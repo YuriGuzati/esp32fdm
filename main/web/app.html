@@ -79,8 +79,38 @@ label.chk{display:flex;align-items:center;gap:10px;min-height:40px}
 .item{width:100%;text-align:left;display:flex;align-items:center;gap:12px;padding:12px;border-radius:14px;border:1px solid var(--border);background:var(--surface);color:var(--text);cursor:pointer}
 .item .nm{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .term{font:12.5px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#0B0D10;color:#D4D7DD;border-radius:12px;padding:12px;height:52vh;overflow:auto;white-space:pre-wrap;word-break:break-word;border:1px solid var(--border)}
-.mesh{display:grid;gap:4px}
-.mesh div{height:52px;border-radius:8px;display:flex;align-items:center;justify-content:center;font:600 11px system-ui,sans-serif;color:#F4F5F7}
+.seg{display:inline-flex;border:1px solid var(--border2);border-radius:12px;overflow:hidden;flex:none}
+.seg button{border:0;background:var(--surface2);color:var(--muted);min-height:38px;padding:0 14px;font-weight:600;cursor:pointer}
+.seg button+button{border-left:1px solid var(--border2)}
+.seg button.on{background:var(--accent-soft);color:var(--accent)}
+.mesa{display:grid;grid-template-columns:minmax(0,1fr);gap:12px;align-items:start}
+@media (min-width:1000px){.mesa{grid-template-columns:minmax(0,3fr) minmax(0,2fr)}}
+.mapwrap{position:relative;width:100%;max-width:560px;margin:0 auto;aspect-ratio:1/1}
+.mapwrap canvas{position:absolute;inset:0;width:100%;height:100%;display:block}
+.knob{position:absolute;display:flex;align-items:center;gap:6px;transform:translate(-18px,-50%);pointer-events:none}
+.knob.r{flex-direction:row-reverse;transform:translate(calc(-100% + 18px),-50%)}
+.knob .k{width:36px;height:36px;flex:none;border-radius:50%;display:flex;align-items:center;justify-content:center;background:var(--surface);border:2.5px solid var(--border2);font-size:18px;font-weight:700;box-shadow:0 2px 8px rgba(0,0,0,.35)}
+.knob .k .ico{width:20px;height:20px}
+.knob .k.ok{border-color:var(--green);color:var(--green)}
+.knob .k.adj{border-color:var(--accent);color:var(--accent)}
+.knob .t{font:700 12px/1.3 system-ui,sans-serif;color:var(--text);background:var(--surface);border:1px solid var(--border2);border-radius:8px;padding:2px 7px;white-space:nowrap}
+.legend{display:flex;flex-direction:column;gap:4px}
+.legend .g{height:12px;border-radius:6px}
+.ticks{display:flex;justify-content:space-between;font-size:11px;color:var(--muted)}
+.gauge{position:relative;height:10px;border-radius:5px;background:linear-gradient(90deg,var(--green) 0 40%,var(--yellow) 40% 66.7%,var(--red) 66.7% 100%)}
+.gauge .gm{position:absolute;top:-5px;width:5px;height:20px;border-radius:3px;background:var(--text);transform:translateX(-50%);box-shadow:0 0 0 2px var(--surface)}
+.hbar{height:8px;border-radius:4px;background:var(--surface3);overflow:hidden}
+.hbar>div{height:100%;border-radius:4px}
+.bars{display:flex;gap:6px;align-items:stretch;height:170px}
+.bar1{flex:1;min-width:0;display:flex;flex-direction:column;align-items:center;gap:2px;background:none;border:0;padding:4px 0;border-radius:8px;color:var(--text);cursor:pointer}
+.bar1 .bw{flex:1;width:100%;display:flex;align-items:flex-end;justify-content:center;min-height:0}
+.bar1 .b{display:block;width:70%;max-width:34px;border-radius:6px 6px 2px 2px}
+.bar1:hover{background:var(--surface2)}
+.bar1.on{background:var(--surface2);outline:2px solid var(--accent)}
+.bar1.base{outline:2px dashed var(--blue)}
+table.vals{border-collapse:collapse;width:100%;font:600 12px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;margin-top:8px}
+table.vals th,table.vals td{padding:7px 4px;text-align:center;border-bottom:1px solid var(--border)}
+table.vals th{color:var(--muted);font-weight:600;font-family:system-ui,sans-serif;font-size:11px}
 .kv{display:grid;grid-template-columns:auto 1fr;gap:6px 14px;font-size:14px}
 .kv dt{color:var(--muted)}.kv dd{margin:0;font-weight:600;text-align:right;overflow-wrap:anywhere}
 .modal-bg{position:fixed;inset:0;background:rgba(5,6,8,.62);display:flex;align-items:flex-end;justify-content:center;z-index:50}
@@ -617,132 +647,483 @@ function Controles() {
 }
 
 /* ---------- Mesa ---------- */
-function Mesa() {
-  let mesh = null, label = '', showVals = true, cfg = null, poll = null, list = [];
-  const lsGet = (k, d) => { try { const v = localStorage.getItem(k); return v == null ? d : +v; } catch (e) { return d; } };
-  const lsSet = (k, v) => { try { localStorage.setItem(k, v); } catch (e) { } };
-  const valsBtn = h('button', { class: 'btn sm', onclick: () => { showVals = !showVals; valsBtn.textContent = showVals ? 'Ocultar valores' : 'Mostrar valores'; renderMesh(); } }, 'Ocultar valores');
-  const meshCard = h('section', { class: 'card', 'aria-label': 'Malha medida' });
-  const sum = h('section', { class: 'grid2', 'aria-label': 'Resumo' });
-  const screws = h('section', { class: 'card', 'aria-label': 'Parafusos' });
-  const probe = h('section', { class: 'col' });
-  const hist = h('section', { class: 'card', 'aria-label': 'Histórico' });
-  const el = h('div', { class: 'col', style: 'gap:12px' }, h('div', { class: 'row between wrap' }, h('h1', null, 'Mesa'), valsBtn), meshCard, sum, screws, probe, hist);
+/* Referências usadas no desenho desta tela:
+   - Klipper (SCREWS_TILT_CALCULATE): para cada parafuso, sentido e voltas no formato de relógio "HH:MM"
+     (00:15 = 1/4 de volta), com um parafuso de referência opcional;
+   - Mainsail/Fluidd e o Bed Level Visualizer do OctoPrint: superfície 3D com o relevo exagerado e plano Z=0;
+   - a página antiga do ESP32FDM: cores fortes por altura (verde no zero, azul baixo, vermelho alto). */
+Object.assign(ICONS, {
+  cw: '<path d="M12 4a8 8 0 1 1-8 8"/><path d="M1 14l3-3 3 3"/>',
+  ccw: '<path d="M12 4a8 8 0 1 0 8 8"/><path d="M17 14l3-3 3 3"/>'
+});
+const MESH_STOPS = [[-1, [37, 78, 214]], [-0.5, [30, 168, 222]], [0, [52, 190, 110]], [0.5, [240, 205, 60]], [1, [228, 66, 44]]];
+function meshRGB(t) {
+  t = Math.max(-1, Math.min(1, t || 0));
+  for (let k = 1; k < MESH_STOPS.length; k++) {
+    const [t1, c1] = MESH_STOPS[k];
+    if (t <= t1) { const [t0, c0] = MESH_STOPS[k - 1], f = (t - t0) / (t1 - t0); return c0.map((x, i) => Math.round(x + (c1[i] - x) * f)); }
+  }
+  return MESH_STOPS[MESH_STOPS.length - 1][1];
+}
+const meshCss = t => 'rgb(' + meshRGB(t).join(',') + ')';
+/* Catmull-Rom: passa exatamente pelos pontos medidos e suaviza entre eles */
+function crInterp(p0, p1, p2, p3, t) { return 0.5 * (2 * p1 + (-p0 + p2) * t + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t * t + (-p0 + 3 * p1 - 3 * p2 + p3) * t * t * t); }
+function meshSample(d, u, v) {
+  const gy = d.length, gx = d[0].length;
+  const g = (j, i) => d[Math.max(0, Math.min(gy - 1, j))][Math.max(0, Math.min(gx - 1, i))];
+  const i = Math.max(0, Math.min(gx - 2, Math.floor(u))), j = Math.max(0, Math.min(gy - 2, Math.floor(v))), tu = u - i, tv = v - j;
+  const r = [-1, 0, 1, 2].map(k => crInterp(g(j + k, i - 1), g(j + k, i), g(j + k, i + 1), g(j + k, i + 2), tu));
+  return crInterp(r[0], r[1], r[2], r[3], tv);
+}
+const cssVar = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+function niceStep(x) { const p = Math.pow(10, Math.floor(Math.log10(x))), m = x / p; return (m < 1.5 ? 1 : m < 3.5 ? 2 : m < 7.5 ? 5 : 10) * p; }
+function clockTurns(t) { let hh = Math.floor(t), mm = Math.round((t - hh) * 60); if (mm === 60) { hh++; mm = 0; } return String(hh).padStart(2, '0') + ':' + String(mm).padStart(2, '0'); }
+function fmtTurns(t) {
+  const q = Math.round(t * 4) / 4, w = Math.floor(q), f = q - w;
+  if (q < 0.25) return 'menos de 1/4 de volta';
+  const fr = f === 0.25 ? '1/4' : f === 0.5 ? '1/2' : f === 0.75 ? '3/4' : '';
+  if (!w) return fr + (fr === '1/2' ? ' volta' : ' de volta');
+  return w + (fr ? ' e ' + fr : '') + (q > 1 ? ' voltas' : ' volta');
+}
+function meshQuality(r) {
+  if (r <= 0.3) return { label: 'ótima', color: 'var(--green)' };
+  if (r <= 0.6) return { label: 'boa', color: 'var(--green)' };
+  if (r <= 1.0) return { label: 'aceitável: o ABL compensa', color: 'var(--yellow)' };
+  return { label: 'vale nivelar', color: 'var(--red)' };
+}
+const MS_SEGS = { 1: [['l', 'b']], 2: [['b', 'r']], 3: [['l', 'r']], 4: [['t', 'r']], 5: [['l', 't'], ['b', 'r']], 6: [['t', 'b']], 7: [['l', 't']], 8: [['l', 't']], 9: [['t', 'b']], 10: [['t', 'r'], ['l', 'b']], 11: [['t', 'r']], 12: [['l', 'r']], 13: [['b', 'r']], 14: [['l', 'b']] };
 
-  /* Linhas da frente para o fundo, colunas da esquerda para a direita (usa a "origem" da config, como a página antiga) */
-  function canon(m) {
-    const o = (cfg && cfg.origin) || 0, gy = m.d.length, gx = m.d[0].length, fy = o >= 2, fx = o === 1 || o === 3, out = [];
+function Mesa() {
+  const V = { view: 'mapa', vals: true, cont: true, flat: true, relief: 30, yaw: -30, pitch: 40 };
+  try { Object.assign(V, JSON.parse(localStorage.getItem('es-mesa') || '{}')); } catch (e) { }
+  const saveV = () => { try { localStorage.setItem('es-mesa', JSON.stringify({ view: V.view, vals: V.vals, cont: V.cont, flat: V.flat, relief: V.relief })); } catch (e) { } };
+  let cfg = { origin: 0, screw_pitch: 1, screw_fac: 1.2, screw_ref: 0, cw_raises: 0 };
+  let cur = null, curTs = 0, base = null, baseTs = 0, list = [], poll = null, alive = true, raf = 0, drag = null, ro = null;
+  const cache = new Map();
+  const getMesh = async ts => { if (cache.has(ts)) return cache.get(ts); const m = await getJSON('/bedlevel/mesh?ts=' + ts); cache.set(ts, m); return m; };
+
+  /* ---- dados ---- */
+  function canon(m) { /* linhas da frente para o fundo, colunas da esquerda para a direita (respeita a "origem") */
+    const o = cfg.origin || 0, gy = m.d.length, gx = m.d[0].length, fy = o >= 2, fx = o === 1 || o === 3, out = [];
     for (let j = 0; j < gy; j++) { const r = []; for (let i = 0; i < gx; i++) r.push(m.d[fy ? gy - 1 - j : j][fx ? gx - 1 - i : i]); out.push(r); }
     return out;
   }
+  const okMesh = m => m && m.d && m.d.length >= 2 && m.d[0] && m.d[0].length >= 2;
+  function statsOf(d) {
+    let mn = Infinity, mx = -Infinity, pmn = null, pmx = null, s = 0, n = 0;
+    d.forEach((r, j) => r.forEach((v, i) => { if (v < mn) { mn = v; pmn = [i, j]; } if (v > mx) { mx = v; pmx = [i, j]; } s += v; n++; }));
+    const mean = s / n; let ss = 0; d.forEach(r => r.forEach(v => ss += (v - mean) ** 2));
+    return { mn, mx, pmn, pmx, mean, std: Math.sqrt(ss / n), n, range: mx - mn };
+  }
+  const rangeOf = m => okMesh(m) ? statsOf(canon(m)).range : null;
   function planeFit(d) { /* z = a + b*x + c*y; x, y em passos da malha a partir do centro (x+ = direita, y+ = fundo) */
     const gy = d.length, gx = d[0].length; let n = 0, sz = 0, sxx = 0, syy = 0, sxz = 0, syz = 0;
     for (let j = 0; j < gy; j++) for (let i = 0; i < gx; i++) { const x = i - (gx - 1) / 2, y = j - (gy - 1) / 2, z = d[j][i]; n++; sz += z; sxx += x * x; syy += y * y; sxz += x * z; syz += y * z; }
     const a = sz / n, b = sxx ? sxz / sxx : 0, c = syy ? syz / syy : 0; let rmin = Infinity, rmax = -Infinity;
     for (let j = 0; j < gy; j++) for (let i = 0; i < gx; i++) { const r = d[j][i] - (a + b * (i - (gx - 1) / 2) + c * (j - (gy - 1) / 2)); rmin = Math.min(rmin, r); rmax = Math.max(rmax, r); }
-    return { a, b, c, gx, gy, resid: rmax - rmin };
+    return { a, b, c, gx, gy, resid: rmax - rmin, tilt: Math.abs(b) * (gx - 1) + Math.abs(c) * (gy - 1) };
   }
-  const low = [31, 95, 168], mid = [52, 58, 70], high = [194, 97, 15];
-  const mix = (a, b, t) => a.map((x, i) => Math.round(x + (b[i] - x) * t));
-  const colr = (v, s) => { const t = Math.max(-1, Math.min(1, v / s)); return 'rgb(' + (t < 0 ? mix(mid, low, -t) : mix(mid, high, t)).join(',') + ')'; };
+  function posName(i, j, gx, gy) {
+    const fx = i / (gx - 1), fy = j / (gy - 1);
+    const cx = fx < 0.2 ? 'esquerda' : fx < 0.45 ? 'meio-esquerda' : fx <= 0.55 ? 'centro' : fx <= 0.8 ? 'meio-direita' : 'direita';
+    const cy = fy < 0.2 ? 'frente' : fy < 0.45 ? 'meio-frente' : fy <= 0.55 ? 'meio' : fy <= 0.8 ? 'meio-fundo' : 'fundo';
+    return cy + ', ' + cx;
+  }
   const sgn = v => { v = Math.round(v * 100) / 100; return (v > 0 ? '+' : v < 0 ? '−' : '') + num(Math.abs(v), 2); };
-  function fmtTurns(t) {
-    const q = Math.round(t * 4) / 4, w = Math.floor(q), f = q - w;
-    if (q < 0.25) return 'menos de 1/4 de volta';
-    const fr = f === 0.25 ? '1/4' : f === 0.5 ? '1/2' : f === 0.75 ? '3/4' : '';
-    if (!w) return fr + (fr === '1/2' ? ' volta' : ' de volta');
-    return w + (fr ? ' e ' + fr : '') + (q > 1 ? ' voltas' : ' volta');
+  function shown() {
+    if (!okMesh(cur)) return null;
+    let d = canon(cur), diff = false;
+    if (okMesh(base)) { const b = canon(base); if (b.length === d.length && b[0].length === d[0].length) { d = d.map((r, j) => r.map((v, i) => v - b[j][i])); diff = true; } }
+    let m = 0.05; d.forEach(r => r.forEach(v => { m = Math.max(m, Math.abs(v)); }));
+    return { d, diff, scale: Math.ceil(m / 0.05 - 1e-9) * 0.05 };
   }
-  function renderMesh() {
-    meshCard.textContent = ''; sum.textContent = ''; screws.textContent = '';
-    if (!mesh || !mesh.d || !mesh.d.length || !mesh.d[0].length) {
-      meshCard.append(h('h2', null, 'Malha'), h('p', { class: 'muted', style: 'margin:0' }, 'Nenhuma malha guardada na ESP32. Ela aparece aqui depois de uma medição, por este botão ou pelo menu da Ender.'));
-      return;
-    }
-    const d = canon(mesh), gx = d[0].length, gy = d.length;
-    let mn = Infinity, mx = -Infinity; d.forEach(r => r.forEach(v => { mn = Math.min(mn, v); mx = Math.max(mx, v); }));
-    const scale = Math.max(0.1, Math.abs(mn), Math.abs(mx));
-    const grid = h('div', { class: 'mesh', role: 'img', 'aria-label': 'Mapa de altura da mesa, ' + gx + ' por ' + gy + ' pontos, de ' + num(mn, 2) + ' a ' + num(mx, 2) + ' mm', style: 'grid-template-columns:repeat(' + gx + ',minmax(0,1fr))' });
-    for (let j = gy - 1; j >= 0; j--) for (let i = 0; i < gx; i++) { const v = d[j][i]; grid.append(h('div', { style: 'background:' + colr(v, scale), title: sgn(v) + ' mm' }, showVals ? sgn(v) : '')); }
-    meshCard.append(h('div', { class: 'row between small muted wrap' }, h('span', null, label), h('span', null, gx + ' × ' + gy + ' pontos')),
-      h('span', { class: 'tiny faint', style: 'text-align:center' }, 'Fundo'), grid, h('span', { class: 'tiny faint', style: 'text-align:center' }, 'Frente (lado da tela)'),
-      h('div', { class: 'row small muted', style: 'gap:8px' }, h('span', null, 'mais baixa'), h('div', { style: 'flex:1;height:8px;border-radius:4px;background:linear-gradient(90deg,rgb(31,95,168),rgb(52,58,70),rgb(194,97,15))' }), h('span', null, 'mais alta')));
-    const p = planeFit(d), range = mx - mn, lr = p.b * (gx - 1), fb = p.c * (gy - 1);
-    const card = (k, v, s, c) => h('div', { class: 'card', style: 'gap:2px' }, h('span', { class: 'small muted' }, k), h('span', { class: 'big', style: 'font-size:24px' }, v), h('span', { class: 'tiny', style: 'color:' + (c || 'var(--faint)') }, s));
-    sum.append(card('Diferença total', num(range, 2) + ' mm', range <= 0.5 ? 'ótima' : range <= 0.8 ? 'boa para imprimir (o ABL compensa)' : 'vale nivelar', range <= 0.8 ? 'var(--green)' : 'var(--yellow)'),
-      card('Inclinação', num(Math.hypot(lr, fb), 2) + ' mm', 'direita ' + sgn(lr) + ' · fundo ' + sgn(fb) + ' mm. Forma própria da mesa ~' + num(p.resid, 2) + ' mm (não sai nos parafusos)'));
-    renderScrews(p);
-  }
-  function renderScrews(p) {
-    screws.textContent = '';
-    const pitch = (cfg && cfg.screw_pitch) || 0.7, fac = lsGet('es-screw-fac', 1.2);
-    const hx = (p.gx - 1) / 2 * fac, hy = (p.gy - 1) / 2 * fac;
-    const rows = [['Fundo-esquerda', -1, 1], ['Fundo-direita', 1, 1], ['Frente-esquerda', -1, -1], ['Frente-direita', 1, -1]].map(([n, sx, sy]) => {
-      const corr = -(p.b * sx * hx + p.c * sy * hy); /* referência = altura média (centro do plano) */
-      const ok = Math.abs(corr) < 0.05;
-      return h('div', { class: 'card', style: 'padding:10px 12px;gap:2px' }, h('span', { class: 'tiny muted' }, n),
-        h('b', { style: 'color:' + (ok ? 'var(--green)' : 'var(--text)') }, ok ? 'deixar como está' : (corr > 0 ? 'subir ' : 'descer ') + num(Math.abs(corr), 2) + ' mm'),
-        ok ? null : h('span', { class: 'tiny faint' }, '≈ ' + fmtTurns(Math.abs(corr) / pitch)));
+  function screwPlan() {
+    if (!okMesh(cur)) return null;
+    const p = planeFit(canon(cur)), fac = cfg.screw_fac || 1.2, hx = (p.gx - 1) / 2 * fac, hy = (p.gy - 1) / 2 * fac;
+    const C = [['Fundo-esquerda', -1, 1, 3], ['Fundo-direita', 1, 1, 4], ['Frente-esquerda', -1, -1, 1], ['Frente-direita', 1, -1, 2]]
+      .map(([n, sx, sy, id]) => ({ n, sx, sy, id, z: p.b * sx * hx + p.c * sy * hy }));
+    const refK = C.find(k => k.id === cfg.screw_ref), ref = refK ? refK.z : 0; /* 0 = altura média dos 4 cantos */
+    C.forEach(k => {
+      k.corr = ref - k.z; k.isRef = !!refK && k === refK; k.ok = k.isRef || Math.abs(k.corr) < 0.05;
+      k.turns = Math.abs(k.corr) / (cfg.screw_pitch || 1);
+      k.dir = k.ok || !cfg.cw_raises ? '' : ((k.corr > 0) === (cfg.cw_raises > 0) ? 'cw' : 'ccw');
     });
-    const facI = h('input', { type: 'number', value: fac, min: 1, max: 2, step: 0.05 });
-    facI.onchange = () => { lsSet('es-screw-fac', facI.value); renderMesh(); };
-    const piI = h('input', { type: 'number', value: pitch, min: 0.2, max: 2, step: 0.05 });
-    const save = h('button', { class: 'btn sm', onclick: async () => {
-      const v = +piI.value; if (!(v >= 0.2 && v <= 2)) { toast('Passo inválido', true); return; }
-      try { await post('/bedlevel/config', Object.assign({}, cfg, { screw_pitch: v }), true); cfg.screw_pitch = v; toast('Passo salvo na ESP32'); renderMesh(); } catch (e) { toast(e.message, true); }
-    } }, 'Salvar o passo');
-    screws.append(h('h2', null, 'Parafusos (estimativa)'),
-      h('span', { class: 'small muted' }, 'Estende o plano da malha até cada parafuso, mantendo a altura média da mesa. Suba o Z ~10 mm antes de girar. O sentido (horário ou anti-horário) depende do manípulo: gire 1/4 de volta e veja se a mesa sobe ou desce.'),
-      h('div', { class: 'grid2' }, rows),
+    return { p, C };
+  }
+
+  /* ---- controles pequenos ---- */
+  function seg(opts, get, set) {
+    const btns = opts.map(([k, l]) => h('button', { type: 'button', onclick: () => { set(k); mark(); } }, l));
+    const mark = () => btns.forEach((b, i) => { const on = opts[i][0] === get(); b.classList.toggle('on', on); b.setAttribute('aria-pressed', on ? 'true' : 'false'); });
+    mark();
+    return h('div', { class: 'seg', role: 'group' }, btns);
+  }
+  function toggle(label, get, set) {
+    const c = h('input', { type: 'checkbox', checked: get() });
+    c.onchange = () => set(c.checked);
+    return h('label', { class: 'chk small', style: 'min-height:36px' }, c, label);
+  }
+
+  /* ---- montagem ---- */
+  const title = h('span', { class: 'small muted' });
+  const canvas = h('canvas', { role: 'img' });
+  const knobBox = h('div');
+  const wrap = h('div', { class: 'mapwrap' }, canvas, knobBox);
+  const lblBack = h('div', { class: 'tiny faint', style: 'text-align:center;letter-spacing:.08em' }, 'FUNDO');
+  const lblFront = h('div', { class: 'tiny faint', style: 'text-align:center;letter-spacing:.08em' }, 'FRENTE (LADO DA TELA DA ENDER)');
+  const tip = h('div', { class: 'small muted', 'aria-live': 'polite', style: 'min-height:20px;text-align:center' });
+  const legend = h('div', { class: 'legend' });
+  const compareSel = h('select', { 'aria-label': 'Comparar com outra medição' });
+  const reliefIn = h('input', { type: 'range', min: 5, max: 70, value: V.relief, 'aria-label': 'Altura do relevo no 3D' });
+  reliefIn.oninput = () => { V.relief = +reliefIn.value; saveV(); draw(); };
+  const tCont = toggle('Linhas de nível', () => V.cont, v => { V.cont = v; saveV(); draw(); });
+  const tFlat = toggle('Plano Z=0', () => V.flat, v => { V.flat = v; saveV(); draw(); });
+  const reliefRow = h('label', { class: 'row small muted', style: 'gap:8px;flex:1;min-width:180px' }, 'Relevo', reliefIn);
+  const viewSeg = seg([['mapa', 'Mapa'], ['3d', '3D']], () => V.view, v => { V.view = v; saveV(); syncTools(); renderLegend(); draw(); });
+  function syncTools() {
+    const m = V.view === 'mapa';
+    tCont.classList.toggle('hide', !m); lblBack.classList.toggle('hide', !m); lblFront.classList.toggle('hide', !m);
+    tFlat.classList.toggle('hide', m); reliefRow.classList.toggle('hide', m);
+    canvas.style.touchAction = m ? 'auto' : 'none'; canvas.style.cursor = m ? 'pointer' : 'grab';
+    tip.textContent = m ? 'Toque num ponto para ver a altura e a posição.' : 'Arraste para girar.';
+  }
+  const mapCard = h('section', { class: 'card', 'aria-label': 'Mapa da mesa' },
+    h('div', { class: 'row between wrap' }, title, viewSeg),
+    h('div', { class: 'row wrap', style: 'gap:2px 16px' }, toggle('Valores', () => V.vals, v => { V.vals = v; saveV(); draw(); }), tCont, tFlat, reliefRow),
+    lblBack, wrap, lblFront, tip, legend,
+    h('label', { class: 'f' }, 'Comparar com outra medição (mostra quanto cada ponto mudou)', compareSel));
+  const tableBox = h('details', { class: 'card' });
+  const sum = h('section', { class: 'card', 'aria-label': 'Resumo da malha' });
+  const screws = h('section', { class: 'card', 'aria-label': 'Ajuste dos parafusos' });
+  const probe = h('section', { class: 'card', 'aria-label': 'Medir a mesa' });
+  const hist = h('section', { class: 'card', 'aria-label': 'Evolução do nivelamento' });
+  const el = h('div', { class: 'col', style: 'gap:12px' },
+    h('div', { class: 'row between wrap' }, h('h1', null, 'Mesa'), h('span', { class: 'small muted' }, 'Nivelamento e malha (ABL)')),
+    h('div', { class: 'mesa' }, h('div', { class: 'col', style: 'gap:12px' }, mapCard, tableBox), h('div', { class: 'col', style: 'gap:12px' }, sum, screws, probe, hist)));
+
+  /* ---- desenho ---- */
+  function draw() {
+    cancelAnimationFrame(raf);
+    raf = requestAnimationFrame(() => { try { if (V.view === '3d') draw3D(); else drawMap(); } catch (e) { console.error(e); } });
+  }
+  function setup() {
+    const S = Math.max(220, wrap.clientWidth || 320), dpr = window.devicePixelRatio || 1;
+    if (canvas.width !== Math.round(S * dpr)) { canvas.width = Math.round(S * dpr); canvas.height = Math.round(S * dpr); }
+    const ctx = canvas.getContext('2d');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, S, S);
+    return [ctx, S];
+  }
+  function rrect(ctx, x, y, w, hh, r) {
+    ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + hh, r); ctx.arcTo(x + w, y + hh, x, y + hh, r);
+    ctx.arcTo(x, y + hh, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+  }
+  function label(ctx, txt, x, y, fs) {
+    ctx.font = '700 ' + fs + 'px system-ui,-apple-system,"Segoe UI",Roboto,sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.lineJoin = 'round'; ctx.lineWidth = 3.2; ctx.strokeStyle = 'rgba(0,0,0,.78)'; ctx.strokeText(txt, x, y);
+    ctx.fillStyle = '#fff'; ctx.fillText(txt, x, y);
+  }
+  function geom(S) { const hm = S * 0.32, c = S / 2; return { S, hm, c, x0: c - hm, y0: c - hm, w: 2 * hm, kx: S * 0.075 }; } /* parafusos nos cantos da chapa, fora da área medida */
+  function contours(ctx, d, G) {
+    const M = 48, gy = d.length, gx = d[0].length, F = [];
+    for (let r = 0; r < M; r++) { const row = []; for (let q = 0; q < M; q++) row.push(meshSample(d, q / (M - 1) * (gx - 1), (1 - r / (M - 1)) * (gy - 1))); F.push(row); }
+    let mn = Infinity, mx = -Infinity; F.forEach(r => r.forEach(v => { mn = Math.min(mn, v); mx = Math.max(mx, v); }));
+    const step = niceStep(Math.max(0.01, (mx - mn) / 7)), cs = G.w / (M - 1);
+    for (let k = Math.ceil(mn / step); k * step <= mx; k++) {
+      const L = k * step, zero = k === 0;
+      ctx.beginPath();
+      for (let r = 0; r < M - 1; r++) for (let q = 0; q < M - 1; q++) {
+        const a = F[r][q], b = F[r][q + 1], c2 = F[r + 1][q + 1], e = F[r + 1][q];
+        const segs = MS_SEGS[(a > L ? 8 : 0) | (b > L ? 4 : 0) | (c2 > L ? 2 : 0) | (e > L ? 1 : 0)];
+        if (!segs) continue;
+        const X = G.x0 + q * cs, Y = G.y0 + r * cs;
+        const P = { t: [X + (L - a) / (b - a) * cs, Y], r: [X + cs, Y + (L - b) / (c2 - b) * cs], b: [X + (L - e) / (c2 - e) * cs, Y + cs], l: [X, Y + (L - a) / (e - a) * cs] };
+        for (const [p1, p2] of segs) { ctx.moveTo(P[p1][0], P[p1][1]); ctx.lineTo(P[p2][0], P[p2][1]); }
+      }
+      ctx.strokeStyle = zero ? 'rgba(255,255,255,.9)' : 'rgba(0,0,0,.32)'; ctx.lineWidth = zero ? 1.8 : 1; ctx.setLineDash(zero ? [6, 4] : []); ctx.stroke();
+    }
+    ctx.setLineDash([]);
+  }
+  function drawMap() {
+    const [ctx, S] = setup(), G = geom(S), sh = shown();
+    knobBox.textContent = '';
+    rrect(ctx, S * 0.03, S * 0.03, S * 0.94, S * 0.94, 18);
+    ctx.fillStyle = cssVar('--surface3'); ctx.fill(); ctx.strokeStyle = cssVar('--border2'); ctx.lineWidth = 1; ctx.stroke();
+    if (!sh) { ctx.fillStyle = cssVar('--muted'); ctx.font = '14px system-ui'; ctx.textAlign = 'center'; ctx.fillText('Sem malha para mostrar', G.c, G.c); return; }
+    const d = sh.d, gx = d[0].length, gy = d.length, N = 120;
+    const off = document.createElement('canvas'); off.width = N; off.height = N;
+    const oc = off.getContext('2d'), img = oc.createImageData(N, N);
+    for (let py = 0; py < N; py++) for (let px = 0; px < N; px++) {
+      const c3 = meshRGB(meshSample(d, px / (N - 1) * (gx - 1), (1 - py / (N - 1)) * (gy - 1)) / sh.scale), k = (py * N + px) * 4;
+      img.data[k] = c3[0]; img.data[k + 1] = c3[1]; img.data[k + 2] = c3[2]; img.data[k + 3] = 255;
+    }
+    oc.putImageData(img, 0, 0);
+    ctx.save(); rrect(ctx, G.x0, G.y0, G.w, G.w, 10); ctx.clip();
+    ctx.imageSmoothingEnabled = true; ctx.drawImage(off, G.x0, G.y0, G.w, G.w);
+    if (V.cont) contours(ctx, d, G);
+    ctx.restore();
+    rrect(ctx, G.x0, G.y0, G.w, G.w, 10); ctx.strokeStyle = 'rgba(0,0,0,.35)'; ctx.lineWidth = 1; ctx.stroke();
+    const st = statsOf(d), fs = Math.round(Math.max(10, Math.min(14, S / 32)));
+    for (let j = 0; j < gy; j++) for (let i = 0; i < gx; i++) {
+      const X = G.x0 + i / (gx - 1) * G.w, Y = G.y0 + G.w - j / (gy - 1) * G.w, v = d[j][i];
+      const isMx = st.pmx[0] === i && st.pmx[1] === j, isMn = st.pmn[0] === i && st.pmn[1] === j;
+      if (isMx || isMn) { ctx.beginPath(); ctx.arc(X, Y, 9, 0, 7); ctx.lineWidth = 2.5; ctx.strokeStyle = '#fff'; ctx.stroke(); }
+      ctx.beginPath(); ctx.arc(X, Y, 3.2, 0, 7); ctx.fillStyle = '#fff'; ctx.fill(); ctx.lineWidth = 1.2; ctx.strokeStyle = 'rgba(0,0,0,.7)'; ctx.stroke();
+      if (V.vals) label(ctx, sgn(v), X, Y - fs - 2, fs);
+    }
+    canvas.setAttribute('aria-label', (sh.diff ? 'Mudança entre duas medições' : 'Mapa de altura da mesa') + ', ' + gx + ' por ' + gy + ' pontos, de ' + sgn(st.mn) + ' a ' + sgn(st.mx) + ' mm');
+    if (!sh.diff) placeKnobs(G);
+  }
+  function placeKnobs(G) {
+    const sp = screwPlan(); if (!sp) return;
+    sp.C.forEach(k => {
+      const x = (k.sx < 0 ? G.kx : G.S - G.kx) / G.S * 100, y = (k.sy > 0 ? G.kx : G.S - G.kx) / G.S * 100;
+      const glyph = k.ok ? '✓' : k.dir ? icon(k.dir, 'ico') : (k.corr > 0 ? '↑' : '↓');
+      const txt = k.isRef ? 'fixo' : k.ok ? 'OK' : (k.dir ? '' : (k.corr > 0 ? 'subir ' : 'descer ')) + clockTurns(k.turns);
+      knobBox.append(h('div', { class: 'knob ' + (k.sx < 0 ? 'l' : 'r'), style: 'left:' + x + '%;top:' + y + '%', 'aria-hidden': 'true' },
+        h('div', { class: 'k ' + (k.ok ? 'ok' : 'adj') }, glyph), h('div', { class: 't' }, txt)));
+    });
+  }
+  function draw3D() {
+    const [ctx, S] = setup(), sh = shown();
+    knobBox.textContent = '';
+    if (!sh) return;
+    const d = sh.d, gx = d[0].length, gy = d.length, N = 24, zk = V.relief / 100;
+    const yw = V.yaw * Math.PI / 180, pt = V.pitch * Math.PI / 180, cyw = Math.cos(yw), syw = Math.sin(yw), cp = Math.cos(pt), sp = Math.sin(pt);
+    const R = S * 0.33, ox = S / 2, oy = S * 0.54;
+    const P = (x, y, z) => { const xr = x * cyw - y * syw, yr = x * syw + y * cyw; return [ox + xr * R, oy - (z * cp + yr * sp) * R, yr * cp - z * sp]; };
+    if (V.flat) {
+      const c4 = [[-1, -1], [1, -1], [1, 1], [-1, 1]].map(([x, y]) => P(x, y, 0));
+      ctx.beginPath(); c4.forEach((p, k) => k ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1])); ctx.closePath();
+      ctx.fillStyle = 'rgba(140,147,160,.12)'; ctx.fill(); ctx.setLineDash([5, 4]); ctx.strokeStyle = cssVar('--faint'); ctx.lineWidth = 1; ctx.stroke(); ctx.setLineDash([]);
+    }
+    const Gp = [];
+    for (let j = 0; j < N; j++) { const row = []; for (let i = 0; i < N; i++) { const val = meshSample(d, i / (N - 1) * (gx - 1), j / (N - 1) * (gy - 1)); row.push({ val, p: P(i / (N - 1) * 2 - 1, j / (N - 1) * 2 - 1, val / sh.scale * zk) }); } Gp.push(row); }
+    const quads = [];
+    for (let j = 0; j < N - 1; j++) for (let i = 0; i < N - 1; i++) {
+      const a = Gp[j][i], b = Gp[j][i + 1], c = Gp[j + 1][i + 1], e = Gp[j + 1][i];
+      quads.push({ pts: [a.p, b.p, c.p, e.p], depth: (a.p[2] + b.p[2] + c.p[2] + e.p[2]) / 4, val: (a.val + b.val + c.val + e.val) / 4 });
+    }
+    quads.sort((q1, q2) => q2.depth - q1.depth);
+    for (const q of quads) {
+      ctx.beginPath(); q.pts.forEach((p, k) => k ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1])); ctx.closePath();
+      ctx.fillStyle = meshCss(q.val / sh.scale); ctx.fill(); ctx.strokeStyle = 'rgba(0,0,0,.2)'; ctx.lineWidth = 0.7; ctx.stroke();
+    }
+    const fs = Math.round(Math.max(10, Math.min(13, S / 36)));
+    for (let j = 0; j < gy; j++) for (let i = 0; i < gx; i++) {
+      const p = P(i / (gx - 1) * 2 - 1, j / (gy - 1) * 2 - 1, d[j][i] / sh.scale * zk);
+      ctx.beginPath(); ctx.arc(p[0], p[1], 2.8, 0, 7); ctx.fillStyle = '#fff'; ctx.fill(); ctx.lineWidth = 1; ctx.strokeStyle = 'rgba(0,0,0,.7)'; ctx.stroke();
+      if (V.vals) label(ctx, sgn(d[j][i]), p[0], p[1] - fs, fs);
+    }
+    [['FRENTE', 0, -1.42], ['FUNDO', 0, 1.42], ['ESQ.', -1.45, 0], ['DIR.', 1.45, 0]].forEach(([t, x, y]) => { const p = P(x, y, 0); label(ctx, t, p[0], p[1], 11); });
+    canvas.setAttribute('aria-label', 'Vista 3D da ' + (sh.diff ? 'mudança entre duas medições' : 'malha') + ', relevo exagerado');
+  }
+  canvas.addEventListener('pointerdown', e => { if (V.view !== '3d') return; drag = [e.clientX, e.clientY, V.yaw, V.pitch]; try { canvas.setPointerCapture(e.pointerId); } catch (x) { } canvas.style.cursor = 'grabbing'; });
+  canvas.addEventListener('pointermove', e => {
+    if (!drag) return;
+    V.yaw = drag[2] + (e.clientX - drag[0]) * 0.5; V.pitch = Math.max(8, Math.min(88, drag[3] + (e.clientY - drag[1]) * 0.35)); draw();
+  });
+  const endDrag = () => { if (drag) { drag = null; canvas.style.cursor = V.view === '3d' ? 'grab' : 'pointer'; } };
+  canvas.addEventListener('pointerup', endDrag); canvas.addEventListener('pointercancel', endDrag);
+  canvas.addEventListener('click', e => {
+    if (V.view !== 'mapa') return;
+    const sh = shown(); if (!sh) return;
+    const rc = canvas.getBoundingClientRect(), G = geom(rc.width), d = sh.d, gx = d[0].length, gy = d.length;
+    const i = Math.round((e.clientX - rc.left - G.x0) / G.w * (gx - 1)), j = Math.round((G.y0 + G.w - (e.clientY - rc.top)) / G.w * (gy - 1));
+    if (i < 0 || j < 0 || i >= gx || j >= gy) { tip.textContent = 'Fora da área medida. Toque num ponto branco.'; return; }
+    tip.textContent = 'Ponto ' + posName(i, j, gx, gy) + ': ' + sgn(d[j][i]) + ' mm' + (sh.diff ? ' de mudança' : '');
+  });
+
+  /* ---- painéis ---- */
+  function renderTitle() {
+    title.textContent = '';
+    if (!cur) return;
+    const parts = [(curTs && curTs === list[0] ? 'Última medição' : 'Medição') + ' · ' + fmtDate(cur.ts)];
+    if (cur.bed != null) parts.push('mesa a ' + num(cur.bed, 0) + ' °C');
+    if (okMesh(base)) parts.push('comparando com ' + fmtDate(base.ts));
+    title.append(parts.join(' · '));
+  }
+  function renderLegend() {
+    legend.textContent = '';
+    const sh = shown(); if (!sh) return;
+    const ts = [-1, -0.5, 0, 0.5, 1];
+    legend.append(h('div', { class: 'g', style: 'background:linear-gradient(90deg,' + ts.map(meshCss).join(',') + ')' }),
+      h('div', { class: 'ticks' }, ts.map(t => h('span', null, sgn(t * sh.scale)))),
+      h('div', { class: 'tiny faint', style: 'text-align:center' }, sh.diff
+        ? 'mm que cada ponto mudou (agora − antes): vermelho subiu, azul desceu, verde ficou igual'
+        : 'mm em relação ao zero do sensor: azul mais baixo, verde no zero, vermelho mais alto' + (V.cont && V.view === 'mapa' ? '. Tracejado branco = 0' : '')));
+  }
+  function renderCompare() {
+    compareSel.textContent = '';
+    compareSel.append(h('option', { value: '' }, 'Nenhuma'));
+    list.filter(ts => ts !== curTs).forEach(ts => { const r = rangeOf(cache.get(ts)); compareSel.append(h('option', { value: ts, selected: ts === baseTs }, fmtDate(ts) + (r != null ? ' · ' + num(r, 2) + ' mm' : ''))); });
+  }
+  compareSel.onchange = async () => {
+    const ts = +compareSel.value;
+    if (!ts) { base = null; baseTs = 0; renderAll(); return; }
+    try { base = await getMesh(ts); baseTs = ts; renderAll(); } catch (e) { toast(e.message, true); }
+  };
+  function hbar(frac, color) { return h('div', { class: 'hbar' }, h('div', { style: 'width:' + Math.max(2, Math.min(100, frac * 100)) + '%;background:' + color })); }
+  function renderSummary() {
+    sum.textContent = '';
+    if (!okMesh(cur)) { sum.append(h('h2', null, 'Resumo'), h('p', { class: 'muted', style: 'margin:0' }, 'Nenhuma malha guardada na ESP32. Ela aparece depois de uma medição, por esta tela ou pelo menu da Ender.')); return; }
+    const d = canon(cur), s = statsOf(d), q = meshQuality(s.range), p = planeFit(d), gx = d[0].length, gy = d.length;
+    const kv = h('dl', { class: 'kv' });
+    const add = (k, v) => kv.append(h('dt', null, k), h('dd', null, v));
+    add('Ponto mais alto', sgn(s.mx) + ' mm · ' + posName(s.pmx[0], s.pmx[1], gx, gy));
+    add('Ponto mais baixo', sgn(s.mn) + ' mm · ' + posName(s.pmn[0], s.pmn[1], gx, gy));
+    add('Desvio padrão', num(s.std, 2) + ' mm');
+    add('Pontos medidos', s.n + ' (' + gx + ' × ' + gy + ')');
+    add('Mesa na medição', cur.bed != null ? num(cur.bed, 0) + ' °C' : 'não registrada (medição antiga)');
+    const gauge = h('div', { class: 'gauge' }, h('div', { class: 'gm', style: 'left:' + Math.min(100, s.range / 1.5 * 100) + '%' }));
+    const big = Math.max(s.range, p.tilt, p.resid, 0.01);
+    sum.append(h('div', { class: 'row between wrap' }, h('h2', null, 'Resumo'), h('span', { class: 'pill', style: 'background:transparent;border:1px solid ' + q.color + ';color:' + q.color }, q.label)),
+      h('div', { class: 'row', style: 'gap:8px;align-items:baseline;flex-wrap:wrap' }, h('span', { class: 'big' }, num(s.range, 2) + ' mm'), h('span', { class: 'small muted' }, 'entre o ponto mais alto e o mais baixo')),
+      gauge, h('div', { class: 'ticks tiny faint' }, h('span', null, '0'), h('span', null, '0,3'), h('span', null, '0,6'), h('span', null, '1,0'), h('span', null, '1,5 mm')),
+      h('div', { class: 'col', style: 'gap:4px;margin-top:4px' },
+        h('div', { class: 'row between small' }, h('span', null, 'Inclinação: sai nos parafusos'), h('b', null, num(p.tilt, 2) + ' mm')), hbar(p.tilt / big, 'var(--accent)'),
+        h('div', { class: 'row between small' }, h('span', null, 'Forma da mesa: o ABL compensa'), h('b', null, num(p.resid, 2) + ' mm')), hbar(p.resid / big, 'var(--blue)')),
+      kv);
+    if (okMesh(base)) {
+      const sb = statsOf(canon(base)), dd = shown().d, sd = statsOf(dd), delta = s.range - sb.range;
+      sum.append(h('div', { class: 'note', style: 'line-height:1.6' },
+        h('b', null, 'Comparação com ' + fmtDate(base.ts)), h('br'),
+        'Diferença total: ' + num(sb.range, 2) + ' → ' + num(s.range, 2) + ' mm (' + (delta <= 0 ? 'melhorou ' : 'piorou ') + num(Math.abs(delta), 2) + ' mm)', h('br'),
+        'Maior subida: ' + sgn(sd.mx) + ' mm (' + posName(sd.pmx[0], sd.pmx[1], gx, gy) + '); maior descida: ' + sgn(sd.mn) + ' mm (' + posName(sd.pmn[0], sd.pmn[1], gx, gy) + ')'));
+    }
+  }
+  async function saveCfg(patch) {
+    const next = Object.assign({}, cfg, patch);
+    try { await post('/bedlevel/config', next, true); cfg = next; toast('Salvo na ESP32'); renderAll(); }
+    catch (e) { toast(e.message, true); }
+  }
+  function renderScrews() {
+    screws.textContent = '';
+    screws.append(h('h2', null, 'Parafusos'));
+    const spn = screwPlan();
+    if (!spn) { screws.append(h('span', { class: 'muted small' }, 'Sem malha para calcular.')); return; }
+    const allOk = spn.C.every(k => k.ok);
+    screws.append(h('p', { class: 'small muted', style: 'margin:0' }, allOk
+      ? 'Os cantos estão a menos de 0,05 mm do alvo: não precisa girar. O que sobra é a forma da mesa, que o ABL compensa.'
+      : 'Suba o Z uns 10 mm, gire só os parafusos marcados e meça de novo. Depois compare com esta medição para ver o efeito.'));
+    const card = k => h('div', { class: 'card', style: 'padding:10px 12px;gap:4px;border-color:' + (k.ok ? 'var(--green)' : 'var(--accent)') },
+      h('span', { class: 'tiny muted' }, k.n + (k.isRef ? ' · referência' : '')),
+      h('div', { class: 'row', style: 'gap:8px' },
+        h('span', { style: 'width:30px;height:30px;flex:none;color:' + (k.ok ? 'var(--green)' : 'var(--accent)') + ';display:flex;align-items:center;justify-content:center;font-size:20px;font-weight:700' }, k.ok ? '✓' : k.dir ? icon(k.dir, 'ico') : (k.corr > 0 ? '↑' : '↓')),
+        h('div', { class: 'col', style: 'gap:0' },
+          h('b', null, k.isRef ? 'Não mexer' : k.ok ? 'OK' : (k.dir ? (k.dir === 'cw' ? 'Horário ' : 'Anti-horário ') : '') + clockTurns(k.turns)),
+          h('span', { class: 'tiny faint' }, k.isRef || k.ok ? 'dentro de 0,05 mm' : '≈ ' + fmtTurns(k.turns) + ' · o canto ' + (k.corr > 0 ? 'sobe ' : 'desce ') + num(Math.abs(k.corr), 2) + ' mm'))));
+    const byId = id => spn.C.find(k => k.id === id);
+    screws.append(h('div', { class: 'tiny faint', style: 'text-align:center' }, 'FUNDO'),
+      h('div', { class: 'grid2' }, card(byId(3)), card(byId(4)), card(byId(1)), card(byId(2))),
+      h('div', { class: 'tiny faint', style: 'text-align:center' }, 'FRENTE'),
+      h('span', { class: 'tiny faint' }, '"00:15" é como no Klipper: 15 minutos do relógio = 1/4 de volta; "01:00" = 1 volta.'));
+    screws.append(h('div', { class: 'col', style: 'gap:6px' },
+      h('span', { class: 'small muted' }, 'Sentido: girando o manípulo no sentido horário, olhando por baixo da mesa, o canto…'),
+      seg([[1, 'sobe'], [-1, 'desce'], [0, 'não sei']], () => cfg.cw_raises || 0, v => saveCfg({ cw_raises: v })),
+      cfg.cw_raises ? null : h('p', { class: 'note', style: 'margin:0' }, 'Para descobrir uma vez: suba o Z 10 mm, gire um manípulo 1/4 de volta no sentido horário (olhando por baixo) e veja se o canto sobe ou desce. Volte o 1/4 de volta e marque aqui. Até lá, a tela diz só "subir" ou "descer".')));
+    const refSel = h('select', { 'aria-label': 'Parafuso de referência' },
+      [[0, 'Altura média (ajusta os 4)'], [1, 'Frente-esquerda fica fixa'], [2, 'Frente-direita fica fixa'], [3, 'Fundo-esquerda fica fixa'], [4, 'Fundo-direita fica fixa']]
+        .map(([v, l]) => h('option', { value: v, selected: (cfg.screw_ref || 0) === v }, l)));
+    refSel.onchange = () => saveCfg({ screw_ref: +refSel.value });
+    const piI = h('input', { type: 'number', value: cfg.screw_pitch, min: 0.2, max: 2, step: 0.05 });
+    const faI = h('input', { type: 'number', value: cfg.screw_fac || 1.2, min: 1, max: 2, step: 0.05 });
+    screws.append(h('label', { class: 'f' }, 'Referência', refSel),
       h('details', null, h('summary', { class: 'small muted', style: 'cursor:pointer' }, 'Medidas usadas no cálculo'),
         h('div', { class: 'grid2', style: 'margin-top:8px' },
           h('label', { class: 'f' }, 'Passo do parafuso (mm por volta; M4 = 0,7)', piI),
-          h('label', { class: 'f' }, 'Quanto os parafusos ficam além da malha (1,2 = 20%)', facI)),
-        h('div', { class: 'row wrap', style: 'margin-top:8px' }, save, h('span', { class: 'tiny faint' }, 'O passo fica salvo na ESP32; o fator, só neste navegador.'))));
+          h('label', { class: 'f' }, 'Parafusos além da área medida (1,2 = 20%)', faI)),
+        h('div', { class: 'row wrap', style: 'margin-top:8px' },
+          h('button', { class: 'btn sm', onclick: () => { const pv = +piI.value, fv = +faI.value; if (!(pv >= 0.2 && pv <= 2) || !(fv >= 1 && fv <= 2)) { toast('Valor fora da faixa', true); return; } saveCfg({ screw_pitch: pv, screw_fac: fv }); } }, 'Salvar'),
+          h('span', { class: 'tiny faint' }, 'O cálculo usa a inclinação da malha (plano) estendida até cada parafuso; a forma própria da mesa fica de fora.'))));
   }
-  async function showTs(ts, lbl) {
-    try { mesh = await getJSON('/bedlevel/mesh?ts=' + ts); label = lbl + ' · ' + fmtDate(ts); renderMesh(); } catch (e) { toast(e.message, true); }
+  const bedNow = h('span', { class: 'small muted' });
+  const probeBtns = h('div', { class: 'col', style: 'gap:8px' });
+  probe.append(h('h2', null, 'Medir'), bedNow, probeBtns);
+  function renderProbe(state, err) {
+    probeBtns.textContent = '';
+    const running = state === 'homing' || state === 'probing';
+    probeBtns.append(h('button', { class: 'btn primary blk', disabled: running || job(), onclick: async () => {
+      if (!(await confirmBox('Medir a mesa agora?', 'A Ender faz a origem (G28) e mede todos os pontos (G29), cerca de 2 a 3 minutos. O bico encosta na mesa várias vezes: fique por perto. A malha nova fica ativa até a Ender desligar; para guardar, salve (M500) depois.', 'Medir'))) return;
+      try { const r = JSON.parse(await post('/bedlevel/probe', { confirm: 1 }) || '{}'); if (!r.ok) throw new Error(r.err || 'recusado'); toast('Medição iniciada'); renderProbe('homing'); startPoll(); } catch (e) { toast(e.message, true); }
+    } }, running ? (state === 'homing' ? 'Fazendo a origem…' : 'Medindo…') : 'Medir de novo (G28 + G29)'));
+    if (state === 'done') probeBtns.append(h('button', { class: 'btn blk', disabled: job(), onclick: async () => {
+      if (await confirmBox('Guardar a malha na Ender?', 'Grava na memória da impressora (M500) a malha nova, o Z offset e as outras configurações atuais.', 'Salvar')) gcode('M500');
+    } }, 'Salvar a malha na memória da Ender (M500)'));
+    if (state === 'error' && err) probeBtns.append(h('p', { class: 'note', style: 'margin:0' }, 'A última medição falhou: ' + err));
   }
   function renderHist() {
     hist.textContent = '';
-    hist.append(h('h2', null, 'Histórico de medições'));
+    hist.append(h('h2', null, 'Evolução do nivelamento'));
     if (!list.length) { hist.append(h('span', { class: 'muted small' }, 'Sem medições guardadas.')); return; }
-    list.slice(0, 12).forEach((ts, i) => hist.append(h('button', { class: 'item', style: 'padding:10px 12px', onclick: () => { showTs(ts, i ? 'Medição antiga' : 'Última medição'); window.scrollTo({ top: 0, behavior: 'smooth' }); } },
-      h('span', { class: 'nm', style: 'flex:1' }, fmtDate(ts)), h('span', { class: 'small muted' }, i ? 'ver' : 'mais recente'))));
+    const items = list.slice(0, (window.innerWidth < 520 ? 8 : 12)).reverse();
+    let maxR = 0.3; items.forEach(ts => { const r = rangeOf(cache.get(ts)); if (r != null) maxR = Math.max(maxR, r); });
+    const bars = h('div', { class: 'bars' });
+    items.forEach(ts => {
+      const m = cache.get(ts), r = rangeOf(m), q = r != null ? meshQuality(r) : null, dt = new Date(ts * 1000);
+      bars.append(h('button', { class: 'bar1' + (ts === curTs ? ' on' : '') + (ts === baseTs ? ' base' : ''), title: fmtDate(ts) + (r != null ? ': ' + num(r, 2) + ' mm' : ''), 'aria-label': 'Medição de ' + fmtDate(ts) + (r != null ? ', ' + num(r, 2) + ' milímetros' : ''), onclick: () => showTs(ts) },
+        h('span', { class: 'tiny' }, r != null ? num(r, 2) : '…'),
+        h('span', { class: 'bw' }, h('span', { class: 'b', style: 'height:' + (r != null ? Math.max(4, r / maxR * 100) : 4) + '%;background:' + (q ? q.color : 'var(--surface3)') })),
+        h('span', { class: 'tiny faint' }, dt.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })),
+        h('span', { class: 'tiny faint' }, dt.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' }))));
+    });
+    hist.append(bars, h('span', { class: 'tiny faint' }, 'Altura da barra = diferença total da malha. Toque numa barra para ver a medição; a borda marca a que está na tela.'),
+      list.length > 1 ? h('button', { class: 'btn sm', onclick: async () => { await showTs(list[0]); try { base = await getMesh(list[1]); baseTs = list[1]; renderAll(); } catch (e) { toast(e.message, true); } } }, 'Comparar a última com a anterior') : null);
   }
-  function renderProbe(state, err) {
-    probe.textContent = '';
-    const running = state === 'homing' || state === 'probing';
-    probe.append(h('button', { class: 'btn primary blk', disabled: running || job(), onclick: async () => {
-      if (!(await confirmBox('Medir a mesa agora?', 'A Ender faz a origem (G28) e mede todos os pontos (G29), cerca de 2 a 3 minutos. O bico encosta na mesa várias vezes: fique por perto. A malha nova fica ativa até a Ender desligar; para guardar, use o botão de salvar (M500) depois.', 'Medir'))) return;
-      try { const r = JSON.parse(await post('/bedlevel/probe', { confirm: 1 }) || '{}'); if (!r.ok) throw new Error(r.err || 'recusado'); toast('Medição iniciada'); renderProbe('homing'); startPoll(); } catch (e) { toast(e.message, true); }
-    } }, running ? (state === 'homing' ? 'Fazendo a origem…' : 'Medindo…') : 'Medir de novo (G28 + G29)'));
-    if (state === 'done') probe.append(h('button', { class: 'btn blk', disabled: job(), onclick: async () => {
-      if (await confirmBox('Guardar a malha na Ender?', 'Grava na memória da impressora (M500) a malha nova, o Z offset e as outras configurações atuais.', 'Salvar')) gcode('M500');
-    } }, 'Salvar a malha na memória da Ender (M500)'));
-    if (state === 'error' && err) probe.append(h('p', { class: 'note', style: 'margin:0' }, 'A última medição falhou: ' + err));
+  function renderTable() {
+    tableBox.textContent = '';
+    tableBox.append(h('summary', { class: 'small', style: 'cursor:pointer;font-weight:600' }, 'Tabela de valores (mm)'));
+    const sh = shown(); if (!sh) return;
+    const d = sh.d, gx = d[0].length, gy = d.length;
+    const tb = h('table', { class: 'vals' });
+    tb.append(h('tr', null, h('th', null, ''), Array.from({ length: gx }, (_, i) => h('th', null, i === 0 ? 'esq.' : i === gx - 1 ? 'dir.' : String(i + 1)))));
+    for (let j = gy - 1; j >= 0; j--) tb.append(h('tr', null, h('th', null, j === gy - 1 ? 'fundo' : j === 0 ? 'frente' : String(j + 1)), d[j].map(v => h('td', { style: 'color:' + meshCss(v / sh.scale) }, sgn(v)))));
+    tableBox.append(tb);
+  }
+  function renderAll() { renderTitle(); renderLegend(); renderCompare(); renderSummary(); renderScrews(); renderHist(); renderTable(); syncTools(); draw(); }
+
+  async function showTs(ts) {
+    try { cur = await getMesh(ts); curTs = ts; if (baseTs === ts) { base = null; baseTs = 0; } renderAll(); } catch (e) { toast(e.message, true); }
   }
   async function loadStatus() {
     let s = { state: 'idle' };
     try { s = await getJSON('/bedlevel/status'); } catch (e) { }
-    if (s.mesh) { mesh = s.mesh; label = 'Medição desta sessão' + (s.mesh.ts ? ' · ' + fmtDate(s.mesh.ts) : ''); renderMesh(); }
     renderProbe(s.state, s.err);
     return s;
   }
   function startPoll() {
     clearInterval(poll);
-    poll = setInterval(async () => { const s = await loadStatus(); if (s.state !== 'homing' && s.state !== 'probing') { clearInterval(poll); poll = null; loadList(); } }, 2000);
+    poll = setInterval(async () => {
+      const s = await loadStatus();
+      if (s.state === 'homing' || s.state === 'probing') return;
+      clearInterval(poll); poll = null;
+      if (s.state === 'done' && s.mesh) {
+        const prev = list[0];
+        await loadList();
+        cache.set(s.mesh.ts, s.mesh); cur = s.mesh; curTs = s.mesh.ts;
+        if (prev && prev !== curTs) { try { base = await getMesh(prev); baseTs = prev; toast('Medição nova: comparando com a anterior'); } catch (e) { } }
+        renderAll();
+      }
+    }, 2000);
   }
-  async function loadList() { try { list = (await getJSON('/bedlevel/meshlist')).slice().sort((a, b) => b - a); } catch (e) { list = []; } renderHist(); }
+  async function loadList() { try { list = (await getJSON('/bedlevel/meshlist')).slice().sort((a, b) => b - a); } catch (e) { list = []; } }
+  async function loadHistory() { /* uma de cada vez, para não pesar na ESP32 */
+    for (const ts of list.slice(0, 12)) { if (!alive) return; if (!cache.has(ts)) { try { await getMesh(ts); } catch (e) { } renderHist(); renderCompare(); } }
+  }
   (async () => {
-    try { cfg = await getJSON('/bedlevel/config'); } catch (e) { cfg = { origin: 0, screw_pitch: 0.7 }; }
+    try { cfg = Object.assign(cfg, await getJSON('/bedlevel/config')); } catch (e) { }
     await loadList();
     const s = await loadStatus();
-    if (!s.mesh && list.length) await showTs(list[0], 'Última medição guardada');
-    else if (!s.mesh) renderMesh();
+    if (okMesh(s.mesh)) { cache.set(s.mesh.ts, s.mesh); cur = s.mesh; curTs = s.mesh.ts; }
+    else if (list.length) { try { cur = await getMesh(list[0]); curTs = list[0]; } catch (e) { } }
+    renderAll();
     if (s.state === 'homing' || s.state === 'probing') startPoll();
+    loadHistory();
   })();
-  return { el, update() { }, unmount() { clearInterval(poll); } };
+  if (window.ResizeObserver) { ro = new ResizeObserver(() => draw()); ro.observe(wrap); }
+  syncTools();
+  function update() { const b = (S.status || {}).bed || [0, 0]; bedNow.textContent = 'Mesa agora: ' + num(b[0], 0) + ' °C' + (b[1] > 0 ? ' (alvo ' + num(b[1], 0) + ' °C)' : '') + '. Meça na temperatura em que você imprime (ex.: 60 °C): o metal muda de forma ao aquecer.'; }
+  update();
+  return { el, update, unmount() { alive = false; clearInterval(poll); cancelAnimationFrame(raf); if (ro) ro.disconnect(); } };
 }
 
 /* ---------- Câmera ---------- */

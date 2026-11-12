@@ -33,6 +33,7 @@ typedef struct {
     int grid_x, grid_y;
     float data[BL_MESH_MAX][BL_MESH_MAX];
     float min_z, max_z;
+    float bed_c;     /* Ender Smart (Fase 4): bed temperature when the grid was read, -1 = unknown */
 } bl_mesh_t;
 
 typedef struct {
@@ -40,6 +41,10 @@ typedef struct {
     float screw_spacing;
     float screw_pitch;
     int origin;  /* 0=FL, 1=FR, 2=BL, 3=BR */
+    /* Ender Smart (Fase 4): screw assistant settings shared by every browser */
+    int cw_raises;    /* turning a knob clockwise (seen from below) raises the bed: 1, lowers: -1, unknown: 0 */
+    float screw_fac;  /* how far the screws sit beyond the probed area (1.2 = 20 %) */
+    int screw_ref;    /* 0 = keep the average height, 1..4 = FL, FR, BL, BR stays fixed */
 } bl_config_t;
 
 typedef enum {
@@ -53,7 +58,7 @@ typedef enum {
 /* ---- Static state ---- */
 static bl_state_t s_state = BL_IDLE;
 static bl_mesh_t  s_current_mesh;
-static bl_config_t s_config = { .bed_w = 220, .bed_h = 220, .screw_spacing = 180, .screw_pitch = 1.0f };
+static bl_config_t s_config = { .bed_w = 220, .bed_h = 220, .screw_spacing = 180, .screw_pitch = 1.0f, .screw_fac = 1.2f };
 static char s_error_msg[64];
 
 /* ---- Config persistence ---- */
@@ -82,6 +87,9 @@ static void load_config(void)
     if ((v = cJSON_GetObjectItem(root, "screw_spacing")) && cJSON_IsNumber(v)) s_config.screw_spacing = v->valuedouble;
     if ((v = cJSON_GetObjectItem(root, "screw_pitch")) && cJSON_IsNumber(v)) s_config.screw_pitch = v->valuedouble;
     if ((v = cJSON_GetObjectItem(root, "origin")) && cJSON_IsNumber(v)) s_config.origin = v->valueint;
+    if ((v = cJSON_GetObjectItem(root, "cw_raises")) && cJSON_IsNumber(v)) s_config.cw_raises = v->valueint;
+    if ((v = cJSON_GetObjectItem(root, "screw_fac")) && cJSON_IsNumber(v)) s_config.screw_fac = v->valuedouble;
+    if ((v = cJSON_GetObjectItem(root, "screw_ref")) && cJSON_IsNumber(v)) s_config.screw_ref = v->valueint;
 
     cJSON_Delete(root);
     ESP_LOGI(TAG, "Config loaded: bed %.0fx%.0f screw_sp=%.0f pitch=%.2f origin=%d",
@@ -97,6 +105,9 @@ static void save_config(void)
     cJSON_AddNumberToObject(root, "screw_spacing", s_config.screw_spacing);
     cJSON_AddNumberToObject(root, "screw_pitch", s_config.screw_pitch);
     cJSON_AddNumberToObject(root, "origin", s_config.origin);
+    cJSON_AddNumberToObject(root, "cw_raises", s_config.cw_raises);
+    cJSON_AddNumberToObject(root, "screw_fac", s_config.screw_fac);
+    cJSON_AddNumberToObject(root, "screw_ref", s_config.screw_ref);
 
     char *json = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
@@ -119,6 +130,7 @@ static void save_mesh(const bl_mesh_t *mesh)
     cJSON_AddNumberToObject(root, "gy", mesh->grid_y);
     cJSON_AddNumberToObject(root, "min", mesh->min_z);
     cJSON_AddNumberToObject(root, "max", mesh->max_z);
+    if (mesh->bed_c >= 0) cJSON_AddNumberToObject(root, "bed", mesh->bed_c);
 
     cJSON *rows = cJSON_AddArrayToObject(root, "d");
     for (int y = 0; y < mesh->grid_y; y++) {
@@ -169,6 +181,8 @@ static bool load_mesh_file(const char *path, bl_mesh_t *mesh)
     mesh->grid_y = cJSON_GetObjectItem(root, "gy")->valueint;
     mesh->min_z = cJSON_GetObjectItem(root, "min")->valuedouble;
     mesh->max_z = cJSON_GetObjectItem(root, "max")->valuedouble;
+    cJSON *bed = cJSON_GetObjectItem(root, "bed");
+    mesh->bed_c = (bed && cJSON_IsNumber(bed)) ? (float)bed->valuedouble : -1.0f;
 
     cJSON *rows = cJSON_GetObjectItem(root, "d");
     if (rows) {
@@ -264,6 +278,11 @@ static void mesh_parse_line(const char *line)
             s_parse_state = MESH_PARSE_IDLE;
             if (s_parse_mesh.grid_y > 0 && s_parse_mesh.grid_x > 0) {
                 s_parse_mesh.timestamp = (int64_t)time(NULL);
+                /* Ender Smart (Fase 4): the bed changes shape with temperature — keep it with the mesh.
+                 * Safe here: process_line() runs without the state mutex held. */
+                printer_state_t ps;
+                printer_comm_get_state(&ps);
+                s_parse_mesh.bed_c = ps.last_update_us > 0 ? ps.bed_actual : -1.0f;
                 save_mesh(&s_parse_mesh);
                 s_current_mesh = s_parse_mesh;
                 ESP_LOGI(TAG, "Mesh captured: %dx%d, range %.3f..%.3f",
@@ -365,8 +384,10 @@ cleanup:
 
 static void mesh_to_json(const bl_mesh_t *mesh, html_buf_t *p)
 {
-    html_buf_printf(p, "{\"ts\":%lld,\"gx\":%d,\"gy\":%d,\"min\":%.3f,\"max\":%.3f,\"d\":[",
+    html_buf_printf(p, "{\"ts\":%lld,\"gx\":%d,\"gy\":%d,\"min\":%.3f,\"max\":%.3f,",
                     (long long)mesh->timestamp, mesh->grid_x, mesh->grid_y, mesh->min_z, mesh->max_z);
+    if (mesh->bed_c >= 0) html_buf_printf(p, "\"bed\":%.1f,", mesh->bed_c);
+    html_buf_printf(p, "\"d\":[");
     for (int y = 0; y < mesh->grid_y; y++) {
         html_buf_printf(p, "%s[", y ? "," : "");
         for (int x = 0; x < mesh->grid_x; x++) {
@@ -494,10 +515,12 @@ static esp_err_t bedlevel_mesh_handler(httpd_req_t *req)
 
 static esp_err_t bedlevel_config_get_handler(httpd_req_t *req)
 {
-    char buf[128];
+    char buf[256];
     snprintf(buf, sizeof(buf),
-             "{\"bed_w\":%.1f,\"bed_h\":%.1f,\"screw_spacing\":%.1f,\"screw_pitch\":%.2f,\"origin\":%d}",
-             s_config.bed_w, s_config.bed_h, s_config.screw_spacing, s_config.screw_pitch, s_config.origin);
+             "{\"bed_w\":%.1f,\"bed_h\":%.1f,\"screw_spacing\":%.1f,\"screw_pitch\":%.2f,\"origin\":%d,"
+             "\"cw_raises\":%d,\"screw_fac\":%.2f,\"screw_ref\":%d}",
+             s_config.bed_w, s_config.bed_h, s_config.screw_spacing, s_config.screw_pitch, s_config.origin,
+             s_config.cw_raises, s_config.screw_fac, s_config.screw_ref);
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_sendstr(req, buf);
 }
@@ -524,6 +547,12 @@ static esp_err_t bedlevel_config_post_handler(httpd_req_t *req)
     if ((v = cJSON_GetObjectItem(root, "screw_spacing")) && cJSON_IsNumber(v)) s_config.screw_spacing = v->valuedouble;
     if ((v = cJSON_GetObjectItem(root, "screw_pitch")) && cJSON_IsNumber(v)) s_config.screw_pitch = v->valuedouble;
     if ((v = cJSON_GetObjectItem(root, "origin")) && cJSON_IsNumber(v)) s_config.origin = v->valueint;
+    if ((v = cJSON_GetObjectItem(root, "cw_raises")) && cJSON_IsNumber(v) && v->valueint >= -1 && v->valueint <= 1)
+        s_config.cw_raises = v->valueint;
+    if ((v = cJSON_GetObjectItem(root, "screw_fac")) && cJSON_IsNumber(v) && v->valuedouble >= 1.0 && v->valuedouble <= 2.0)
+        s_config.screw_fac = v->valuedouble;
+    if ((v = cJSON_GetObjectItem(root, "screw_ref")) && cJSON_IsNumber(v) && v->valueint >= 0 && v->valueint <= 4)
+        s_config.screw_ref = v->valueint;
     cJSON_Delete(root);
 
     save_config();
