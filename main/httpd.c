@@ -23,6 +23,7 @@
 #include "obico_client.h"
 #include "terminal.h"
 #include "bedlevel.h"
+#include "job_history.h"
 #include "url_util.h"
 #include "logbuf.h"
 #include "ota.h"
@@ -358,7 +359,7 @@ static esp_err_t api_stats_handler(httpd_req_t *req)
         "{\"cpu0\":%d,\"cpu1\":%d,\"heap\":%lu,\"heap_min\":%lu,"
         "\"uptime_s\":%lld,\"reset_reason\":\"%s\",\"rssi\":%d,"
         "\"wifi\":\"%s\",\"emergency_ap\":%s,\"wifi_reconnects\":%lu,\"camera\":%s,"
-        "\"http_clients\":%u,\"stream_clients\":%d,\"rx_dropped\":%lu}",
+        "\"http_clients\":%u,\"stream_clients\":%d,\"rx_dropped\":%lu,\"temp_mode\":\"%s\"}",
         cpu0_pct, cpu1_pct, (unsigned long)free_heap, (unsigned long)min_heap,
         (long long)(esp_timer_get_time() / 1000000), reset_reason_str(esp_reset_reason()),
         sta ? rssi : 0, sta ? "connected" : "disconnected",
@@ -366,7 +367,7 @@ static esp_err_t api_stats_handler(httpd_req_t *req)
         (unsigned long)wifi_get_reconnect_count(),
         camera_is_available() ? "true" : "false",
         (unsigned)n_clients, __atomic_load_n(&s_stream_clients, __ATOMIC_ACQUIRE),
-        (unsigned long)printer_comm_rx_dropped());
+        (unsigned long)printer_comm_rx_dropped(), printer_comm_autotemp_active() ? "auto" : "poll");
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
@@ -387,6 +388,31 @@ static esp_err_t app_handler(httpd_req_t *req)
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
     return httpd_resp_send(req, (const char *)app_html_start, app_html_end - app_html_start);
+}
+
+/* Ender Smart (Fase 4): icon and manifest for "Add to home screen" */
+extern const uint8_t icon192_png_start[] asm("_binary_icon_192_png_start");
+extern const uint8_t icon192_png_end[]   asm("_binary_icon_192_png_end");
+extern const uint8_t touch_png_start[]   asm("_binary_apple_touch_icon_png_start");
+extern const uint8_t touch_png_end[]     asm("_binary_apple_touch_icon_png_end");
+
+static esp_err_t send_png(httpd_req_t *req, const uint8_t *start, const uint8_t *end)
+{
+    httpd_resp_set_type(req, "image/png");
+    httpd_resp_set_hdr(req, "Cache-Control", "max-age=86400");
+    return httpd_resp_send(req, (const char *)start, end - start);
+}
+static esp_err_t icon192_handler(httpd_req_t *req) { return send_png(req, icon192_png_start, icon192_png_end); }
+static esp_err_t touch_icon_handler(httpd_req_t *req) { return send_png(req, touch_png_start, touch_png_end); }
+
+static esp_err_t manifest_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "application/manifest+json");
+    return httpd_resp_sendstr(req,
+        "{\"name\":\"Ender Smart\",\"short_name\":\"Ender Smart\",\"start_url\":\"/app\",\"scope\":\"/\","
+        "\"display\":\"standalone\",\"background_color\":\"#0F1115\",\"theme_color\":\"#0F1115\","
+        "\"icons\":[{\"src\":\"/icon-192.png\",\"sizes\":\"192x192\",\"type\":\"image/png\",\"purpose\":\"any maskable\"},"
+        "{\"src\":\"/apple-touch-icon.png\",\"sizes\":\"180x180\",\"type\":\"image/png\"}]}");
 }
 
 static void json_str(char *out, size_t out_size, const char *in)
@@ -1216,7 +1242,7 @@ esp_err_t httpd_start_server(void)
     config.server_port = 80;
     config.core_id = 0;
     config.stack_size = 10240;  /* TLS (mbedTLS) in /obico/link handler needs ~8KB */
-    config.max_uri_handlers = 64;   /* Ender Smart: 55 in use after lote 4 */
+    config.max_uri_handlers = 72;   /* Ender Smart: 60 in use after lote 5 */
     config.max_open_sockets = 13;
     config.lru_purge_enable = true;
 
@@ -1241,6 +1267,14 @@ esp_err_t httpd_start_server(void)
         .handler  = api_settings_handler,
     };
     HTTPD_REGISTER(server, &settings_api_uri);
+
+    httpd_uri_t manifest_uri = { .uri = "/manifest.webmanifest", .method = HTTP_GET, .handler = manifest_handler };
+    HTTPD_REGISTER(server, &manifest_uri);
+    httpd_uri_t icon192_uri = { .uri = "/icon-192.png", .method = HTTP_GET, .handler = icon192_handler };
+    HTTPD_REGISTER(server, &icon192_uri);
+    httpd_uri_t touch_uri = { .uri = "/apple-touch-icon.png", .method = HTTP_GET, .handler = touch_icon_handler };
+    HTTPD_REGISTER(server, &touch_uri);
+    job_history_register_httpd(server);
 
     httpd_uri_t printer_info_uri = { .uri = "/api/printer_info", .method = HTTP_GET, .handler = api_printer_info_handler };
     HTTPD_REGISTER(server, &printer_info_uri);

@@ -10,6 +10,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "job_history.h"
+#include <time.h>
+
 static const char *TAG = "host_print";
 
 /* ---- Constants ---- */
@@ -45,6 +48,7 @@ typedef struct {
 
     /* Timing */
     int64_t start_us, pause_elapsed_us;
+    int64_t start_epoch;        /* Ender Smart (F3-06): wall clock at start, 0 if not set */
 
     /* Marlin line numbering & checksum */
     int32_t marlin_line;        /* Next Marlin line number to assign */
@@ -99,6 +103,28 @@ static void hp_clear_error(void)
     }
     g_state.error_msg[0] = '\0';
     xSemaphoreGive(g_state_mutex);
+}
+
+/** Ender Smart (F3-06): add the job that is ending to the print history. */
+static void hp_record(const char *result, const char *reason)
+{
+    int64_t el = s_hp.pause_elapsed_us + (s_hp.paused ? 0 : (esp_timer_get_time() - s_hp.start_us));
+    int32_t total_layers;
+    xSemaphoreTake(g_state_mutex, portMAX_DELAY);
+    total_layers = g_state.total_layers;
+    xSemaphoreGive(g_state_mutex);
+    job_record_t r = {
+        .file = s_hp.filename,
+        .start_epoch = s_hp.start_epoch,
+        .duration_s = (int32_t)(el / 1000000),
+        .result = result,
+        .reason = reason ? reason : "",
+        .lines_sent = s_hp.lines_sent,
+        .total_lines = s_hp.total_lines,
+        .layer = s_hp.has_layer_comments ? s_hp.layer + 1 : 0,   /* 1-based, like the UI */
+        .total_layers = total_layers,
+    };
+    job_history_add(&r);
 }
 
 /** Track the modes and feedrate the file sets, so a pause can restore them (F15-09). */
@@ -357,6 +383,7 @@ static void host_print_unpark(void)
  *  unknown — it only turns the heaters off (a safe action) and reports why. */
 static void host_print_interrupt(const char *why)
 {
+    hp_record("interrupted", why);
     if (s_hp.file) {
         fclose(s_hp.file);
         s_hp.file = NULL;
@@ -386,6 +413,7 @@ static void host_print_interrupt(const char *why)
 /** Finish host print (complete or cancel) */
 static void host_print_finish(bool cancelled)
 {
+    hp_record(cancelled ? "cancelled" : "completed", "");
     if (s_hp.file) {
         fclose(s_hp.file);
         s_hp.file = NULL;
@@ -489,6 +517,10 @@ void hp_cmd_start(const char *filename)
     s_hp.has_layer_comments = false;
     s_hp.start_us = esp_timer_get_time();
     s_hp.pause_elapsed_us = 0;
+    {
+        time_t now = time(NULL);
+        s_hp.start_epoch = now > 1600000000 ? (int64_t)now : 0;  /* 0 = SNTP not synced yet */
+    }
     s_hp.has_pending = false;
     s_hp.line_truncated = false;
     /* Ender Smart: Marlin defaults until the file says otherwise */

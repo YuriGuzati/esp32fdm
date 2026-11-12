@@ -276,11 +276,15 @@ static void mesh_parse_line(const char *line)
         break;
 
     case MESH_PARSE_SKIP_HEADER:
+        /* Ender Smart (F2-03): with M155 autoreport a temperature line (or "busy:")
+         * can arrive in the middle of the grid — ignore it instead of breaking the grid */
+        if ((strstr(line, "T:") && strstr(line, "B:")) || strncmp(line, "busy:", 5) == 0) break;
         /* Column header line (e.g. "      0      1      2 ...") — skip */
         s_parse_state = MESH_PARSE_DATA;
         break;
 
     case MESH_PARSE_DATA: {
+        if ((strstr(line, "T:") && strstr(line, "B:")) || strncmp(line, "busy:", 5) == 0) break;  /* F2-03 */
         const char *p = line;
         while (*p == ' ') p++;
         if (*p < '0' || *p > '9') {

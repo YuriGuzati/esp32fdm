@@ -82,6 +82,7 @@ static uint32_t           s_spam_lines;     /* Creality debug lines dropped */
 #define NVS_KEY_PAUSE_CMD       "pause_cmd"
 #define NVS_KEY_FILAMENT_CHK    "fil_chk"
 #define NVS_KEY_ECHO_PING       "echo_ping"
+#define NVS_KEY_AUTOTEMP        "autotemp"
 
 /* ---- Backend config ---- */
 
@@ -95,6 +96,14 @@ static char s_mr_host[64] = "";
 static uint16_t s_mr_port = 7125;
 static pause_cmd_t s_pause_cmd = PAUSE_CMD_M25;
 static bool s_filament_check = false;  /* Poll M119 for filament runout during host print */
+/* Ender Smart (F2-03): temperature autoreport (M155 S2) instead of polling M105.
+ * Off by default; when the user turns it on, M155 S2 is sent on every connection. */
+static bool s_autotemp = false;
+static bool s_autotemp_sent;            /* M155 S2 sent on this connection */
+static volatile bool s_autotemp_dirty;  /* setting changed: send M155 S2 / S0 */
+static int64_t s_last_auto_temp_us;     /* last unsolicited temperature line */
+static int64_t s_last_m155_us;
+#define AUTOTEMP_FRESH_US (6 * 1000000LL)  /* reports newer than this replace M105 */
 static char s_echo_ping_cmds[128] = "";  /* Comma-separated GCode prefixes that need CDC flush ping */
 
 /* ---- Temperature history circular buffer ---- */
@@ -429,10 +438,12 @@ static void process_line(const char *line)
         strstr(line, "BL24CXX Check")) {
         ESP_LOGW(TAG, "Printer restart detected (\"%s\")", line);
         hp_notify_printer_reset();
+        s_autotemp_sent = false;   /* F2-03: M155 is not kept across a restart */
     }
 
     /* Content-based matching — handles unsolicited auto-reports too */
     if (strstr(line, "T:")) {
+        if (s_pending_query != QUERY_M105) s_last_auto_temp_us = esp_timer_get_time();  /* F2-03 */
         parse_m105(line);
     } else if (strstr(line, "SD printing") || strstr(line, "Not SD")) {
         parse_m27(line);
@@ -905,6 +916,7 @@ static void printer_comm_task(void *arg)
             }
             s_m290_queried = false;
             s_pos_logged = false;
+            s_autotemp_sent = false;
             vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
         }
@@ -992,7 +1004,8 @@ static void printer_comm_task(void *arg)
         if (hp_is_active() && !hp_is_paused()) {
             if (hp_has_pending()) goto poll_done;
             now = esp_timer_get_time();
-            if (now - s_last_m105_us >= POLL_M105_HOSTPRINT_INTERVAL_MS * 1000LL) {
+            bool auto_fresh = s_autotemp && now - s_last_auto_temp_us < AUTOTEMP_FRESH_US;
+            if (!auto_fresh && now - s_last_m105_us >= POLL_M105_HOSTPRINT_INTERVAL_MS * 1000LL) {
                 marlin_send_cmd("M105", QUERY_M105);
                 s_last_m105_us = esp_timer_get_time();
                 CHECK_COOLDOWN();
@@ -1015,9 +1028,27 @@ static void printer_comm_task(void *arg)
             CHECK_COOLDOWN();
         }
 
-        /* Poll M105 (temperatures) every 4s */
+        /* Ender Smart (F2-03): apply the autoreport setting (on connect, on change, and again
+         * if the reports stopped, e.g. after an Ender restart that was not seen) */
         now = esp_timer_get_time();
-        if (now - s_last_m105_us >= POLL_M105_INTERVAL_MS * 1000LL) {
+        if (s_autotemp_dirty ||
+            (s_autotemp && !s_autotemp_sent) ||
+            (s_autotemp && now - s_last_auto_temp_us > 15000000LL && now - s_last_m155_us > 60000000LL)) {
+            bool on = s_autotemp;
+            s_autotemp_dirty = false;
+            s_last_m155_us = now;
+            if (on || s_autotemp_sent) {
+                ESP_LOGI(TAG, "Temperature autoreport %s", on ? "on (M155 S2)" : "off (M155 S0)");
+                marlin_send_cmd(on ? "M155 S2" : "M155 S0", QUERY_CMD);
+            }
+            s_autotemp_sent = on;
+            CHECK_COOLDOWN();
+        }
+
+        /* Poll M105 (temperatures) every 4s — not needed while autoreport lines arrive */
+        now = esp_timer_get_time();
+        bool auto_fresh = s_autotemp && now - s_last_auto_temp_us < AUTOTEMP_FRESH_US;
+        if (!auto_fresh && now - s_last_m105_us >= POLL_M105_INTERVAL_MS * 1000LL) {
             marlin_send_cmd("M105", QUERY_M105);
             s_last_m105_us = esp_timer_get_time();
             CHECK_COOLDOWN();
@@ -1097,6 +1128,11 @@ static void load_config_from_nvs(void)
     uint8_t fil_chk = 0;
     if (nvs_get_u8(nvs, NVS_KEY_FILAMENT_CHK, &fil_chk) == ESP_OK) {
         s_filament_check = (fil_chk == 1);
+    }
+
+    uint8_t autotemp = 0;
+    if (nvs_get_u8(nvs, NVS_KEY_AUTOTEMP, &autotemp) == ESP_OK) {
+        s_autotemp = (autotemp == 1);
     }
 
     size_t ping_len = sizeof(s_echo_ping_cmds);
@@ -1238,11 +1274,11 @@ void printer_comm_settings_json(char *out, size_t out_size)
     host[o] = '\0';
     snprintf(out, out_size,
              "\"backend\":\"%s\",\"mr_host\":\"%s\",\"mr_port\":%u,"
-             "\"pause_cmd\":\"%s\",\"filament_chk\":%s,\"echo_ping\":\"%s\"",
+             "\"pause_cmd\":\"%s\",\"filament_chk\":%s,\"echo_ping\":\"%s\",\"autotemp\":%s",
              s_backend == PRINTER_BACKEND_KLIPPER ? "klipper" : "marlin",
              host, (unsigned)s_mr_port,
              s_pause_cmd == PAUSE_CMD_M524 ? "m524" : "m25",
-             s_filament_check ? "true" : "false", echo);
+             s_filament_check ? "true" : "false", echo, s_autotemp ? "true" : "false");
 }
 
 /* ---- Ender Smart (F15-15 / F2-02) ---- */
@@ -1250,6 +1286,11 @@ void printer_comm_settings_json(char *out, size_t out_size)
 uint32_t printer_comm_rx_dropped(void)
 {
     return s_rx_dropped;
+}
+
+bool printer_comm_autotemp_active(void)
+{
+    return s_autotemp && esp_timer_get_time() - s_last_auto_temp_us < AUTOTEMP_FRESH_US;
 }
 
 void printer_comm_info_json(char *out, size_t out_size)
@@ -1678,12 +1719,23 @@ static esp_err_t printer_config_marlin_post_handler(httpd_req_t *req)
     strncpy(s_echo_ping_cmds, new_ping, sizeof(s_echo_ping_cmds));
     s_echo_ping_cmds[sizeof(s_echo_ping_cmds) - 1] = '\0';
 
+    /* Ender Smart (F2-03) */
+    bool autotemp_given = strstr(body, "autotemp=") != NULL;
+    if (autotemp_given) {
+        bool on = strstr(body, "autotemp=1") != NULL;
+        if (on != s_autotemp) {
+            s_autotemp = on;
+            s_autotemp_dirty = true;
+        }
+    }
+
     /* Persist to NVS */
     nvs_handle_t nvs;
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
         nvs_set_u8(nvs, NVS_KEY_PAUSE_CMD, (uint8_t)new_cmd);
         nvs_set_u8(nvs, NVS_KEY_FILAMENT_CHK, new_fil_chk ? 1 : 0);
         nvs_set_str(nvs, NVS_KEY_ECHO_PING, s_echo_ping_cmds);
+        if (autotemp_given) nvs_set_u8(nvs, NVS_KEY_AUTOTEMP, s_autotemp ? 1 : 0);
         nvs_commit(nvs);
         nvs_close(nvs);
     }

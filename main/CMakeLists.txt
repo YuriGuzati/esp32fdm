@@ -19,11 +19,12 @@ set(SRCS
     "dns_server.c"
     "mdns_service.c"
     "ota.c"
+    "job_history.c"
 )
 
 idf_component_register(
     SRCS ${SRCS}
     INCLUDE_DIRS "."
     # Ender Smart (Fase 4, v1): new web interface served at /app (single file, no build step)
-    EMBED_FILES "web/app.html"
+    EMBED_FILES "web/app.html" "web/icon-192.png" "web/apple-touch-icon.png"
 )

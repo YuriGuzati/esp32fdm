@@ -194,6 +194,9 @@ bool printer_comm_job_active(void);
 /** Ender Smart (F15-15): bytes from the printer lost because the RX buffer was full. */
 uint32_t printer_comm_rx_dropped(void);
 
+/** Ender Smart (F2-03): true while M155 autoreport lines are arriving (M105 polling skipped). */
+bool printer_comm_autotemp_active(void);
+
 /** Ender Smart (F2-02): last M115 answer as a JSON object (firmware line, age, capabilities). */
 void printer_comm_info_json(char *out, size_t out_size);
 

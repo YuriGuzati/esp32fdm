@@ -6,6 +6,13 @@
 <meta name="theme-color" content="#0F1115">
 <title>Ender Smart</title>
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Ender Smart">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <style>
 :root{--bg:#0F1115;--surface:#171A21;--surface2:#1E222B;--surface3:#262B35;--border:#2A2F3A;--border2:#3A3F4B;--text:#E8EAED;--muted:#A3A9B5;--faint:#8C93A0;--accent:#F2994A;--accent-ink:#1A0E05;--accent-soft:#2A1E12;--blue:#5AA9FF;--green:#4CC38A;--yellow:#F2C94C;--red:#FF6B6B;--red-bg:#2A1717;--red-bd:#5A2A2A;--warn-bg:#2A2213;--warn-ink:#F7D9AE;--tabs:#12151B;color-scheme:dark}
 :root[data-theme=light]{--bg:#F5F6F8;--surface:#FFFFFF;--surface2:#F0F2F5;--surface3:#E6E9EE;--border:#E2E5EA;--border2:#CDD2DA;--text:#14171C;--muted:#4F5664;--faint:#5F6774;--accent:#B4530A;--accent-ink:#FFFFFF;--accent-soft:#FFF1E4;--blue:#1D6FD1;--green:#1A7F4E;--yellow:#8A6100;--red:#B42318;--red-bg:#FFF5F5;--red-bd:#F0C2C2;--warn-bg:#FFF4E8;--warn-ink:#6B3A10;--tabs:#FFFFFF;color-scheme:light}
@@ -183,7 +190,8 @@ const ICONS = {
   old: '<path d="M10 6H6v12h12v-4"/><path d="M14 4h6v6M20 4l-9 9"/>',
   wifi: '<path d="M2 8.5a15 15 0 0 1 20 0"/><path d="M5 12a10 10 0 0 1 14 0"/><path d="M8.5 15.5a5 5 0 0 1 7 0"/><circle cx="12" cy="19" r="1"/>',
   up: '<path d="M12 16V4M7 9l5-5 5 5M4 20h16"/>',
-  full: '<path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/>'
+  full: '<path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/>',
+  hist: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>'
 };
 function icon(name, cls) {
   return h('span', { class: cls || 'ico', 'aria-hidden': 'true',
@@ -283,7 +291,7 @@ function sheet(title, content) {
 /* ---------- moldura: navegação, chips, aviso de erro ---------- */
 const NAV = [
   ['inicio', 'Início', 'home', true], ['arquivos', 'Arquivos', 'files', true], ['controles', 'Controles', 'ctl', true],
-  ['mesa', 'Mesa', 'mesh', true], ['camera', 'Câmera', 'cam'], ['terminal', 'Terminal', 'term'], ['logs', 'Logs', 'logs'],
+  ['mesa', 'Mesa', 'mesh', true], ['historico', 'Histórico', 'hist'], ['camera', 'Câmera', 'cam'], ['terminal', 'Terminal', 'term'], ['logs', 'Logs', 'logs'],
   ['config', 'Configurações', 'gear'], ['sistema', 'Sistema', 'sys']
 ];
 function buildNav() {
@@ -309,7 +317,7 @@ function stateInfo() {
 function renderChrome() {
   const r = (location.hash.slice(1) || 'inicio');
   document.querySelectorAll('[data-r]').forEach(a => {
-    const on = a.dataset.r === r || (a.dataset.r === 'mais' && ['camera', 'terminal', 'logs', 'config', 'sistema', 'mais'].includes(r));
+    const on = a.dataset.r === r || (a.dataset.r === 'mais' && ['historico', 'camera', 'terminal', 'logs', 'config', 'sistema', 'mais'].includes(r));
     a.classList.toggle('on', on); if (on) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current');
   });
   const [lbl, col] = stateInfo();
@@ -1350,13 +1358,15 @@ function Config() {
     if (!isK) {
       const p25 = h('input', { type: 'radio', name: 'pc', checked: s.pause_cmd !== 'm524' }), p524 = h('input', { type: 'radio', name: 'pc', checked: s.pause_cmd === 'm524' });
       const fc = h('input', { type: 'checkbox', checked: s.filament_chk }), ep = h('input', { type: 'text', value: s.echo_ping || '', placeholder: 'ex.: M119, G92' });
+      const at = h('input', { type: 'checkbox', checked: s.autotemp });
       el.append(sec('Marlin',
         h('span', { class: 'small muted' }, 'Pausa de impressão feita pelo cartão da própria Ender:'),
         h('label', { class: 'chk' }, p25, 'M25: pausa (pode retomar)'), h('label', { class: 'chk' }, p524, 'M524: aborta (se o M25 travar o firmware)'),
         h('label', { class: 'chk' }, fc, 'Consultar o sensor de filamento (M119) durante a impressão e pausar se acabar'),
+        h('label', { class: 'chk' }, at, 'Temperatura enviada pela Ender a cada 2 s (M155 S2), em vez de a ESP32 perguntar com M105. Atualiza a temperatura também durante a impressão'),
         h('label', { class: 'f' }, 'Comandos que precisam de "ping" (ajuste avançado)', ep),
         h('button', { class: 'btn sm', onclick: async () => {
-          const d = { pause_cmd: p524.checked ? 'm524' : 'm25', echo_ping: ep.value }; if (fc.checked) d.filament_chk = 1;
+          const d = { pause_cmd: p524.checked ? 'm524' : 'm25', echo_ping: ep.value, autotemp: at.checked ? 1 : 0 }; if (fc.checked) d.filament_chk = 1;
           try { await post('/printer/config/marlin', d); toast('Salvo'); loadSettings(); } catch (e) { toast(e.message, true); }
         } }, 'Salvar')));
     }
@@ -1441,10 +1451,53 @@ function Sistema() {
     kv('Memória livre', fmtSize(s.heap)); kv('Memória mínima', fmtSize(s.heap_min)); kv('CPU', s.cpu0 + '% / ' + s.cpu1 + '%');
     kv('Conexões HTTP', s.http_clients); kv('Vídeos abertos', s.stream_clients + ' de 3');
     kv('Bytes perdidos da Ender', s.rx_dropped != null ? String(s.rx_dropped) : '—');
+    kv('Temperatura', s.temp_mode === 'auto' ? 'enviada pela Ender a cada 2 s (M155)' : 'consultada pela ESP32 (M105)');
     if (S.settings) { kv('Firmware', S.settings.fw + ' (' + S.settings.partition + ')'); }
   }
   update();
   return { el, update };
+}
+
+/* ---------- Histórico (F3-06) ---------- */
+function Historico() {
+  const RES = {
+    completed: ['Concluída', 'var(--green)'],
+    cancelled: ['Cancelada', 'var(--yellow)'],
+    interrupted: ['Interrompida', 'var(--red)']
+  };
+  const top = h('section', { class: 'card', 'aria-label': 'Resumo do histórico' });
+  const list = h('ul', { class: 'list', 'aria-label': 'Impressões' });
+  const el = h('div', { class: 'col', style: 'gap:12px' },
+    h('div', { class: 'row between wrap' }, h('h1', null, 'Histórico'), h('button', { class: 'btn sm danger', onclick: async () => {
+      if (!(await confirmBox('Apagar o histórico?', 'Apaga a lista de impressões guardada na ESP32. Os arquivos do cartão não são afetados.', 'Apagar', true))) return;
+      try { await post('/api/history/clear'); toast('Histórico apagado'); load(); } catch (e) { toast(e.message, true); }
+    } }, 'Apagar histórico')),
+    top, list,
+    h('span', { class: 'tiny faint' }, 'Só entram as impressões enviadas por esta ESP32. Uma impressão iniciada pela tela e pelo cartão da própria Ender não aparece aqui.'));
+  async function load() {
+    let jobs = [];
+    try { jobs = await getJSON('/api/history'); } catch (e) { top.textContent = ''; top.append(h('span', { class: 'muted small' }, 'Não consegui ler o histórico: ' + e.message)); return; }
+    top.textContent = ''; list.textContent = '';
+    const done = jobs.filter(j => j.result === 'completed'), total = jobs.reduce((a, j) => a + (j.duration || 0), 0);
+    const kv = h('dl', { class: 'kv' });
+    [['Impressões', String(jobs.length)], ['Concluídas', String(done.length)], ['Canceladas ou interrompidas', String(jobs.length - done.length)], ['Tempo total imprimindo', fmtDur(total)]]
+      .forEach(([k, v]) => kv.append(h('dt', null, k), h('dd', null, v)));
+    top.append(kv);
+    if (!jobs.length) { list.append(h('li', { class: 'muted' }, 'Nenhuma impressão registrada ainda.')); return; }
+    jobs.forEach(j => {
+      const [lbl, col] = RES[j.result] || [j.result, 'var(--faint)'];
+      const pct = j.total_lines > 0 ? Math.round(j.lines / j.total_lines * 100) : null;
+      list.append(h('li', { class: 'card', style: 'gap:6px;padding:12px' },
+        h('div', { class: 'row between', style: 'gap:8px' },
+          h('b', { style: 'overflow-wrap:anywhere' }, j.file),
+          h('span', { class: 'pill', style: 'flex:none;background:transparent;border:1px solid ' + col + ';color:' + col }, lbl)),
+        h('span', { class: 'small muted' }, (j.start ? fmtDate(j.start) : 'data desconhecida (relógio da ESP32 sem hora)') + ' · ' + fmtDur(j.duration)),
+        h('span', { class: 'small muted' }, (j.total_layers > 0 ? 'camada ' + j.layer + ' de ' + j.total_layers + ' · ' : '') + j.lines + (j.total_lines > 0 ? ' de ' + j.total_lines : '') + ' linhas' + (pct != null ? ' (' + pct + '%)' : '')),
+        j.reason ? h('span', { class: 'small', style: 'color:var(--red)' }, j.reason) : null));
+    });
+  }
+  load();
+  return { el, update() { } };
 }
 
 /* ---------- Mais (celular) ---------- */
@@ -1456,7 +1509,7 @@ function Mais() {
 }
 
 /* ---------- roteador ---------- */
-const ROUTES = { inicio: Inicio, arquivos: Arquivos, controles: Controles, mesa: Mesa, camera: Camera, terminal: Terminal, logs: Logs, config: Config, sistema: Sistema, mais: Mais };
+const ROUTES = { inicio: Inicio, arquivos: Arquivos, controles: Controles, mesa: Mesa, historico: Historico, camera: Camera, terminal: Terminal, logs: Logs, config: Config, sistema: Sistema, mais: Mais };
 function go() {
   const name = location.hash.slice(1) || 'inicio';
   if (current && current.unmount) current.unmount();
