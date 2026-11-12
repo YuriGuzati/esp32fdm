@@ -24,4 +24,6 @@ set(SRCS
 idf_component_register(
     SRCS ${SRCS}
     INCLUDE_DIRS "."
+    # Ender Smart (Fase 4, v1): new web interface served at /app (single file, no build step)
+    EMBED_FILES "web/app.html"
 )

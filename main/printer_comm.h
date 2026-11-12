@@ -191,6 +191,9 @@ bool printer_comm_cmd_allowed(const char *gcode, char *reason, size_t reason_len
  */
 bool printer_comm_job_active(void);
 
+/** Ender Smart (Fase 4): writes the printer settings as JSON members (no braces). */
+void printer_comm_settings_json(char *out, size_t out_size);
+
 /**
  * Suppress automatic polling (M105/M27/M114/M119).
  * Used by terminal manual mode to avoid response clutter.

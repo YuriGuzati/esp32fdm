@@ -1148,6 +1148,32 @@ bool printer_comm_is_simulating(void)
     return s_simulate;
 }
 
+/* Ender Smart (Fase 4): printer part of GET /api/settings */
+void printer_comm_settings_json(char *out, size_t out_size)
+{
+    char echo[160];
+    size_t o = 0;
+    for (const char *p = s_echo_ping_cmds; *p && o + 2 < sizeof(echo); p++) {
+        if (*p == '"' || *p == '\\') echo[o++] = '\\';
+        echo[o++] = *p;
+    }
+    echo[o] = '\0';
+    char host[80];
+    o = 0;
+    for (const char *p = s_mr_host; *p && o + 2 < sizeof(host); p++) {
+        if (*p == '"' || *p == '\\') host[o++] = '\\';
+        host[o++] = *p;
+    }
+    host[o] = '\0';
+    snprintf(out, out_size,
+             "\"backend\":\"%s\",\"mr_host\":\"%s\",\"mr_port\":%u,"
+             "\"pause_cmd\":\"%s\",\"filament_chk\":%s,\"echo_ping\":\"%s\"",
+             s_backend == PRINTER_BACKEND_KLIPPER ? "klipper" : "marlin",
+             host, (unsigned)s_mr_port,
+             s_pause_cmd == PAUSE_CMD_M524 ? "m524" : "m25",
+             s_filament_check ? "true" : "false", echo);
+}
+
 bool printer_comm_job_active(void)
 {
     printer_state_t st;

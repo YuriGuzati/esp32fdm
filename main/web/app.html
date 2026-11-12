@@ -1,0 +1,998 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0F1115">
+<title>Ender Smart</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<style>
+:root{--bg:#0F1115;--surface:#171A21;--surface2:#1E222B;--surface3:#262B35;--border:#2A2F3A;--border2:#3A3F4B;--text:#E8EAED;--muted:#A3A9B5;--faint:#8C93A0;--accent:#F2994A;--accent-ink:#1A0E05;--accent-soft:#2A1E12;--blue:#5AA9FF;--green:#4CC38A;--yellow:#F2C94C;--red:#FF6B6B;--red-bg:#2A1717;--red-bd:#5A2A2A;--warn-bg:#2A2213;--warn-ink:#F7D9AE;--tabs:#12151B;color-scheme:dark}
+:root[data-theme=light]{--bg:#F5F6F8;--surface:#FFFFFF;--surface2:#F0F2F5;--surface3:#E6E9EE;--border:#E2E5EA;--border2:#CDD2DA;--text:#14171C;--muted:#4F5664;--faint:#5F6774;--accent:#B4530A;--accent-ink:#FFFFFF;--accent-soft:#FFF1E4;--blue:#1D6FD1;--green:#1A7F4E;--yellow:#8A6100;--red:#B42318;--red-bg:#FFF5F5;--red-bd:#F0C2C2;--warn-bg:#FFF4E8;--warn-ink:#6B3A10;--tabs:#FFFFFF;color-scheme:light}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,Ubuntu,sans-serif;-webkit-text-size-adjust:100%}
+a{color:var(--accent)}
+button,input,select,textarea{font:inherit;color:inherit}
+h1,h2,h3{margin:0;font-weight:650;letter-spacing:-.01em}
+h1{font-size:22px}h2{font-size:15px}
+#app{display:flex;min-height:100vh}
+#side{display:none}
+#main{flex:1;min-width:0;padding-bottom:92px}
+#top{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:16px 16px 8px;max-width:1240px;margin:0 auto}
+.kicker{font-size:11px;color:var(--muted);letter-spacing:.08em;text-transform:uppercase;font-weight:650}
+.chips{display:flex;gap:6px;flex-wrap:wrap;align-items:center;justify-content:flex-end}
+.chip{display:inline-flex;align-items:center;gap:6px;padding:5px 10px;border-radius:999px;background:var(--surface);border:1px solid var(--border);font-size:12px;color:var(--muted);white-space:nowrap}
+.dot{width:9px;height:9px;border-radius:50%;flex:none;background:var(--faint)}
+#banner{max-width:1240px;margin:0 auto;padding:0 16px}
+#view{max-width:1240px;margin:0 auto;padding:4px 16px 16px;display:flex;flex-direction:column;gap:12px}
+#tabs{position:fixed;left:0;right:0;bottom:0;display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:2px;padding:6px 8px calc(8px + env(safe-area-inset-bottom));background:var(--tabs);border-top:1px solid var(--border);z-index:20}
+#tabs a,#side a{display:flex;align-items:center;text-decoration:none;color:var(--muted);font-size:11px;font-weight:550}
+#tabs a{flex-direction:column;justify-content:center;gap:3px;min-height:52px;border-radius:12px}
+#tabs a.on,#side a.on{color:var(--accent);font-weight:700}
+#side a{gap:10px;height:44px;padding:0 12px;border-radius:12px;font-size:14px}
+#side a.on{background:var(--surface);border:1px solid var(--border)}
+#side .grp{font-size:11px;color:var(--faint);text-transform:uppercase;letter-spacing:.08em;padding:14px 12px 4px;font-weight:650}
+@media (min-width:900px){
+ #side{display:flex;flex-direction:column;gap:2px;width:232px;flex:none;padding:20px 12px;position:sticky;top:0;height:100vh;overflow:auto;border-right:1px solid var(--border)}
+ #tabs{display:none}
+ #main{padding-bottom:24px}
+}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:14px;display:flex;flex-direction:column;gap:10px;min-width:0}
+.row{display:flex;align-items:center;gap:10px;min-width:0}
+.between{justify-content:space-between}
+.wrap{flex-wrap:wrap}
+.col{display:flex;flex-direction:column;gap:6px;min-width:0}
+.grid2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.grid3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}
+.dash{display:flex;flex-direction:column;gap:12px}
+.dash>.col{display:contents}
+.o1{order:1}.o2{order:2}.o3{order:3}.o4{order:4}.o5{order:5}.o6{order:6}
+@media (min-width:900px){.dash{display:grid;grid-template-columns:minmax(0,3fr) minmax(0,2fr);align-items:start}.dash>.col{display:flex;gap:12px}}
+@media (max-width:420px){h1{font-size:20px}.chip.wf{display:none}}
+.muted{color:var(--muted)}.faint{color:var(--faint)}.small{font-size:12px}.tiny{font-size:11px}
+.big{font-size:30px;font-weight:650;line-height:1.1}
+.metric{display:flex;flex-direction:column;gap:2px;min-width:0}
+.metric b{font-size:18px;font-weight:650}
+.bar{height:10px;border-radius:5px;background:var(--surface3);overflow:hidden}
+.bar>div{height:100%;border-radius:5px;background:var(--accent);transition:width .4s}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;min-height:44px;padding:0 14px;border-radius:12px;border:1px solid var(--border2);background:var(--surface2);color:var(--text);font-weight:600;cursor:pointer;text-decoration:none;white-space:nowrap}
+.btn:hover{filter:brightness(1.08)}
+.btn.primary{background:var(--accent);color:var(--accent-ink);border-color:transparent}
+.btn.danger{background:var(--red-bg);color:var(--red);border-color:var(--red-bd)}
+.btn.sel{background:var(--accent-soft);border-color:var(--accent);color:var(--accent)}
+.btn.sm{min-height:36px;padding:0 10px;font-size:13px;border-radius:10px}
+.btn:disabled{opacity:.45;cursor:not-allowed;filter:none}
+.btn.blk{width:100%}
+.ico{width:20px;height:20px;flex:none}
+.pill{font-size:11px;font-weight:650;padding:4px 10px;border-radius:999px;background:var(--warn-bg);color:var(--warn-ink)}
+.note{padding:10px 12px;border-radius:12px;background:var(--warn-bg);color:var(--warn-ink);font-size:13px;line-height:1.5}
+.err{padding:12px 14px;border-radius:14px;background:var(--red-bg);border:1px solid var(--red-bd);color:var(--red);display:flex;gap:12px;align-items:center;justify-content:space-between;margin-bottom:4px}
+.cam{position:relative;border-radius:16px;overflow:hidden;background:#000;border:1px solid var(--border);aspect-ratio:4/3}
+.cam img{width:100%;height:100%;object-fit:cover;display:block}
+.cam .ov{position:absolute;left:10px;top:10px;padding:4px 9px;border-radius:999px;background:rgba(15,17,21,.78);color:#E8EAED;font-size:11px}
+.cam .ph{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#A3A9B5;font-size:13px;text-align:center;padding:16px}
+input[type=text],input[type=number],input[type=url],select,textarea{min-height:44px;padding:8px 10px;border-radius:10px;border:1px solid var(--border2);background:var(--surface2);width:100%}
+input[type=range]{width:100%;accent-color:var(--accent)}
+label.f{display:flex;flex-direction:column;gap:4px;font-size:13px;color:var(--muted)}
+label.chk{display:flex;align-items:center;gap:10px;min-height:40px}
+.list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:8px}
+.item{width:100%;text-align:left;display:flex;align-items:center;gap:12px;padding:12px;border-radius:14px;border:1px solid var(--border);background:var(--surface);color:var(--text);cursor:pointer}
+.item .nm{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.term{font:12.5px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#0B0D10;color:#D4D7DD;border-radius:12px;padding:12px;height:52vh;overflow:auto;white-space:pre-wrap;word-break:break-word;border:1px solid var(--border)}
+.mesh{display:grid;gap:4px}
+.mesh div{height:52px;border-radius:8px;display:flex;align-items:center;justify-content:center;font:600 11px system-ui,sans-serif;color:#F4F5F7}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:6px 14px;font-size:14px}
+.kv dt{color:var(--muted)}.kv dd{margin:0;font-weight:600;text-align:right;overflow-wrap:anywhere}
+.modal-bg{position:fixed;inset:0;background:rgba(5,6,8,.62);display:flex;align-items:flex-end;justify-content:center;z-index:50}
+.sheet{width:100%;max-width:520px;max-height:88vh;overflow:auto;background:var(--surface);border:1px solid var(--border);border-radius:20px 20px 0 0;padding:20px 18px calc(22px + env(safe-area-inset-bottom));display:flex;flex-direction:column;gap:12px}
+@media (min-width:640px){.modal-bg{align-items:center}.sheet{border-radius:20px}}
+#toast{position:fixed;left:50%;bottom:96px;transform:translateX(-50%);z-index:60;display:flex;flex-direction:column;gap:8px;align-items:center;pointer-events:none;width:min(92vw,520px)}
+#toast div{background:var(--surface3);color:var(--text);border:1px solid var(--border2);padding:10px 14px;border-radius:12px;font-size:13px;box-shadow:0 6px 20px rgba(0,0,0,.25)}
+#toast div.e{background:var(--red-bg);color:var(--red);border-color:var(--red-bd)}
+@media (min-width:900px){#toast{bottom:24px}}
+.sec h2{margin-bottom:2px}
+.hide{display:none!important}
+.pad{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}
+svg.spark{width:100%;height:28px;display:block}
+</style>
+</head>
+<body>
+<div id="app">
+ <aside id="side" aria-label="Navegação"></aside>
+ <div id="main">
+  <header id="top">
+   <div class="col" style="gap:2px">
+    <span class="kicker">Ender Smart</span>
+    <h1 id="pname">Ender-3 Max Neo</h1>
+   </div>
+   <div class="chips" id="chips"></div>
+  </header>
+  <div id="banner"></div>
+  <main id="view"></main>
+ </div>
+ <nav id="tabs" aria-label="Navegação principal"></nav>
+</div>
+<div id="modal"></div>
+<div id="toast" role="status" aria-live="polite"></div>
+<script>
+'use strict';
+/* ===== Ender Smart — interface v1 (Fase 4) =====
+   Arquivo único servido pela ESP32 em /app. Usa só as rotas que o firmware já tem.
+   Nada aqui decide segurança: as regras ficam no servidor (F15-10/13/18). */
+
+/* ---------- utilidades ---------- */
+const $ = (s, r) => (r || document).querySelector(s);
+function h(tag, attrs, ...kids) {
+  const el = document.createElement(tag);
+  if (attrs) for (const k in attrs) {
+    const v = attrs[k];
+    if (v == null || v === false) continue;
+    if (k === 'class') el.className = v;
+    else if (k === 'style') el.style.cssText = v;
+    else if (k.startsWith('on') && typeof v === 'function') el.addEventListener(k.slice(2), v);
+    else if (k === 'svg') el.innerHTML = v; /* só ícones constantes deste arquivo */
+    else el.setAttribute(k, v === true ? '' : v);
+  }
+  for (const c of kids.flat(9)) {
+    if (c == null || c === false) continue;
+    el.append(c.nodeType ? c : document.createTextNode(String(c)));
+  }
+  return el;
+}
+const ICONS = {
+  home: '<path d="M3 11l9-7 9 7"/><path d="M5 10v10h14V10"/>',
+  files: '<path d="M4 4h6l2 2h8v14H4z"/>',
+  ctl: '<circle cx="12" cy="12" r="3"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4"/>',
+  mesh: '<rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M3 15h18M9 3v18M15 3v18"/>',
+  more: '<circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/>',
+  cam: '<path d="M4 7h3l2-2h6l2 2h3v12H4z"/><circle cx="12" cy="13" r="3.5"/>',
+  term: '<path d="M4 5h16v14H4z"/><path d="M7 9l3 3-3 3M12 15h5"/>',
+  logs: '<path d="M6 3h9l3 3v15H6z"/><path d="M9 10h6M9 14h6M9 18h4"/>',
+  gear: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.6 1.6 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.6 1.6 0 0 0-1.8-.3 1.6 1.6 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.6 1.6 0 0 0-1-1.5 1.6 1.6 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.6 1.6 0 0 0 .3-1.8 1.6 1.6 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.6 1.6 0 0 0 1.5-1 1.6 1.6 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.6 1.6 0 0 0 1.8.3H9a1.6 1.6 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.6 1.6 0 0 0 1 1.5 1.6 1.6 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.6 1.6 0 0 0-.3 1.8V9a1.6 1.6 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.6 1.6 0 0 0-1.5 1z"/>',
+  sys: '<path d="M4 4h16v12H4z"/><path d="M8 20h8M12 16v4"/>',
+  old: '<path d="M10 6H6v12h12v-4"/><path d="M14 4h6v6M20 4l-9 9"/>',
+  wifi: '<path d="M2 8.5a15 15 0 0 1 20 0"/><path d="M5 12a10 10 0 0 1 14 0"/><path d="M8.5 15.5a5 5 0 0 1 7 0"/><circle cx="12" cy="19" r="1"/>',
+  up: '<path d="M12 16V4M7 9l5-5 5 5M4 20h16"/>',
+  full: '<path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/>'
+};
+function icon(name, cls) {
+  return h('span', { class: cls || 'ico', 'aria-hidden': 'true',
+    svg: '<svg viewBox="0 0 24 24" width="100%" height="100%" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' + (ICONS[name] || '') + '</svg>' });
+}
+const num = (v, d) => (v == null || isNaN(v)) ? '—' : Number(v).toFixed(d == null ? 0 : d).replace('.', ',');
+function fmtDur(s) {
+  s = Math.max(0, Math.round(s || 0));
+  const hh = Math.floor(s / 3600), mm = Math.floor((s % 3600) / 60);
+  if (hh) return hh + ' h ' + String(mm).padStart(2, '0') + ' min';
+  if (mm) return mm + ' min';
+  return s + ' s';
+}
+function fmtSize(b) {
+  if (b < 1024) return b + ' B';
+  if (b < 1048576) return num(b / 1024, 0) + ' KB';
+  return num(b / 1048576, 1) + ' MB';
+}
+function fmtDate(t) {
+  if (!t) return '—';
+  const d = new Date(t * 1000);
+  return d.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' }) + ' ' + d.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+}
+function toast(msg, isErr) {
+  const el = h('div', { class: isErr ? 'e' : '' }, msg);
+  $('#toast').append(el);
+  setTimeout(() => el.remove(), isErr ? 6000 : 3200);
+}
+
+/* ---------- API ---------- */
+async function getJSON(url) {
+  const r = await fetch(url, { cache: 'no-store' });
+  if (!r.ok) throw new Error((await r.text().catch(() => '')).slice(0, 160) || ('HTTP ' + r.status));
+  return r.json();
+}
+async function getText(url) {
+  const r = await fetch(url, { cache: 'no-store' });
+  const t = await r.text();
+  if (!r.ok) throw new Error(t.slice(0, 160) || ('HTTP ' + r.status));
+  return t;
+}
+async function post(url, data, json) {
+  const opts = { method: 'POST', redirect: 'manual', headers: {} };
+  if (json) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(data); }
+  else { opts.headers['Content-Type'] = 'application/x-www-form-urlencoded'; opts.body = new URLSearchParams(data || {}).toString(); }
+  const r = await fetch(url, opts);
+  if (r.type === 'opaqueredirect') return '';
+  const t = await r.text().catch(() => '');
+  if (r.ok || r.status === 303) return t;
+  throw new Error(t.replace(/<[^>]*>/g, ' ').trim().slice(0, 200) || ('HTTP ' + r.status));
+}
+async function gcode(cmd, quiet) {
+  try { await post('/api/command', { cmd }); if (!quiet) toast('Enviado: ' + cmd); return true; }
+  catch (e) { toast(e.message, true); return false; }
+}
+async function gcodes(list) { for (const c of list) { if (!(await gcode(c, true))) return false; } return true; }
+
+/* ---------- estado e polling ---------- */
+const S = { status: null, stats: null, settings: null, hist: null, online: true, lastOk: 0 };
+let current = null;
+function refreshView() { try { current && current.update && current.update(); } catch (e) { console.error(e); } renderChrome(); }
+async function pollStatus() {
+  try { S.status = await getJSON('/api/status'); S.online = true; S.lastOk = Date.now(); }
+  catch (e) { S.online = false; }
+  refreshView();
+}
+async function pollStats() { try { S.stats = await getJSON('/api/stats'); } catch (e) { } renderChrome(); }
+async function pollHist() { try { S.hist = (await getJSON('/api/temp_history')).samples || []; } catch (e) { } refreshView(); }
+async function loadSettings() { try { S.settings = await getJSON('/api/settings'); } catch (e) { } refreshView(); }
+function every(fn, ms) { fn(); return setInterval(() => { if (!document.hidden) fn(); }, ms); }
+const job = () => { const s = S.status && S.status.state; return s === 'printing' || s === 'paused'; };
+
+/* ---------- confirmação ---------- */
+function confirmBox(title, body, okLabel, danger) {
+  return new Promise(res => {
+    const close = v => { root.remove(); res(v); };
+    const root = h('div', { class: 'modal-bg', onclick: e => { if (e.target === root) close(false); } },
+      h('div', { class: 'sheet', role: 'dialog', 'aria-modal': 'true', 'aria-label': title },
+        h('h2', { style: 'font-size:19px' }, title),
+        body ? h('p', { style: 'margin:0;color:var(--muted);line-height:1.5' }, body) : null,
+        h('div', { class: 'grid2', style: 'margin-top:6px' },
+          h('button', { class: 'btn', onclick: () => close(false) }, 'Voltar'),
+          h('button', { class: 'btn ' + (danger ? 'danger' : 'primary'), onclick: () => close(true) }, okLabel || 'Confirmar'))));
+    $('#modal').append(root);
+  });
+}
+function sheet(title, content) {
+  const root = h('div', { class: 'modal-bg', onclick: e => { if (e.target === root) root.remove(); } },
+    h('div', { class: 'sheet', role: 'dialog', 'aria-modal': 'true', 'aria-label': title },
+      h('div', { class: 'row between' }, h('h2', { style: 'font-size:18px;overflow-wrap:anywhere' }, title),
+        h('button', { class: 'btn sm', 'aria-label': 'Fechar', onclick: () => root.remove() }, '✕')),
+      content));
+  $('#modal').append(root);
+  return root;
+}
+
+/* ---------- moldura: navegação, chips, aviso de erro ---------- */
+const NAV = [
+  ['inicio', 'Início', 'home', true], ['arquivos', 'Arquivos', 'files', true], ['controles', 'Controles', 'ctl', true],
+  ['mesa', 'Mesa', 'mesh', true], ['camera', 'Câmera', 'cam'], ['terminal', 'Terminal', 'term'], ['logs', 'Logs', 'logs'],
+  ['config', 'Configurações', 'gear'], ['sistema', 'Sistema', 'sys']
+];
+function buildNav() {
+  const side = $('#side'), tabs = $('#tabs');
+  side.append(h('div', { class: 'col', style: 'gap:2px;padding:4px 12px 14px' },
+    h('span', { class: 'kicker' }, 'Ender Smart'), h('b', { style: 'font-size:17px' }, 'Ender-3 Max Neo')));
+  NAV.forEach(([id, label, ic], i) => {
+    if (i === 4) side.append(h('div', { class: 'grp' }, 'Ferramentas'));
+    side.append(h('a', { href: '#' + id, 'data-r': id }, icon(ic), label));
+  });
+  side.append(h('div', { class: 'grp' }, 'Outros'), h('a', { href: '/' }, icon('old'), 'Interface antiga'));
+  NAV.filter(n => n[3]).forEach(([id, label, ic]) => tabs.append(h('a', { href: '#' + id, 'data-r': id }, icon(ic), label)));
+  tabs.append(h('a', { href: '#mais', 'data-r': 'mais' }, icon('more'), 'Mais'));
+}
+function stateInfo() {
+  const st = S.status;
+  if (!S.online) return ['Sem resposta da ESP32', 'var(--red)'];
+  if (!st) return ['Carregando…', 'var(--faint)'];
+  if (!st.usb && st.state !== 'error') return ['Ender desconectada', 'var(--faint)'];
+  return ({ printing: ['Imprimindo', 'var(--green)'], paused: ['Pausada', 'var(--yellow)'], error: ['Erro', 'var(--red)'],
+    operational: ['Pronta', 'var(--blue)'], disconnected: ['Ender desconectada', 'var(--faint)'] })[st.state] || [st.state, 'var(--faint)'];
+}
+function renderChrome() {
+  const r = (location.hash.slice(1) || 'inicio');
+  document.querySelectorAll('[data-r]').forEach(a => {
+    const on = a.dataset.r === r || (a.dataset.r === 'mais' && ['camera', 'terminal', 'logs', 'config', 'sistema', 'mais'].includes(r));
+    a.classList.toggle('on', on); if (on) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current');
+  });
+  const [lbl, col] = stateInfo();
+  const chips = $('#chips'); chips.textContent = '';
+  chips.append(h('span', { class: 'chip' }, h('span', { class: 'dot', style: 'background:' + col }), lbl));
+  if (S.stats && S.stats.wifi === 'connected') chips.append(h('span', { class: 'chip wf', title: 'Sinal do Wi-Fi' }, icon('wifi', 'ico'), S.stats.rssi + ' dBm'));
+  const b = $('#banner'); b.textContent = '';
+  if (S.status && S.status.state === 'error') {
+    b.append(h('div', { class: 'err', role: 'alert' },
+      h('span', null, S.status.error || 'A impressora informou um erro.'),
+      h('button', { class: 'btn sm danger', onclick: async () => { try { await post('/sd/cancel'); toast('Erro reconhecido'); pollStatus(); } catch (e) { toast(e.message, true); } } }, 'OK')));
+  }
+}
+
+/* ---------- gráficos ---------- */
+function svgEl(attrs) { /* createElement('svg') daria um elemento HTML que não desenha */
+  const s = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  for (const k in attrs) s.setAttribute(k, attrs[k]);
+  return s;
+}
+function spark(samples, idx, color, minutes) {
+  const svg = svgEl({ class: 'spark', viewBox: '0 0 140 28', preserveAspectRatio: 'none', 'aria-hidden': 'true' });
+  if (!samples || samples.length < 2) return svg;
+  const tEnd = samples[samples.length - 1][0], t0 = tEnd - minutes * 60;
+  const pts = samples.filter(s => s[0] >= t0);
+  if (pts.length < 2) return svg;
+  let mn = Infinity, mx = -Infinity;
+  pts.forEach(s => { mn = Math.min(mn, s[idx], s[idx + 1] || s[idx]); mx = Math.max(mx, s[idx], s[idx + 1] || s[idx]); });
+  if (mx - mn < 5) { mx += 2.5; mn -= 2.5; }
+  const p = pts.map(s => ((s[0] - t0) / (tEnd - t0) * 140).toFixed(1) + ',' + (26 - (s[idx] - mn) / (mx - mn) * 24).toFixed(1)).join(' ');
+  svg.innerHTML = '<polyline points="' + p + '" fill="none" stroke="' + color + '" stroke-width="2"/>';
+  return svg;
+}
+function chart(samples, minutes) {
+  const W = 600, H = 180;
+  const svg = svgEl({ viewBox: '0 0 ' + W + ' ' + H, style: 'width:100%;height:auto;display:block', role: 'img', 'aria-label': 'Temperaturas do bico e da mesa nos últimos ' + minutes + ' minutos' });
+  if (!samples || samples.length < 2) return svg;
+  const tEnd = samples[samples.length - 1][0], t0 = tEnd - minutes * 60;
+  const pts = samples.filter(s => s[0] >= t0);
+  if (pts.length < 2) return svg;
+  let mx = 40; pts.forEach(s => { mx = Math.max(mx, s[1], s[2], s[3], s[4]); }); mx = Math.ceil((mx + 10) / 50) * 50;
+  const X = t => ((t - t0) / (tEnd - t0) * W).toFixed(1), Y = v => (H - 6 - v / mx * (H - 28)).toFixed(1);
+  let inner = '';
+  for (let g = 0; g <= mx; g += 50) inner += '<line x1="0" x2="' + W + '" y1="' + Y(g) + '" y2="' + Y(g) + '" stroke="var(--border)" stroke-width="1"/><text x="4" y="' + (Y(g) - 3) + '" font-size="15" fill="var(--faint)">' + g + '°</text>';
+  const line = (i, c, dash) => '<polyline points="' + pts.map(s => X(s[0]) + ',' + Y(s[i])).join(' ') + '" fill="none" stroke="' + c + '" stroke-width="' + (dash ? 1.2 : 2.4) + '"' + (dash ? ' stroke-dasharray="5 4"' : '') + '/>';
+  inner += line(2, 'var(--accent)', 1) + line(4, 'var(--blue)', 1) + line(1, 'var(--accent)') + line(3, 'var(--blue)');
+  svg.innerHTML = inner;
+  return svg;
+}
+
+/* =================== TELAS =================== */
+
+/* ---------- Início ---------- */
+/* Montada uma vez; update() só troca textos e estados (nada é recriado a cada 2 s,
+   para não perder toques nem o que foi digitado). */
+function Inicio() {
+  const el = h('div', { class: 'dash' });
+  const left = h('div', { class: 'col' }), right = h('div', { class: 'col' });
+  el.append(left, right);
+  /* câmera (foto periódica: não ocupa uma das 3 vagas de vídeo) */
+  const img = h('img', { alt: 'Câmera: mesa e cabeçote da impressora' });
+  const ph = h('div', { class: 'ph' }, 'Carregando a câmera…');
+  const cam = h('section', { class: 'cam o2', 'aria-label': 'Câmera' }, img, ph,
+    h('span', { class: 'ov' }, 'Foto a cada 3 s'),
+    h('a', { class: 'btn sm', href: '#camera', style: 'position:absolute;right:10px;bottom:10px;background:rgba(15,17,21,.78);color:#E8EAED;border-color:transparent', 'aria-label': 'Abrir vídeo ao vivo' }, icon('full'), 'Ao vivo'));
+  let camBusy = false;
+  img.onload = () => { ph.classList.add('hide'); camBusy = false; };
+  img.onerror = () => { ph.textContent = 'Câmera indisponível'; ph.classList.remove('hide'); camBusy = false; };
+  const snap = () => { if (camBusy || document.hidden) return; camBusy = true; img.src = '/capture?t=' + Date.now(); };
+  const camTimer = setInterval(snap, 3000); snap();
+  const chartBody = h('div');
+  const chartBox = h('div', { class: 'card o6' }, h('div', { class: 'row between' }, h('h2', null, 'Temperaturas · 30 min'),
+    h('span', { class: 'small muted' }, h('span', { style: 'color:var(--accent)' }, '●'), ' Bico  ', h('span', { style: 'color:var(--blue)' }, '●'), ' Mesa')), chartBody);
+  left.append(cam, chartBox);
+
+  /* cartão da impressão: duas versões (com e sem impressão), trocadas só quando o modo muda */
+  const dot = h('span', { class: 'dot' }), lbl = h('b'), be = h('span', { class: 'small muted' });
+  const fn = h('div', { style: 'font-size:20px;font-weight:650;overflow-wrap:anywhere' });
+  const barIn = h('div'), bar = h('div', { class: 'bar', role: 'progressbar', 'aria-valuemin': 0, 'aria-valuemax': 100, 'aria-label': 'Progresso' }, barIn);
+  const mPct = h('b'), mLay = h('b'), mZ = h('span', { class: 'tiny faint' }), mTk = h('span', { class: 'small muted' }), mT = h('b'), mTs = h('span', { class: 'tiny faint' });
+  const jobBox = h('div', { class: 'col', style: 'gap:10px' }, fn, bar, h('div', { class: 'grid3' },
+    h('div', { class: 'metric' }, h('span', { class: 'small muted' }, 'Progresso'), mPct, h('span', { class: 'tiny faint' }, 'pelo arquivo')),
+    h('div', { class: 'metric' }, h('span', { class: 'small muted' }, 'Camada'), mLay, mZ),
+    h('div', { class: 'metric' }, mTk, mT, mTs)));
+  const idleTxt = h('p', { class: 'muted', style: 'margin:0' });
+  const idleBox = h('div', { class: 'col', style: 'gap:10px' }, idleTxt, h('a', { class: 'btn primary', href: '#arquivos' }, icon('files'), 'Escolher um arquivo'));
+  const stCard = h('section', { class: 'card o1', 'aria-label': 'Impressão atual' },
+    h('div', { class: 'row between' }, h('div', { class: 'row', style: 'gap:8px' }, dot, lbl), be), jobBox, idleBox);
+
+  function mkTile(label, color, idx) {
+    const v = h('span', { class: 'big', style: 'color:' + color }, '—'), t = h('span', { class: 'tiny faint' }), sp = h('div');
+    const box = h('div', { class: 'card', style: 'gap:2px' }, h('span', { class: 'small muted' }, label),
+      h('div', { class: 'row', style: 'gap:4px;align-items:baseline' }, v, h('span', { class: 'muted' }, '°C')), t, sp);
+    return { box, set(pair) { v.textContent = num(pair[0], 0); t.textContent = pair[1] > 0 ? 'alvo ' + num(pair[1], 0) + ' °C' : 'desligado'; sp.textContent = ''; sp.append(spark(S.hist, idx, color, 15)); } };
+  }
+  const tH = mkTile('Bico', 'var(--accent)', 1), tB = mkTile('Mesa', 'var(--blue)', 3);
+  const temps = h('section', { class: 'grid2 o3', 'aria-label': 'Temperaturas' }, tH.box, tB.box);
+
+  async function act(kind) {
+    const map = {
+      pause: ['Pausar a impressão?', 'A ESP32 espera o movimento atual, recolhe o filamento, sobe o bico 5 mm e estaciona. Na retomada, o bico reaquece antes de continuar.', 'Pausar', '/sd/pause'],
+      resume: ['Retomar a impressão?', 'O bico volta à temperatura, retorna à posição salva e a impressão continua com os mesmos modos.', 'Retomar', '/sd/resume'],
+      cancel: ['Cancelar a impressão?', 'O envio para, o bico sobe e os aquecedores são desligados. Não dá para continuar depois.', 'Cancelar impressão', '/sd/cancel']
+    }[kind];
+    if (!(await confirmBox(map[0], map[1], map[2], kind === 'cancel'))) return;
+    try { await post(map[3]); toast(map[2] + ': comando enviado'); setTimeout(pollStatus, 800); } catch (e) { toast(e.message, true); }
+  }
+  const pauseBtn = h('button', { class: 'btn', onclick: () => act(S.status && S.status.state === 'paused' ? 'resume' : 'pause') }, 'Pausar');
+  const actions = h('section', { class: 'grid2 o4 hide', 'aria-label': 'Ações' }, pauseBtn,
+    h('button', { class: 'btn danger', onclick: () => act('cancel') }, 'Cancelar'));
+
+  const babyVal = h('span', { class: 'tiny faint' });
+  const step = d => h('button', { class: 'btn sm', 'aria-label': (d > 0 ? 'Subir ' : 'Descer ') + Math.abs(d) + ' mm', onclick: () => gcode('M290 Z' + d) }, (d > 0 ? '+' : '−') + num(Math.abs(d), 2));
+  const saveBtn = h('button', { class: 'btn sm', onclick: async () => {
+    if (await confirmBox('Salvar as configurações na Ender?', 'Grava na memória da impressora (M500) o Z offset, a malha e as outras configurações atuais.', 'Salvar')) gcode('M500');
+  } }, 'Salvar na memória da Ender (M500)');
+  const baby = h('section', { class: 'card o5', 'aria-label': 'Ajuste fino do Z' },
+    h('div', { class: 'row between wrap' },
+      h('div', { class: 'col', style: 'gap:2px' }, h('b', null, 'Ajuste fino do Z'), babyVal),
+      h('div', { class: 'row', style: 'gap:6px' }, step(-0.05), step(-0.01), step(0.01), step(0.05))),
+    saveBtn);
+  right.append(stCard, temps, actions, baby);
+
+  function update() {
+    const st = S.status || {};
+    const [l, col] = stateInfo();
+    const paused = st.state === 'paused', active = job();
+    dot.style.background = col; lbl.textContent = l; be.textContent = st.backend || '';
+    jobBox.classList.toggle('hide', !active); idleBox.classList.toggle('hide', active);
+    if (active) {
+      const pct = Math.max(0, Math.min(100, st.progress || 0));
+      const [lay, tot] = String(st.layer || '0/0').split('/');
+      fn.textContent = st.filename || '—';
+      barIn.style.width = pct + '%'; barIn.style.background = paused ? 'var(--faint)' : 'var(--accent)'; bar.setAttribute('aria-valuenow', Math.round(pct));
+      mPct.textContent = num(pct, 0) + '%';
+      mLay.textContent = +tot ? lay + ' / ' + tot : lay; mZ.textContent = 'Z ' + num(st.z, 1) + ' mm';
+      mTk.textContent = st.remaining ? 'Restante' : 'Decorrido';
+      mT.textContent = st.remaining ? '~' + fmtDur(st.remaining) : fmtDur(st.elapsed); mTs.textContent = st.remaining ? 'estimado' : '';
+    } else {
+      idleTxt.textContent = !S.online ? 'A ESP32 não respondeu à última consulta.' : st.usb === false ? 'A ESP32 não está conectada à Ender pela USB.' : 'Nenhuma impressão em andamento.';
+    }
+    tH.set(st.hotend || [0, 0]); tB.set(st.bed || [0, 0]);
+    actions.classList.toggle('hide', !active);
+    pauseBtn.textContent = paused ? 'Retomar' : 'Pausar';
+    babyVal.textContent = 'Z offset atual ' + num(st.baby_z, 2) + ' mm. Ajustar pela tela da Ender trava a impressora ~3 s.';
+    saveBtn.disabled = active; saveBtn.title = active ? 'Disponível com a impressora parada' : '';
+    chartBody.textContent = ''; chartBody.append(chart(S.hist, 30));
+  }
+  const t = every(pollHist, 30000);
+  return { el, update, unmount() { clearInterval(camTimer); clearInterval(t); img.removeAttribute('src'); } };
+}
+
+/* ---------- Arquivos ---------- */
+function Arquivos() {
+  let files = [], sort = 'recentes';
+  const el = h('div', { class: 'col', style: 'gap:12px' });
+  const input = h('input', { type: 'file', accept: '.gcode,.g,.gc', class: 'hide' });
+  const prog = h('div', { class: 'bar hide' }, h('div', { style: 'width:0%' }));
+  const progTxt = h('span', { class: 'small muted' });
+  const head = h('div', { class: 'row between wrap' },
+    h('h1', null, 'Arquivos'),
+    h('button', { class: 'btn primary', onclick: () => input.click() }, icon('up'), 'Enviar G-code'));
+  const info = h('div', { class: 'card', style: 'gap:6px' });
+  const chips = h('div', { class: 'row wrap', style: 'gap:6px' });
+  const list = h('ul', { class: 'list', 'aria-label': 'Arquivos no cartão da ESP32' });
+  el.append(head, input, info, chips, list);
+
+  function safeName(n) {
+    let s = n.normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^\x20-\x7e]/g, '_').replace(/[\/\\"<>|:*?]/g, '_');
+    if (s.startsWith('.')) s = '_' + s.slice(1);
+    return s.slice(0, 63);
+  }
+  input.onchange = () => {
+    const f = input.files[0]; input.value = ''; if (!f) return;
+    const name = safeName(f.name);
+    if (files.some(x => x.name === name)) { toast('Já existe um arquivo com esse nome no cartão. Renomeie antes de enviar.', true); return; }
+    const x = new XMLHttpRequest();
+    prog.classList.remove('hide');
+    x.upload.onprogress = e => { if (e.lengthComputable) { prog.firstChild.style.width = (e.loaded / e.total * 100) + '%'; progTxt.textContent = 'Enviando ' + name + ': ' + fmtSize(e.loaded) + ' de ' + fmtSize(e.total); } };
+    x.onload = () => { prog.classList.add('hide'); progTxt.textContent = ''; if (x.status === 200) { toast('Enviado: ' + name); load(); } else toast('Falha no envio: ' + x.responseText, true); };
+    x.onerror = () => { prog.classList.add('hide'); progTxt.textContent = ''; toast('Falha no envio (conexão)', true); };
+    x.open('POST', '/sd/upload'); x.setRequestHeader('X-Filename', name); x.send(f);
+  };
+  async function load() {
+    try { files = await getJSON('/sd/files'); } catch (e) { toast('Não consegui ler o cartão: ' + e.message, true); files = []; }
+    render();
+  }
+  async function openFile(f) {
+    const meta = h('div', { class: 'grid2' }, h('span', { class: 'muted small' }, 'Lendo o arquivo…'));
+    const thumb = h('div', { style: 'min-height:100px;border-radius:12px;border:1px dashed var(--border2);display:flex;align-items:center;justify-content:center;color:var(--faint);font-size:12px;text-align:center;padding:10px' }, 'Carregando…');
+    const busy = job() || !(S.status && S.status.usb);
+    const s = sheet(f.name, h('div', { class: 'col', style: 'gap:12px' }, thumb, meta,
+      busy ? h('p', { class: 'note', style: 'margin:0' }, job() ? 'Há uma impressão em andamento.' : 'A Ender não está conectada.') : null,
+      h('div', { class: 'grid2' },
+        h('button', { class: 'btn danger', disabled: job(), onclick: async () => {
+          if (!(await confirmBox('Apagar ' + f.name + '?', 'O arquivo sai do cartão da ESP32. Não dá para desfazer.', 'Apagar', true))) return;
+          try { await post('/sd/delete', { filename: f.name }); toast('Apagado'); s.remove(); load(); } catch (e) { toast(e.message, true); }
+        } }, 'Apagar'),
+        h('button', { class: 'btn primary', disabled: busy, onclick: async () => {
+          if (!(await confirmBox('Imprimir ' + f.name + '?', 'Confira: mesa limpa, filamento carregado e nada perto do bico. A Ender vai aquecer, fazer a origem e começar. Fique por perto.', 'Começar a impressão'))) return;
+          try { await post('/sd/print', { filename: f.name }); toast('Impressão iniciada'); s.remove(); location.hash = '#inicio'; setTimeout(pollStatus, 1000); } catch (e) { toast(e.message, true); }
+        } }, 'Imprimir'))));
+    try {
+      const d = await getJSON('/sd/info?filename=' + encodeURIComponent(f.name));
+      const m = (k, v) => h('div', { class: 'card', style: 'padding:10px 12px;gap:2px' }, h('span', { class: 'tiny muted' }, k), h('b', null, v));
+      meta.textContent = '';
+      meta.append(m('Tempo (fatiador)', d.estTime > 0 ? fmtDur(d.estTime) : '—'),
+        m('Filamento', d.filamentMm > 0 ? num(d.filamentMm / 1000, 2) + ' m' + (d.filamentG > 0 ? ' · ' + num(d.filamentG, 1) + ' g' : '') : '—'),
+        m('Camadas', d.layers > 0 ? d.layers + (d.layerHeight > 0 ? ' × ' + num(d.layerHeight, 2) + ' mm' : '') : '—'),
+        m('Altura', d.objectHeight > 0 ? num(d.objectHeight, 1) + ' mm' : '—'));
+      thumb.textContent = '';
+      if (d.thumbnail && /^data:image\//.test(d.thumbnail)) thumb.append(h('img', { src: d.thumbnail, alt: 'Miniatura', style: 'max-width:100%;max-height:180px;border-radius:8px' }));
+      else thumb.append('Sem miniatura: o fatiador não gravou uma imagem que a ESP32 entenda');
+    } catch (e) { meta.textContent = ''; meta.append(h('span', { class: 'muted small' }, 'Não consegui ler os dados: ' + e.message)); thumb.textContent = ''; }
+  }
+  function render() {
+    const total = files.reduce((a, f) => a + (f.size || 0), 0);
+    info.textContent = '';
+    info.append(h('div', { class: 'row between small muted' }, h('span', null, files.length + ' arquivo(s) · ' + fmtSize(total)), h('span', null, 'cartão da ESP32')),
+      prog, progTxt, h('span', { class: 'tiny faint' }, 'Envio pelo Wi-Fi: cerca de 125 KB/s (um arquivo de 25 MB leva uns 3 min). Nomes com acento são convertidos.'));
+    chips.textContent = '';
+    [['recentes', 'Mais recentes'], ['nome', 'Nome'], ['tamanho', 'Tamanho']].forEach(([k, l]) =>
+      chips.append(h('button', { class: 'btn sm' + (sort === k ? ' sel' : ''), onclick: () => { sort = k; render(); } }, l)));
+    const arr = files.slice().sort(sort === 'nome' ? (a, b) => a.name.localeCompare(b.name) : sort === 'tamanho' ? (a, b) => b.size - a.size : (a, b) => (b.mtime || 0) - (a.mtime || 0));
+    list.textContent = '';
+    if (!arr.length) list.append(h('li', { class: 'muted' }, 'Nenhum arquivo no cartão.'));
+    arr.forEach(f => list.append(h('li', null, h('button', { class: 'item', onclick: () => openFile(f) },
+      h('span', { style: 'width:40px;height:40px;flex:none;border-radius:10px;background:var(--surface3);display:flex;align-items:center;justify-content:center;color:var(--muted)' }, icon('files')),
+      h('span', { class: 'col', style: 'gap:2px;flex:1' }, h('span', { class: 'nm' }, f.name), h('span', { class: 'small muted' }, fmtSize(f.size) + ' · ' + fmtDate(f.mtime)))))));
+  }
+  load();
+  return { el, update() { } };
+}
+
+/* ---------- Controles ---------- */
+function Controles() {
+  let stepXY = 10, stepZ = 1, eSpeed = 300;
+  const moveBtns = [], eBtns = [];
+  const lock = h('p', { class: 'note hide', style: 'margin:0' }, 'Impressão em andamento: a ESP32 só aceita ajustes finos (ventilador, velocidade, fluxo, Z fino e temperatura de aquecedor já ligado). Movimento, origem e ligar um aquecedor desligado são recusados.');
+
+  async function setTemp(kind, v) {
+    const st = S.status || {}, cur = kind === 'M104' ? (st.hotend || [0, 0])[1] : (st.bed || [0, 0])[1];
+    v = Math.round(Number(v)); if (isNaN(v) || v < 0) { toast('Temperatura inválida', true); return; }
+    const max = kind === 'M104' ? 260 : 100;
+    if (v > max) { toast('Acima do limite desta tela (' + max + ' °C)', true); return; }
+    if (cur === 0 && v > 0 && !(await confirmBox('Ligar o aquecedor?', (kind === 'M104' ? 'Bico' : 'Mesa') + ' de desligado para ' + v + ' °C. Fique por perto.', 'Aquecer'))) return;
+    gcode(kind + ' S' + v);
+  }
+  function heaterRow(label, kind, max, presets) {
+    const info = h('span', { class: 'muted small' });
+    const inp = h('input', { type: 'number', min: 0, max, inputmode: 'numeric', placeholder: '°C', 'aria-label': 'Temperatura do ' + label, style: 'max-width:100px' });
+    const row = h('div', { class: 'col', style: 'gap:8px' },
+      h('div', { class: 'row between' }, h('b', null, label), info),
+      h('div', { class: 'row wrap', style: 'gap:6px' },
+        h('button', { class: 'btn sm', onclick: () => gcode(kind + ' S0') }, 'Desligar'),
+        presets.map(p => h('button', { class: 'btn sm', onclick: () => setTemp(kind, p) }, p + '°')),
+        inp, h('button', { class: 'btn sm primary', onclick: () => setTemp(kind, inp.value) }, 'Aplicar')));
+    return { row, info };
+  }
+  const hB = heaterRow('Bico', 'M104', 260, [190, 200, 210, 220, 240]);
+  const hM = heaterRow('Mesa', 'M140', 100, [50, 60, 70, 80, 100]);
+  const preset = (t, b, name) => h('button', { class: 'btn sm', onclick: async () => {
+    if (await confirmBox('Aquecer para ' + name + '?', 'Bico ' + t + ' °C e mesa ' + b + ' °C. Fique por perto.', 'Aquecer')) gcodes(['M140 S' + b, 'M104 S' + t]);
+  } }, name + ' ' + t + ' / ' + b);
+  const heat = h('section', { class: 'card', 'aria-label': 'Temperaturas' }, h('h2', null, 'Temperaturas'), hB.row, hM.row,
+    h('div', { class: 'row wrap', style: 'gap:6px' }, preset(200, 60, 'PLA'), preset(240, 100, 'ABS'),
+      h('button', { class: 'btn sm', style: 'color:var(--blue)', onclick: () => gcodes(['M104 S0', 'M140 S0']).then(ok => ok && toast('Aquecedores desligados')) }, 'Desligar tudo')));
+
+  function stepRow(vals, get, set) {
+    const btns = vals.map(v => h('button', { class: 'btn sm', onclick: () => { set(v); mark(); } }, num(v, v < 1 ? 1 : 0) + ' mm'));
+    const mark = () => btns.forEach((b, i) => b.classList.toggle('sel', vals[i] === get()));
+    mark();
+    return h('div', { class: 'row wrap', style: 'gap:4px' }, btns);
+  }
+  const mv = (lbl, aria, fn, cls) => { const b = h('button', { class: 'btn' + (cls ? ' ' + cls : ''), 'aria-label': aria, onclick: fn }, lbl); moveBtns.push(b); return b; };
+  async function jog(axis, dir) {
+    const st = S.status || {}, step = axis === 'Z' ? stepZ : stepXY, d = dir * step;
+    if (axis === 'Z' && dir < 0 && (st.z == null || st.z - step < 5)) {
+      if (!(await confirmBox('Descer o Z ' + num(step, 1) + ' mm?', 'O bico está perto da mesa (Z ' + num(st.z, 1) + ' mm, última posição lida). Confira se nada vai encostar.', 'Descer'))) return;
+    }
+    gcodes(['G91', 'G1 ' + axis + d + ' F' + (axis === 'Z' ? 600 : 3000), 'G90']);
+  }
+  async function home(axes) {
+    const z = !axes || axes.includes('Z');
+    if (!(await confirmBox('Fazer a origem' + (axes ? ' de ' + axes : ' de todos os eixos') + '?', 'Os eixos vão até os fins de curso' + (z ? ' e o sensor encosta na mesa' : '') + '. Confira se nada está no caminho.', 'Fazer a origem'))) return;
+    gcode('G28' + (axes ? ' ' + axes.split('').join(' ') : ''));
+  }
+  const zInfo = h('span', { class: 'tiny faint' });
+  const move = h('section', { class: 'card', 'aria-label': 'Movimento' }, h('h2', null, 'Movimento'),
+    h('div', { class: 'row between wrap' }, h('span', { class: 'small muted' }, 'Passo X/Y'), stepRow([0.1, 1, 10, 100], () => stepXY, v => stepXY = v)),
+    h('div', { class: 'grid2', style: 'align-items:center' },
+      h('div', { class: 'pad' }, h('span'), mv('Y+', 'Mover Y para trás', () => jog('Y', 1)), h('span'),
+        mv('X−', 'Mover X para a esquerda', () => jog('X', -1)), mv(icon('home'), 'Origem de todos os eixos (G28)', () => home(''), 'sel'), mv('X+', 'Mover X para a direita', () => jog('X', 1)),
+        h('span'), mv('Y−', 'Mover Y para a frente', () => jog('Y', -1)), h('span')),
+      h('div', { class: 'col' }, h('span', { class: 'small muted' }, 'Passo Z'), stepRow([0.1, 1, 10], () => stepZ, v => stepZ = v),
+        mv('Z+ (sobe)', 'Subir Z', () => jog('Z', 1)), mv('Z− (desce)', 'Descer Z', () => jog('Z', -1)))),
+    h('div', { class: 'row wrap', style: 'gap:6px' }, h('span', { class: 'small muted' }, 'Origem:'),
+      ['X', 'Y', 'Z', 'XY'].map(a => { const b = h('button', { class: 'btn sm', onclick: () => home(a) }, a); moveBtns.push(b); return b; }),
+      (() => { const b = h('button', { class: 'btn sm', onclick: () => gcode('M84') }, 'Desligar motores (M84)'); moveBtns.push(b); return b; })()),
+    zInfo);
+
+  const fanV = h('b', null, '—');
+  const fan = h('input', { type: 'range', min: 0, max: 100, step: 5, value: 0, 'aria-label': 'Ventilador da peça (%)' });
+  fan.oninput = () => fanV.textContent = fan.value + '%';
+  fan.onchange = () => gcode(+fan.value === 0 ? 'M107' : 'M106 S' + Math.round(fan.value * 2.55));
+  const spd = h('input', { type: 'number', min: 10, max: 300, value: 100, 'aria-label': 'Velocidade (%)' });
+  const flow = h('input', { type: 'number', min: 50, max: 150, value: 100, 'aria-label': 'Fluxo (%)' });
+  const eSel = [[300, 'Normal'], [60, 'Lenta (medir)']].map(([v, l]) => h('button', { class: 'btn sm', onclick: () => { eSpeed = v; markE(); } }, l));
+  const markE = () => eSel.forEach((b, i) => b.classList.toggle('sel', [300, 60][i] === eSpeed));
+  markE();
+  const eb = (lbl, d) => { const b = h('button', { class: 'btn sm', onclick: () => gcodes(['M83', 'G1 E' + d + ' F' + eSpeed]) }, lbl); eBtns.push(b); return b; };
+  const eHint = h('span', { class: 'tiny faint' });
+  const ext = h('section', { class: 'card', 'aria-label': 'Ventilador, velocidade e filamento' }, h('h2', null, 'Ventilador, velocidade e filamento'),
+    h('div', { class: 'row between' }, h('span', { class: 'muted small' }, 'Ventilador da peça (a ESP32 não lê o valor atual)'), fanV), fan,
+    h('div', { class: 'grid2' },
+      h('label', { class: 'f' }, 'Velocidade (M220, %)', h('div', { class: 'row' }, spd, h('button', { class: 'btn sm', onclick: () => gcode('M220 S' + Math.round(spd.value)) }, 'Aplicar'))),
+      h('label', { class: 'f' }, 'Fluxo (M221, %)', h('div', { class: 'row' }, flow, h('button', { class: 'btn sm', onclick: () => gcode('M221 S' + Math.round(flow.value)) }, 'Aplicar')))),
+    h('div', { class: 'row wrap', style: 'gap:6px' }, h('span', { class: 'small muted' }, 'Extrusora:'), eSel, eb('Retrair 10 mm', -10), eb('Extrudar 10 mm', 10)),
+    eHint);
+
+  const el = h('div', { class: 'col', style: 'gap:12px' }, h('h1', null, 'Controles'), lock, heat, move, ext);
+  function update() {
+    const st = S.status || {}, active = job(), he = st.hotend || [0, 0], bd = st.bed || [0, 0];
+    lock.classList.toggle('hide', !active);
+    const inf = p => 'agora ' + num(p[0], 0) + ' °C · alvo ' + (p[1] > 0 ? num(p[1], 0) + ' °C' : 'desligado');
+    hB.info.textContent = inf(he); hM.info.textContent = inf(bd);
+    moveBtns.forEach(b => b.disabled = active);
+    const canE = !active && he[0] >= 180;
+    eBtns.forEach(b => b.disabled = !canE);
+    eHint.textContent = canE ? 'Normal: 300 mm/min. Lenta: 60 mm/min (para medir a extrusão).' : 'Extrusora liberada com o bico acima de 180 °C e sem impressão (bico agora ' + num(he[0], 0) + ' °C).';
+    zInfo.textContent = 'Z lido: ' + num(st.z, 1) + ' mm. Descer o Z abaixo de 5 mm pede confirmação.';
+  }
+  update();
+  return { el, update };
+}
+
+/* ---------- Mesa ---------- */
+function Mesa() {
+  let mesh = null, label = '', showVals = true, cfg = null, poll = null, list = [];
+  const lsGet = (k, d) => { try { const v = localStorage.getItem(k); return v == null ? d : +v; } catch (e) { return d; } };
+  const lsSet = (k, v) => { try { localStorage.setItem(k, v); } catch (e) { } };
+  const valsBtn = h('button', { class: 'btn sm', onclick: () => { showVals = !showVals; valsBtn.textContent = showVals ? 'Ocultar valores' : 'Mostrar valores'; renderMesh(); } }, 'Ocultar valores');
+  const meshCard = h('section', { class: 'card', 'aria-label': 'Malha medida' });
+  const sum = h('section', { class: 'grid2', 'aria-label': 'Resumo' });
+  const screws = h('section', { class: 'card', 'aria-label': 'Parafusos' });
+  const probe = h('section', { class: 'col' });
+  const hist = h('section', { class: 'card', 'aria-label': 'Histórico' });
+  const el = h('div', { class: 'col', style: 'gap:12px' }, h('div', { class: 'row between wrap' }, h('h1', null, 'Mesa'), valsBtn), meshCard, sum, screws, probe, hist);
+
+  /* Linhas da frente para o fundo, colunas da esquerda para a direita (usa a "origem" da config, como a página antiga) */
+  function canon(m) {
+    const o = (cfg && cfg.origin) || 0, gy = m.d.length, gx = m.d[0].length, fy = o >= 2, fx = o === 1 || o === 3, out = [];
+    for (let j = 0; j < gy; j++) { const r = []; for (let i = 0; i < gx; i++) r.push(m.d[fy ? gy - 1 - j : j][fx ? gx - 1 - i : i]); out.push(r); }
+    return out;
+  }
+  function planeFit(d) { /* z = a + b*x + c*y; x, y em passos da malha a partir do centro (x+ = direita, y+ = fundo) */
+    const gy = d.length, gx = d[0].length; let n = 0, sz = 0, sxx = 0, syy = 0, sxz = 0, syz = 0;
+    for (let j = 0; j < gy; j++) for (let i = 0; i < gx; i++) { const x = i - (gx - 1) / 2, y = j - (gy - 1) / 2, z = d[j][i]; n++; sz += z; sxx += x * x; syy += y * y; sxz += x * z; syz += y * z; }
+    const a = sz / n, b = sxx ? sxz / sxx : 0, c = syy ? syz / syy : 0; let rmin = Infinity, rmax = -Infinity;
+    for (let j = 0; j < gy; j++) for (let i = 0; i < gx; i++) { const r = d[j][i] - (a + b * (i - (gx - 1) / 2) + c * (j - (gy - 1) / 2)); rmin = Math.min(rmin, r); rmax = Math.max(rmax, r); }
+    return { a, b, c, gx, gy, resid: rmax - rmin };
+  }
+  const low = [31, 95, 168], mid = [52, 58, 70], high = [194, 97, 15];
+  const mix = (a, b, t) => a.map((x, i) => Math.round(x + (b[i] - x) * t));
+  const colr = (v, s) => { const t = Math.max(-1, Math.min(1, v / s)); return 'rgb(' + (t < 0 ? mix(mid, low, -t) : mix(mid, high, t)).join(',') + ')'; };
+  const sgn = v => { v = Math.round(v * 100) / 100; return (v > 0 ? '+' : v < 0 ? '−' : '') + num(Math.abs(v), 2); };
+  function fmtTurns(t) {
+    const q = Math.round(t * 4) / 4, w = Math.floor(q), f = q - w;
+    if (q < 0.25) return 'menos de 1/4 de volta';
+    const fr = f === 0.25 ? '1/4' : f === 0.5 ? '1/2' : f === 0.75 ? '3/4' : '';
+    if (!w) return fr + (fr === '1/2' ? ' volta' : ' de volta');
+    return w + (fr ? ' e ' + fr : '') + (q > 1 ? ' voltas' : ' volta');
+  }
+  function renderMesh() {
+    meshCard.textContent = ''; sum.textContent = ''; screws.textContent = '';
+    if (!mesh || !mesh.d || !mesh.d.length || !mesh.d[0].length) {
+      meshCard.append(h('h2', null, 'Malha'), h('p', { class: 'muted', style: 'margin:0' }, 'Nenhuma malha guardada na ESP32. Ela aparece aqui depois de uma medição, por este botão ou pelo menu da Ender.'));
+      return;
+    }
+    const d = canon(mesh), gx = d[0].length, gy = d.length;
+    let mn = Infinity, mx = -Infinity; d.forEach(r => r.forEach(v => { mn = Math.min(mn, v); mx = Math.max(mx, v); }));
+    const scale = Math.max(0.1, Math.abs(mn), Math.abs(mx));
+    const grid = h('div', { class: 'mesh', role: 'img', 'aria-label': 'Mapa de altura da mesa, ' + gx + ' por ' + gy + ' pontos, de ' + num(mn, 2) + ' a ' + num(mx, 2) + ' mm', style: 'grid-template-columns:repeat(' + gx + ',minmax(0,1fr))' });
+    for (let j = gy - 1; j >= 0; j--) for (let i = 0; i < gx; i++) { const v = d[j][i]; grid.append(h('div', { style: 'background:' + colr(v, scale), title: sgn(v) + ' mm' }, showVals ? sgn(v) : '')); }
+    meshCard.append(h('div', { class: 'row between small muted wrap' }, h('span', null, label), h('span', null, gx + ' × ' + gy + ' pontos')),
+      h('span', { class: 'tiny faint', style: 'text-align:center' }, 'Fundo'), grid, h('span', { class: 'tiny faint', style: 'text-align:center' }, 'Frente (lado da tela)'),
+      h('div', { class: 'row small muted', style: 'gap:8px' }, h('span', null, 'mais baixa'), h('div', { style: 'flex:1;height:8px;border-radius:4px;background:linear-gradient(90deg,rgb(31,95,168),rgb(52,58,70),rgb(194,97,15))' }), h('span', null, 'mais alta')));
+    const p = planeFit(d), range = mx - mn, lr = p.b * (gx - 1), fb = p.c * (gy - 1);
+    const card = (k, v, s, c) => h('div', { class: 'card', style: 'gap:2px' }, h('span', { class: 'small muted' }, k), h('span', { class: 'big', style: 'font-size:24px' }, v), h('span', { class: 'tiny', style: 'color:' + (c || 'var(--faint)') }, s));
+    sum.append(card('Diferença total', num(range, 2) + ' mm', range <= 0.5 ? 'ótima' : range <= 0.8 ? 'boa para imprimir (o ABL compensa)' : 'vale nivelar', range <= 0.8 ? 'var(--green)' : 'var(--yellow)'),
+      card('Inclinação', num(Math.hypot(lr, fb), 2) + ' mm', 'direita ' + sgn(lr) + ' · fundo ' + sgn(fb) + ' mm. Forma própria da mesa ~' + num(p.resid, 2) + ' mm (não sai nos parafusos)'));
+    renderScrews(p);
+  }
+  function renderScrews(p) {
+    screws.textContent = '';
+    const pitch = (cfg && cfg.screw_pitch) || 0.7, fac = lsGet('es-screw-fac', 1.2);
+    const hx = (p.gx - 1) / 2 * fac, hy = (p.gy - 1) / 2 * fac;
+    const rows = [['Fundo-esquerda', -1, 1], ['Fundo-direita', 1, 1], ['Frente-esquerda', -1, -1], ['Frente-direita', 1, -1]].map(([n, sx, sy]) => {
+      const corr = -(p.b * sx * hx + p.c * sy * hy); /* referência = altura média (centro do plano) */
+      const ok = Math.abs(corr) < 0.05;
+      return h('div', { class: 'card', style: 'padding:10px 12px;gap:2px' }, h('span', { class: 'tiny muted' }, n),
+        h('b', { style: 'color:' + (ok ? 'var(--green)' : 'var(--text)') }, ok ? 'deixar como está' : (corr > 0 ? 'subir ' : 'descer ') + num(Math.abs(corr), 2) + ' mm'),
+        ok ? null : h('span', { class: 'tiny faint' }, '≈ ' + fmtTurns(Math.abs(corr) / pitch)));
+    });
+    const facI = h('input', { type: 'number', value: fac, min: 1, max: 2, step: 0.05 });
+    facI.onchange = () => { lsSet('es-screw-fac', facI.value); renderMesh(); };
+    const piI = h('input', { type: 'number', value: pitch, min: 0.2, max: 2, step: 0.05 });
+    const save = h('button', { class: 'btn sm', onclick: async () => {
+      const v = +piI.value; if (!(v >= 0.2 && v <= 2)) { toast('Passo inválido', true); return; }
+      try { await post('/bedlevel/config', Object.assign({}, cfg, { screw_pitch: v }), true); cfg.screw_pitch = v; toast('Passo salvo na ESP32'); renderMesh(); } catch (e) { toast(e.message, true); }
+    } }, 'Salvar o passo');
+    screws.append(h('h2', null, 'Parafusos (estimativa)'),
+      h('span', { class: 'small muted' }, 'Estende o plano da malha até cada parafuso, mantendo a altura média da mesa. Suba o Z ~10 mm antes de girar. O sentido (horário ou anti-horário) depende do manípulo: gire 1/4 de volta e veja se a mesa sobe ou desce.'),
+      h('div', { class: 'grid2' }, rows),
+      h('details', null, h('summary', { class: 'small muted', style: 'cursor:pointer' }, 'Medidas usadas no cálculo'),
+        h('div', { class: 'grid2', style: 'margin-top:8px' },
+          h('label', { class: 'f' }, 'Passo do parafuso (mm por volta; M4 = 0,7)', piI),
+          h('label', { class: 'f' }, 'Quanto os parafusos ficam além da malha (1,2 = 20%)', facI)),
+        h('div', { class: 'row wrap', style: 'margin-top:8px' }, save, h('span', { class: 'tiny faint' }, 'O passo fica salvo na ESP32; o fator, só neste navegador.'))));
+  }
+  async function showTs(ts, lbl) {
+    try { mesh = await getJSON('/bedlevel/mesh?ts=' + ts); label = lbl + ' · ' + fmtDate(ts); renderMesh(); } catch (e) { toast(e.message, true); }
+  }
+  function renderHist() {
+    hist.textContent = '';
+    hist.append(h('h2', null, 'Histórico de medições'));
+    if (!list.length) { hist.append(h('span', { class: 'muted small' }, 'Sem medições guardadas.')); return; }
+    list.slice(0, 12).forEach((ts, i) => hist.append(h('button', { class: 'item', style: 'padding:10px 12px', onclick: () => { showTs(ts, i ? 'Medição antiga' : 'Última medição'); window.scrollTo({ top: 0, behavior: 'smooth' }); } },
+      h('span', { class: 'nm', style: 'flex:1' }, fmtDate(ts)), h('span', { class: 'small muted' }, i ? 'ver' : 'mais recente'))));
+  }
+  function renderProbe(state, err) {
+    probe.textContent = '';
+    const running = state === 'homing' || state === 'probing';
+    probe.append(h('button', { class: 'btn primary blk', disabled: running || job(), onclick: async () => {
+      if (!(await confirmBox('Medir a mesa agora?', 'A Ender faz a origem (G28) e mede todos os pontos (G29), cerca de 2 a 3 minutos. O bico encosta na mesa várias vezes: fique por perto. A malha nova fica ativa até a Ender desligar; para guardar, use o botão de salvar (M500) depois.', 'Medir'))) return;
+      try { const r = JSON.parse(await post('/bedlevel/probe', { confirm: 1 }) || '{}'); if (!r.ok) throw new Error(r.err || 'recusado'); toast('Medição iniciada'); renderProbe('homing'); startPoll(); } catch (e) { toast(e.message, true); }
+    } }, running ? (state === 'homing' ? 'Fazendo a origem…' : 'Medindo…') : 'Medir de novo (G28 + G29)'));
+    if (state === 'done') probe.append(h('button', { class: 'btn blk', disabled: job(), onclick: async () => {
+      if (await confirmBox('Guardar a malha na Ender?', 'Grava na memória da impressora (M500) a malha nova, o Z offset e as outras configurações atuais.', 'Salvar')) gcode('M500');
+    } }, 'Salvar a malha na memória da Ender (M500)'));
+    if (state === 'error' && err) probe.append(h('p', { class: 'note', style: 'margin:0' }, 'A última medição falhou: ' + err));
+  }
+  async function loadStatus() {
+    let s = { state: 'idle' };
+    try { s = await getJSON('/bedlevel/status'); } catch (e) { }
+    if (s.mesh) { mesh = s.mesh; label = 'Medição desta sessão' + (s.mesh.ts ? ' · ' + fmtDate(s.mesh.ts) : ''); renderMesh(); }
+    renderProbe(s.state, s.err);
+    return s;
+  }
+  function startPoll() {
+    clearInterval(poll);
+    poll = setInterval(async () => { const s = await loadStatus(); if (s.state !== 'homing' && s.state !== 'probing') { clearInterval(poll); poll = null; loadList(); } }, 2000);
+  }
+  async function loadList() { try { list = (await getJSON('/bedlevel/meshlist')).slice().sort((a, b) => b - a); } catch (e) { list = []; } renderHist(); }
+  (async () => {
+    try { cfg = await getJSON('/bedlevel/config'); } catch (e) { cfg = { origin: 0, screw_pitch: 0.7 }; }
+    await loadList();
+    const s = await loadStatus();
+    if (!s.mesh && list.length) await showTs(list[0], 'Última medição guardada');
+    else if (!s.mesh) renderMesh();
+    if (s.state === 'homing' || s.state === 'probing') startPoll();
+  })();
+  return { el, update() { }, unmount() { clearInterval(poll); } };
+}
+
+/* ---------- Câmera ---------- */
+function Camera() {
+  const el = h('div', { class: 'col', style: 'gap:12px' });
+  const img = h('img', { alt: 'Vídeo ao vivo da impressora', src: '/stream' });
+  const ph = h('div', { class: 'ph hide' });
+  img.onerror = () => { ph.textContent = 'Vídeo indisponível. A ESP32 aceita no máximo 3 vídeos ao mesmo tempo: feche outra aba da câmera e recarregue.'; ph.classList.remove('hide'); };
+  const ctl = h('section', { class: 'card', 'aria-label': 'Ajustes da câmera' });
+  el.append(h('div', { class: 'row between wrap' }, h('h1', null, 'Câmera'), h('a', { class: 'btn sm', href: '/capture', target: '_blank', rel: 'noopener' }, 'Foto (/capture)')),
+    h('section', { class: 'cam', style: 'aspect-ratio:4/3' }, img, ph), ctl);
+  let rendered = false;
+  function update() {
+    const c = S.settings && S.settings.camera; if (!c || rendered) return; rendered = true;
+    ctl.textContent = '';
+    const vals = { brightness: c.brightness, contrast: c.contrast, saturation: c.saturation, ae_level: c.ae_level };
+    let tm = null;
+    const send = () => { clearTimeout(tm); tm = setTimeout(async () => { try { await post('/camera/settings', vals); toast('Imagem ajustada'); } catch (e) { toast(e.message, true); } }, 400); };
+    const slider = (k, l) => { const v = h('b', null, vals[k]); const r = h('input', { type: 'range', min: -2, max: 2, step: 1, value: vals[k], 'aria-label': l }); r.oninput = () => { v.textContent = r.value; vals[k] = +r.value; send(); }; return h('div', { class: 'col', style: 'gap:2px' }, h('div', { class: 'row between small' }, h('span', { class: 'muted' }, l), v), r); };
+    const rot = h('input', { type: 'checkbox', checked: c.rotate180 });
+    const xclk = h('select', { 'aria-label': 'XCLK' }, [10, 12, 16, 20].map(m => h('option', { value: m, selected: c.xclk === m }, m + ' MHz' + (m === 10 ? ' (seguro)' : m === 20 ? ' (rápido)' : ''))));
+    ctl.append(h('h2', null, 'Imagem'), h('div', { class: 'grid2' }, slider('brightness', 'Brilho'), slider('contrast', 'Contraste'), slider('saturation', 'Saturação'), slider('ae_level', 'Exposição')),
+      h('label', { class: 'chk' }, rot, 'Girar a imagem 180°'), h('label', { class: 'f' }, 'Clock da câmera (XCLK, vale depois de reiniciar)', xclk),
+      h('button', { class: 'btn sm', onclick: async () => {
+        try { await post('/video/config', Object.assign({ xclk: xclk.value, janus_host: S.settings.janus_host || '', janus_port: S.settings.janus_port || 17800 }, rot.checked ? { rotate180: 1 } : {})); toast('Vídeo salvo'); loadSettings(); } catch (e) { toast(e.message, true); }
+      } }, 'Salvar rotação e clock'));
+  }
+  update();
+  /* troca o src para fechar a conexão do vídeo na hora (libera uma das 3 vagas) */
+  return { el, update, unmount() { img.onerror = null; img.src = 'data:,'; } };
+}
+
+/* ---------- Terminal ---------- */
+function Terminal() {
+  let seq = 0, timer = null, histI = -1;
+  const histK = 'es-term-hist';
+  const hist = (() => { try { return JSON.parse(localStorage.getItem(histK) || '[]'); } catch (e) { return []; } })();
+  const out = h('div', { class: 'term', role: 'log', 'aria-live': 'polite' });
+  const inp = h('input', { type: 'text', placeholder: 'G-code, ex.: M115', autocomplete: 'off', autocapitalize: 'characters', spellcheck: 'false', 'aria-label': 'Comando G-code' });
+  const supp = h('input', { type: 'checkbox' });
+  const el = h('div', { class: 'col', style: 'gap:12px' },
+    h('h1', null, 'Terminal'),
+    h('p', { class: 'note', style: 'margin:0' }, 'Os comandos vão direto para a Ender, com conferência (checksum). Movimento e aquecimento acontecem na hora. Durante uma impressão o terminal fica bloqueado.'),
+    out,
+    h('form', { class: 'row', onsubmit: e => { e.preventDefault(); send(inp.value); } }, inp, h('button', { class: 'btn primary', type: 'submit' }, 'Enviar')),
+    h('div', { class: 'row wrap', style: 'gap:6px' }, ['M115', 'M105', 'M114', 'M119', 'M420 V', 'M503'].map(c => h('button', { class: 'btn sm', onclick: () => send(c) }, c))),
+    h('label', { class: 'chk small' }, supp, 'Pausar as consultas automáticas (M105/M27/M114) para ver só os meus comandos'));
+  supp.onchange = async () => { try { await post('/terminal/polling', { suppress: supp.checked ? 1 : 0 }); } catch (e) { toast(e.message, true); } };
+  inp.onkeydown = e => {
+    if (e.key === 'ArrowUp' && hist.length) { histI = Math.min(hist.length - 1, histI + 1); inp.value = hist[hist.length - 1 - histI]; e.preventDefault(); }
+    if (e.key === 'ArrowDown') { histI = Math.max(-1, histI - 1); inp.value = histI < 0 ? '' : hist[hist.length - 1 - histI]; e.preventDefault(); }
+  };
+  async function send(c) {
+    c = (c || '').trim(); if (!c) return;
+    try { await post('/terminal/send', { cmd: c }); hist.push(c); if (hist.length > 50) hist.shift(); try { localStorage.setItem(histK, JSON.stringify(hist)); } catch (e) { } histI = -1; inp.value = ''; setTimeout(poll, 300); }
+    catch (e) { toast(e.message.includes('Printing') ? 'Bloqueado durante a impressão' : e.message, true); }
+  }
+  async function poll() {
+    try {
+      const r = await getJSON('/terminal/poll?seq=' + seq);
+      if (r.data) { const atEnd = out.scrollTop + out.clientHeight >= out.scrollHeight - 30; out.append(r.data); if (out.textContent.length > 60000) out.textContent = out.textContent.slice(-40000); if (atEnd) out.scrollTop = out.scrollHeight; }
+      seq = r.seq;
+    } catch (e) { }
+  }
+  timer = setInterval(poll, 1000); poll();
+  return { el, update() { }, unmount() { clearInterval(timer); if (supp.checked) post('/terminal/polling', { suppress: 0 }).catch(() => { }); } };
+}
+
+/* ---------- Logs ---------- */
+function Logs() {
+  let filter = '', auto = null;
+  const out = h('div', { class: 'term', role: 'log' }, 'Carregando…');
+  const chips = h('div', { class: 'row wrap', style: 'gap:6px' });
+  const autoC = h('input', { type: 'checkbox' });
+  const el = h('div', { class: 'col', style: 'gap:12px' },
+    h('div', { class: 'row between wrap' }, h('h1', null, 'Logs'),
+      h('div', { class: 'row', style: 'gap:6px' }, h('a', { class: 'btn sm', href: '/logs?format=text', target: '_blank', rel: 'noopener' }, 'Abrir completo'),
+        h('button', { class: 'btn sm danger', onclick: async () => { if (await confirmBox('Limpar os logs?', 'Apaga o registro guardado na memória da ESP32 (ele também some ao reiniciar).', 'Limpar', true)) { try { await post('/logs/clear'); load(); } catch (e) { toast(e.message, true); } } } }, 'Limpar'))),
+    chips, out, h('label', { class: 'chk small' }, autoC, 'Atualizar a cada 10 s'));
+  function chipsR() { chips.textContent = ''; [['', 'Tudo'], ['printer', 'Impressora'], ['system', 'Sistema'], ['heap', 'Memória']].forEach(([k, l]) => chips.append(h('button', { class: 'btn sm' + (filter === k ? ' sel' : ''), onclick: () => { filter = k; chipsR(); load(); } }, l))); chips.append(h('button', { class: 'btn sm', onclick: load }, 'Atualizar')); }
+  async function load() {
+    try { const t = await getText('/logs?format=text&tail=65536' + (filter ? '&filter=' + filter : '')); out.textContent = t.replace(/\x1b\[[0-9;]*m/g, '') || '(vazio)'; out.scrollTop = out.scrollHeight; }
+    catch (e) { out.textContent = 'Não consegui ler os logs: ' + e.message; }
+  }
+  autoC.onchange = () => { clearInterval(auto); if (autoC.checked) auto = setInterval(load, 10000); };
+  chipsR(); load();
+  return { el, update() { }, unmount() { clearInterval(auto); } };
+}
+
+/* ---------- Configurações ---------- */
+function Config() {
+  const el = h('div', { class: 'col', style: 'gap:12px' });
+  let built = false;
+  const sec = (title, ...kids) => h('section', { class: 'card sec' }, h('h2', null, title), ...kids);
+  function themeSel() {
+    let cur = 'auto'; try { cur = localStorage.getItem('es-tema') || 'auto'; } catch (e) { }
+    return h('div', { class: 'row wrap', style: 'gap:6px' }, [['auto', 'Automático'], ['escuro', 'Escuro'], ['claro', 'Claro']].map(([k, l]) =>
+      h('button', { class: 'btn sm' + (cur === k ? ' sel' : ''), onclick: () => { try { localStorage.setItem('es-tema', k); } catch (e) { } applyTheme(); built = false; update(); } }, l)));
+  }
+  const sig = h('dd', null, '—');
+  function update() {
+    sig.textContent = S.stats && S.stats.wifi === 'connected' ? S.stats.rssi + ' dBm' : '—';
+    const s = S.settings; if (!s || built) return; built = true;
+    el.textContent = '';
+    el.append(h('h1', null, 'Configurações'));
+    /* aparência */
+    el.append(sec('Aparência', themeSel()));
+    /* dispositivo */
+    const hn = h('input', { type: 'text', value: s.hostname, maxlength: 31, pattern: '[a-zA-Z][a-zA-Z0-9-]*', 'aria-label': 'Nome da placa' });
+    el.append(sec('Dispositivo',
+      h('label', { class: 'f' }, 'Nome na rede (acesso por ' + s.hostname + '.local)', hn),
+      h('button', { class: 'btn sm', onclick: async () => {
+        if (!/^[a-zA-Z][a-zA-Z0-9-]{0,30}$/.test(hn.value)) { toast('Use letras, números e hífen, começando por letra.', true); return; }
+        if (!(await confirmBox('Salvar e reiniciar a ESP32?', 'O novo nome vale depois do reinício (cerca de 10 s).', 'Salvar e reiniciar'))) return;
+        try { await post('/device/config', { hostname: hn.value }); toast('Reiniciando…'); } catch (e) { toast(e.message, true); }
+      } }, 'Salvar e reiniciar')));
+    /* wi-fi */
+    el.append(sec('Wi-Fi',
+      h('dl', { class: 'kv' }, h('dt', null, 'Rede'), h('dd', null, s.ssid || '—'), h('dt', null, 'IP'), h('dd', null, s.ip || '—'), h('dt', null, 'Sinal'), sig),
+      h('button', { class: 'btn sm danger', onclick: async () => {
+        if (!(await confirmBox('Apagar o Wi-Fi salvo?', 'A ESP32 reinicia em modo de configuração e abre a rede própria (ESP32FDM-…). Você vai precisar se conectar nela pelo celular para escolher a rede de novo.', 'Apagar e reiniciar', true))) return;
+        try { await post('/wifi/reset'); toast('Reiniciando em modo de configuração…'); } catch (e) { toast(e.message, true); }
+      } }, 'Apagar Wi-Fi e reiniciar')));
+    /* impressora */
+    const isK = s.backend === 'klipper';
+    const bM = h('input', { type: 'radio', name: 'be', value: 'marlin', checked: !isK }), bK = h('input', { type: 'radio', name: 'be', value: 'klipper', checked: isK });
+    const mh = h('input', { type: 'text', value: s.mr_host || '', placeholder: '192.168.1.x' }), mp = h('input', { type: 'number', value: s.mr_port || 7125, min: 1, max: 65535 });
+    el.append(sec('Impressora',
+      h('label', { class: 'chk' }, bM, 'Marlin pela USB (Ender-3 Max Neo)'), h('label', { class: 'chk' }, bK, 'Klipper (Moonraker pela rede)'),
+      h('div', { class: 'grid2' }, h('label', { class: 'f' }, 'Moonraker: host', mh), h('label', { class: 'f' }, 'Moonraker: porta', mp)),
+      h('div', { class: 'row wrap', style: 'gap:6px' },
+        h('button', { class: 'btn sm', onclick: async () => { try { const r = await getJSON('/printer/config/test'); if (r.ok) toast('Moonraker respondeu em ' + r.host + ':' + r.port); else toast('Moonraker não respondeu: ' + (r.error || '?'), true); } catch (e) { toast(e.message, true); } } }, 'Testar Moonraker'),
+        h('button', { class: 'btn sm', onclick: async () => {
+          if (!(await confirmBox('Salvar e reiniciar a ESP32?', 'A troca de tipo de impressora vale depois do reinício.', 'Salvar e reiniciar'))) return;
+          try { await post('/printer/config', { backend: bK.checked ? 'klipper' : 'marlin', mr_host: mh.value, mr_port: mp.value }); toast('Reiniciando…'); } catch (e) { toast(e.message, true); }
+        } }, 'Salvar e reiniciar'))));
+    /* marlin */
+    if (!isK) {
+      const p25 = h('input', { type: 'radio', name: 'pc', checked: s.pause_cmd !== 'm524' }), p524 = h('input', { type: 'radio', name: 'pc', checked: s.pause_cmd === 'm524' });
+      const fc = h('input', { type: 'checkbox', checked: s.filament_chk }), ep = h('input', { type: 'text', value: s.echo_ping || '', placeholder: 'ex.: M119, G92' });
+      el.append(sec('Marlin',
+        h('span', { class: 'small muted' }, 'Pausa de impressão feita pelo cartão da própria Ender:'),
+        h('label', { class: 'chk' }, p25, 'M25: pausa (pode retomar)'), h('label', { class: 'chk' }, p524, 'M524: aborta (se o M25 travar o firmware)'),
+        h('label', { class: 'chk' }, fc, 'Consultar o sensor de filamento (M119) durante a impressão e pausar se acabar'),
+        h('label', { class: 'f' }, 'Comandos que precisam de "ping" (ajuste avançado)', ep),
+        h('button', { class: 'btn sm', onclick: async () => {
+          const d = { pause_cmd: p524.checked ? 'm524' : 'm25', echo_ping: ep.value }; if (fc.checked) d.filament_chk = 1;
+          try { await post('/printer/config/marlin', d); toast('Salvo'); loadSettings(); } catch (e) { toast(e.message, true); }
+        } }, 'Salvar')));
+    }
+    /* obico */
+    const ob = s.obico || {};
+    const url = h('input', { type: 'url', value: ob.server_url || '' }), code = h('input', { type: 'text', inputmode: 'numeric', maxlength: 6, placeholder: '123456' });
+    el.append(sec('Obico (monitoramento com IA)',
+      h('span', { class: 'small muted' }, ob.linked ? 'Vinculado.' : 'Não vinculado.'),
+      h('label', { class: 'f' }, 'Servidor', url),
+      h('div', { class: 'row wrap', style: 'gap:6px' }, h('button', { class: 'btn sm', onclick: async () => { try { await post('/obico/server', { server_url: url.value }); toast('Servidor salvo'); loadSettings(); } catch (e) { toast(e.message, true); } } }, 'Salvar servidor')),
+      ob.linked
+        ? h('button', { class: 'btn sm danger', onclick: async () => { if (await confirmBox('Desvincular do Obico?', '', 'Desvincular', true)) { try { await post('/obico/unlink'); toast('Desvinculado'); built = false; loadSettings(); } catch (e) { toast(e.message, true); } } } }, 'Desvincular')
+        : h('div', { class: 'row' }, code, h('button', { class: 'btn sm', onclick: async () => { if (!/^\d{6}$/.test(code.value)) { toast('O código tem 6 números', true); return; } try { const t = await post('/obico/link', { code: code.value }); if (t.includes('Linked successfully')) toast('Vinculado ao Obico'); else toast('O vínculo falhou: confira o código', true); built = false; loadSettings(); } catch (e) { toast(e.message, true); } } }, 'Vincular com o código')),
+      h('a', { class: 'small', href: '/obico/status', target: '_blank', rel: 'noopener' }, 'Estado detalhado do Obico')));
+    /* vídeo (proxy) */
+    const jh = h('input', { type: 'text', value: s.janus_host || '', placeholder: 'vazio = desligado' }), jp = h('input', { type: 'number', value: s.janus_port || 17800 });
+    el.append(sec('Vídeo WebRTC (Janus, opcional)',
+      h('div', { class: 'grid2' }, h('label', { class: 'f' }, 'Host', jh), h('label', { class: 'f' }, 'Porta', jp)),
+      h('button', { class: 'btn sm', onclick: async () => {
+        const c = s.camera || {}; const d = { xclk: c.xclk || 10, janus_host: jh.value, janus_port: jp.value }; if (c.rotate180) d.rotate180 = 1;
+        try { await post('/video/config', d); toast('Salvo'); loadSettings(); } catch (e) { toast(e.message, true); }
+      } }, 'Salvar'), h('span', { class: 'tiny faint' }, 'Brilho, rotação e clock ficam na tela Câmera.')));
+    /* firmware */
+    const fi = h('input', { type: 'file', accept: '.bin', class: 'hide' });
+    const bar = h('div', { class: 'bar hide' }, h('div', { style: 'width:0%' })), bt = h('span', { class: 'small muted' });
+    fi.onchange = async () => {
+      const f = fi.files[0]; fi.value = ''; if (!f) return;
+      if (!(await confirmBox('Gravar o firmware ' + f.name + '?', fmtSize(f.size) + '. A ESP32 grava na outra partição e reinicia. Ainda não há volta automática: se o firmware novo não ligar, a placa precisa ir ao PC pelo cabo. Bloqueado durante impressões.', 'Gravar e reiniciar', true))) return;
+      const x = new XMLHttpRequest(); bar.classList.remove('hide');
+      x.upload.onprogress = e => { if (e.lengthComputable) { bar.firstChild.style.width = (e.loaded / e.total * 100) + '%'; bt.textContent = 'Enviando ' + fmtSize(e.loaded) + ' de ' + fmtSize(e.total); } };
+      x.onload = () => { bar.classList.add('hide'); if (x.status === 200) { bt.textContent = 'Gravado. Reiniciando… a página recarrega em 20 s.'; setTimeout(() => location.reload(), 20000); } else { bt.textContent = ''; toast('Falha: ' + x.responseText, true); } };
+      x.onerror = () => { bar.classList.add('hide'); bt.textContent = ''; toast('Falha no envio', true); };
+      x.open('POST', '/ota/upload'); x.setRequestHeader('Content-Type', 'application/octet-stream'); x.send(f);
+    };
+    el.append(sec('Firmware',
+      h('dl', { class: 'kv' }, h('dt', null, 'Versão'), h('dd', null, s.fw_label + ' · ' + s.fw), h('dt', null, 'Partição'), h('dd', null, s.partition), h('dt', null, 'ESP-IDF'), h('dd', null, s.idf)),
+      fi, h('button', { class: 'btn sm', onclick: () => fi.click() }, icon('up'), 'Enviar firmware (.bin)'), bar, bt));
+    /* endereços */
+    const base = location.origin;
+    el.append(sec('Endereços para outros programas',
+      h('dl', { class: 'kv' }, h('dt', null, 'Vídeo (MJPEG)'), h('dd', null, base + '/stream'), h('dt', null, 'Foto'), h('dd', null, base + '/capture'),
+        h('dt', null, 'mDNS'), h('dd', null, s.hostname + '.local'), h('dt', null, 'OctoPrint (RFC 2217)'), h('dd', null, s.rfc2217 ? 'ligado' : 'desligado neste firmware')),
+      h('a', { class: 'btn sm', href: '/' }, icon('old'), 'Abrir a interface antiga')));
+  }
+  update();
+  return { el, update };
+}
+
+/* ---------- Sistema ---------- */
+function Sistema() {
+  const box = h('dl', { class: 'kv' });
+  const el = h('div', { class: 'col', style: 'gap:12px' }, h('h1', null, 'Sistema'), h('section', { class: 'card' }, box),
+    h('span', { class: 'tiny faint' }, 'Atualiza a cada 5 s. Memória "mínima" é o menor valor desde que a ESP32 ligou.'));
+  const RR = { poweron: 'ligada da tomada', external: 'botão de reset', software: 'reinício pelo software (atualização ou configuração)', panic: 'travamento (panic)', int_wdt: 'watchdog de interrupção', task_wdt: 'watchdog de tarefa', wdt: 'watchdog', brownout: 'queda de tensão', deepsleep: 'saída de sono', sdio: 'SDIO', other: 'outro' };
+  function update() {
+    const s = S.stats; box.textContent = '';
+    if (!s) { box.append(h('dt', null, 'Carregando…'), h('dd')); return; }
+    const kv = (k, v) => box.append(h('dt', null, k), h('dd', null, v));
+    kv('Ligada há', fmtDur(s.uptime_s)); kv('Último reinício', RR[s.reset_reason] || s.reset_reason);
+    kv('Wi-Fi', s.wifi === 'connected' ? 'conectado · ' + s.rssi + ' dBm' : 'desconectado'); kv('Reconexões do Wi-Fi', s.wifi_reconnects);
+    kv('Rede de emergência', s.emergency_ap ? 'aberta' : 'fechada'); kv('Câmera', s.camera ? 'OK' : 'indisponível');
+    kv('Memória livre', fmtSize(s.heap)); kv('Memória mínima', fmtSize(s.heap_min)); kv('CPU', s.cpu0 + '% / ' + s.cpu1 + '%');
+    kv('Conexões HTTP', s.http_clients); kv('Vídeos abertos', s.stream_clients + ' de 3');
+    if (S.settings) { kv('Firmware', S.settings.fw + ' (' + S.settings.partition + ')'); }
+  }
+  update();
+  return { el, update };
+}
+
+/* ---------- Mais (celular) ---------- */
+function Mais() {
+  const el = h('div', { class: 'col', style: 'gap:8px' }, h('h1', null, 'Mais'));
+  NAV.slice(4).forEach(([id, label, ic]) => el.append(h('a', { class: 'item', href: '#' + id, style: 'text-decoration:none' }, icon(ic), h('span', { class: 'nm' }, label))));
+  el.append(h('a', { class: 'item', href: '/', style: 'text-decoration:none' }, icon('old'), h('span', { class: 'nm' }, 'Interface antiga')));
+  return { el, update() { } };
+}
+
+/* ---------- roteador ---------- */
+const ROUTES = { inicio: Inicio, arquivos: Arquivos, controles: Controles, mesa: Mesa, camera: Camera, terminal: Terminal, logs: Logs, config: Config, sistema: Sistema, mais: Mais };
+function go() {
+  const name = location.hash.slice(1) || 'inicio';
+  if (current && current.unmount) current.unmount();
+  const view = $('#view'); view.textContent = '';
+  current = (ROUTES[name] || Inicio)();
+  view.append(current.el);
+  refreshView();
+  window.scrollTo(0, 0);
+}
+function applyTheme() {
+  let t = 'auto'; try { t = localStorage.getItem('es-tema') || 'auto'; } catch (e) { }
+  const light = t === 'claro' || (t === 'auto' && matchMedia('(prefers-color-scheme: light)').matches);
+  document.documentElement.dataset.theme = light ? 'light' : 'dark';
+  $('meta[name=theme-color]').setAttribute('content', light ? '#F5F6F8' : '#0F1115');
+}
+applyTheme();
+matchMedia('(prefers-color-scheme: light)').addEventListener('change', applyTheme);
+buildNav();
+window.addEventListener('hashchange', go);
+go();
+every(pollStatus, 2000);
+every(pollStats, 5000);
+loadSettings();
+document.addEventListener('visibilitychange', () => { if (!document.hidden) { pollStatus(); pollStats(); } });
+</script>
+</body>
+</html>

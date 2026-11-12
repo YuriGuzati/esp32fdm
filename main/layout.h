@@ -136,6 +136,7 @@ static inline void layout_html_begin(html_buf_t *p, const char *title, const cha
         "</style></head><body>"
         "<nav>"
         "<span class='brand'>ESP32FDM</span>"
+        "<a href='/app' style='color:#ffb366;font-weight:bold'>Nova interface</a> "
         "%s %s%s%s%s %s %s"
         "<span class='cpu-bars'>"
         "C0<span class='cpu-bar'><div id='cb0'></div></span>"

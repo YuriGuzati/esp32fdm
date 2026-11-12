@@ -112,6 +112,8 @@ typedef enum { FILTER_ALL, FILTER_PRINTER, FILTER_SYSTEM, FILTER_HEAP } log_filt
 typedef struct {
     httpd_req_t *req;
     log_filter_t filter;
+    bool text;          /* Ender Smart (Fase 4): ?format=text → plain text for the new UI */
+    int tail;           /* ?tail=N → only the last N bytes (0 = all) */
 } logs_ctx_t;
 
 static bool s_logs_busy;   /* Ender Smart (F15-22): one /logs response at a time */
@@ -143,8 +145,18 @@ static void logs_task(void *arg)
         xSemaphoreGive(s_mutex);
     }
 
-    httpd_resp_set_type(req, "text/html");
+    bool text = ctx->text;
+    httpd_resp_set_type(req, text ? "text/plain; charset=utf-8" : "text/html");
 
+    /* Only the last N bytes, starting at a line boundary */
+    int first_pos = 0;
+    if (snap && ctx->tail > 0 && ctx->tail < snap_len) {
+        first_pos = snap_len - ctx->tail;
+        while (first_pos < snap_len && snap[first_pos] != '\n') first_pos++;
+        if (first_pos < snap_len) first_pos++;
+    }
+
+    if (!text) {
     /* HTML header via layout */
     html_buf_t page;
     html_buf_init(&page);
@@ -183,6 +195,7 @@ static void logs_task(void *arg)
     if (httpd_resp_send_chunk(req, page.data, page.len) != ESP_OK)
         send_ok = false;
     html_buf_free(&page);
+    }
 
     /* Stream log lines from snapshot.
      * Ender Smart (F15-22): the chunk buffer now spans lines and is flushed only
@@ -191,7 +204,7 @@ static void logs_task(void *arg)
     char chunk[1024];
     int ci = 0;
     if (send_ok && snap && snap_len > 0) {
-        int pos = 0;
+        int pos = first_pos;
         while (pos < snap_len && send_ok) {
             /* Find end of line */
             int line_start = pos;
@@ -212,7 +225,14 @@ static void logs_task(void *arg)
             /* HTML-escape into the shared chunk buffer: we need to escape <, >, & */
             for (int i = line_start; i < line_start + line_len && send_ok; i++) {
                 char c = snap[i];
-                if (c == '<') {
+                if (text) {
+                    if (ci + 1 > (int)sizeof(chunk)) {
+                        if (httpd_resp_send_chunk(req, chunk, ci) != ESP_OK)
+                            send_ok = false;
+                        ci = 0;
+                    }
+                    chunk[ci++] = c;
+                } else if (c == '<') {
                     if (ci + 4 > (int)sizeof(chunk)) {
                         if (httpd_resp_send_chunk(req, chunk, ci) != ESP_OK)
                             send_ok = false;
@@ -250,6 +270,7 @@ static void logs_task(void *arg)
     }
 
     if (send_ok) {
+        if (!text) {
         /* HTML footer */
         html_buf_t foot;
         html_buf_init(&foot);
@@ -258,6 +279,7 @@ static void logs_task(void *arg)
         layout_html_end(&foot);
         httpd_resp_send_chunk(req, foot.data, foot.len);
         html_buf_free(&foot);
+        }
 
         /* End chunked response */
         httpd_resp_send_chunk(req, NULL, 0);
@@ -284,7 +306,9 @@ static esp_err_t logs_handler(httpd_req_t *req)
 
     /* Parse filter from query string (before async clone) */
     log_filter_t filter = FILTER_ALL;
-    char qbuf[32] = {0};
+    bool text = false;
+    int tail = 0;
+    char qbuf[96] = {0};
     if (httpd_req_get_url_query_str(req, qbuf, sizeof(qbuf)) == ESP_OK) {
         char val[16];
         if (httpd_query_key_value(qbuf, "filter", val, sizeof(val)) == ESP_OK) {
@@ -292,6 +316,10 @@ static esp_err_t logs_handler(httpd_req_t *req)
             else if (strcmp(val, "system") == 0) filter = FILTER_SYSTEM;
             else if (strcmp(val, "heap") == 0) filter = FILTER_HEAP;
         }
+        if (httpd_query_key_value(qbuf, "format", val, sizeof(val)) == ESP_OK)
+            text = (strcmp(val, "text") == 0);
+        if (httpd_query_key_value(qbuf, "tail", val, sizeof(val)) == ESP_OK)
+            tail = atoi(val);
     }
 
     httpd_req_t *async_req = NULL;
@@ -309,6 +337,8 @@ static esp_err_t logs_handler(httpd_req_t *req)
     }
     ctx->req = async_req;
     ctx->filter = filter;
+    ctx->text = text;
+    ctx->tail = tail;
 
     /* 6KB stack: 1KB chunk buf + html_buf + PSRAM snapshot pointer */
     if (xTaskCreatePinnedToCore(logs_task, "logs", 6144, ctx,

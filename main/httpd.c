@@ -26,6 +26,9 @@
 #include "url_util.h"
 #include "logbuf.h"
 #include "ota.h"
+#include "version.h"
+#include "esp_app_desc.h"
+#include "esp_ota_ops.h"
 
 static const char *TAG = "httpd";
 
@@ -371,6 +374,81 @@ static esp_err_t api_stats_handler(httpd_req_t *req)
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_send(req, "{\"error\":\"stats not enabled\"}", HTTPD_RESP_USE_STRLEN);
 #endif
+}
+
+/* ---- Ender Smart (Fase 4): new interface at /app and its settings JSON ---- */
+
+extern const uint8_t app_html_start[] asm("_binary_app_html_start");
+extern const uint8_t app_html_end[]   asm("_binary_app_html_end");
+
+static esp_err_t app_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+    return httpd_resp_send(req, (const char *)app_html_start, app_html_end - app_html_start);
+}
+
+static void json_str(char *out, size_t out_size, const char *in)
+{
+    size_t o = 0;
+    for (const unsigned char *p = (const unsigned char *)(in ? in : ""); *p && o + 7 < out_size; p++) {
+        if (*p == '"' || *p == '\\') { out[o++] = '\\'; out[o++] = (char)*p; }
+        else if (*p < 0x20) o += snprintf(out + o, out_size - o, "\\u%04x", *p);
+        else out[o++] = (char)*p;
+    }
+    out[o] = '\0';
+}
+
+/* GET /api/settings — current values for the new interface's forms (read-only) */
+static esp_err_t api_settings_handler(httpd_req_t *req)
+{
+    char ssid_raw[33] = {0};
+    wifi_get_ssid(ssid_raw, sizeof(ssid_raw));
+    char ssid[80], host[80], jhost[140], obico_url[200];
+    json_str(ssid, sizeof(ssid), ssid_raw);
+    json_str(host, sizeof(host), wifi_get_hostname());
+    json_str(jhost, sizeof(jhost), obico_get_janus_host());
+    json_str(obico_url, sizeof(obico_url), obico_get_server_url());
+
+    const esp_app_desc_t *app = esp_app_get_description();
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    int bright = 0, contrast = 0, sat = 0, ae = 0;
+    camera_get_image_params(&bright, &contrast, &sat, &ae);
+
+    char printer[400];
+    printer_comm_settings_json(printer, sizeof(printer));
+
+    char *json = malloc(1400);
+    if (!json) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+        return ESP_FAIL;
+    }
+    snprintf(json, 1400,
+        "{\"hostname\":\"%s\",\"ssid\":\"%s\",\"ip\":\"%s\","
+        "\"fw\":\"%s\",\"fw_label\":\"%s\",\"partition\":\"%s\",\"idf\":\"%s\","
+        "\"camera\":{\"available\":%s,\"rotate180\":%s,\"xclk\":%d,"
+        "\"brightness\":%d,\"contrast\":%d,\"saturation\":%d,\"ae_level\":%d},"
+        "\"janus_host\":\"%s\",\"janus_port\":%u,"
+        "\"obico\":{\"linked\":%s,\"server_url\":\"%s\"},"
+        "\"rfc2217\":%s,%s}",
+        host, ssid, wifi_get_ip_str(),
+        app ? app->version : "?", FW_VERSION, running ? running->label : "?",
+        app ? app->idf_ver : "?",
+        camera_is_available() ? "true" : "false", camera_get_rotate180() ? "true" : "false",
+        camera_get_xclk_mhz(), bright, contrast, sat, ae,
+        jhost, (unsigned)obico_get_janus_port(),
+        obico_is_linked() ? "true" : "false", obico_url,
+#if CONFIG_RFC2217_ENABLE
+        "true",
+#else
+        "false",
+#endif
+        printer);
+
+    httpd_resp_set_type(req, "application/json");
+    esp_err_t ret = httpd_resp_sendstr(req, json);
+    free(json);
+    return ret;
 }
 
 /* ---- GET /api/temp_history — temperature history for chart ---- */
@@ -1120,6 +1198,20 @@ esp_err_t httpd_start_server(void)
         return err;
     }
     s_main_server = server;
+
+    httpd_uri_t app_uri = {
+        .uri      = "/app",
+        .method   = HTTP_GET,
+        .handler  = app_handler,
+    };
+    HTTPD_REGISTER(server, &app_uri);
+
+    httpd_uri_t settings_api_uri = {
+        .uri      = "/api/settings",
+        .method   = HTTP_GET,
+        .handler  = api_settings_handler,
+    };
+    HTTPD_REGISTER(server, &settings_api_uri);
 
     httpd_uri_t root_uri = {
         .uri      = "/",
