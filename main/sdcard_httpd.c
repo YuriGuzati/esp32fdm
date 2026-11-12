@@ -7,7 +7,9 @@
 #include "url_util.h"
 
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_heap_caps.h"
+#include "mbedtls/sha256.h"
 #include "esp_http_server.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -19,11 +21,15 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/unistd.h>
+#include <strings.h>
 
 static const char *TAG = "sdcard_httpd";
 
 #define MOUNT_POINT "/sdcard"
 #define UPLOAD_BUF_SIZE 8192
+/* Ender Smart (F3-02): uploads go to a hidden temporary name and are renamed only
+ * when complete, so an interrupted upload never leaves a truncated file behind. */
+#define UPLOAD_TMP_PREFIX ".up_"
 
 /* Ender Smart (F15-14 / A5): one rule for every file name coming from the network.
  * Rejects path traversal ("..", "/", "\"), hidden/leading-dot names, control
@@ -213,7 +219,14 @@ static esp_err_t sd_files_handler(httpd_req_t *req)
 typedef struct {
     httpd_req_t *req;
     char filename[64];
+    char want_sha[65];   /* Ender Smart (F15-21): optional X-SHA256 header, "" if absent */
 } sd_upload_ctx_t;
+
+static void hex32(const uint8_t *in, char *out)
+{
+    for (int i = 0; i < 32; i++) sprintf(out + 2 * i, "%02x", in[i]);
+    out[64] = '\0';
+}
 
 /* SD writer context — shared between recv task (Core 0) and writer task (Core 1) */
 typedef struct {
@@ -284,8 +297,14 @@ static void sd_upload_task(void *arg)
     sd_upload_ctx_t *ctx = (sd_upload_ctx_t *)arg;
     httpd_req_t *req = ctx->req;
 
-    char path[300];
-    snprintf(path, sizeof(path), MOUNT_POINT "/%s", ctx->filename);
+    char path[300], final_path[300];
+    snprintf(path, sizeof(path), MOUNT_POINT "/" UPLOAD_TMP_PREFIX "%s", ctx->filename);
+    snprintf(final_path, sizeof(final_path), MOUNT_POINT "/%s", ctx->filename);
+    unlink(path);  /* leftover of an earlier interrupted upload */
+
+    mbedtls_sha256_context sha;
+    mbedtls_sha256_init(&sha);
+    mbedtls_sha256_starts(&sha, 0);
 
     FILE *f = fopen(path, "w");
     if (!f) {
@@ -358,6 +377,8 @@ static void sd_upload_task(void *arg)
             break;
         }
 
+        mbedtls_sha256_update(&sha, (const unsigned char *)rbuf, received);
+
         /* Push into stream buffer — may block if writer is slow */
         size_t sent = 0;
         while (sent < (size_t)received) {
@@ -384,15 +405,38 @@ static void sd_upload_task(void *arg)
     free(stream_static);
     if (wctx.file) fclose(wctx.file);  /* writer task may have closed it already */
 
+    uint8_t dig[32];
+    char hex[65];
+    mbedtls_sha256_finish(&sha, dig);
+    hex32(dig, hex);
+
     if (ret != ESP_OK || wctx.write_error) {
         unlink(path);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Upload failed");
+    } else if (ctx->want_sha[0] && strcasecmp(ctx->want_sha, hex) != 0) {
+        unlink(path);
+        ESP_LOGW(TAG, "Upload %s: SHA-256 mismatch (got %s, expected %s), discarded", ctx->filename, hex, ctx->want_sha);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "SHA-256 mismatch: file discarded");
     } else {
-        ESP_LOGI(TAG, "Uploaded %s (%d bytes)", ctx->filename, total);
-        httpd_resp_send(req, "OK", 2);
+        /* FAT rename() does not replace an existing file */
+        unlink(final_path);
+        if (rename(path, final_path) != 0) {
+            unlink(path);
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Rename failed");
+        } else {
+            ESP_LOGI(TAG, "Uploaded %s (%d bytes, sha256 %s%s)", ctx->filename, total, hex,
+                     ctx->want_sha[0] ? ", verified" : "");
+            char esc[160], json[320];
+            json_escape(ctx->filename, esc, sizeof(esc));
+            snprintf(json, sizeof(json), "{\"ok\":true,\"name\":\"%s\",\"size\":%d,\"sha256\":\"%s\",\"verified\":%s}",
+                     esc, total, hex, ctx->want_sha[0] ? "true" : "false");
+            httpd_resp_set_type(req, "application/json");
+            httpd_resp_sendstr(req, json);
+        }
     }
 
 done:
+    mbedtls_sha256_free(&sha);
     httpd_req_async_handler_complete(req);
     free(ctx);
     vTaskDelete(NULL);
@@ -423,6 +467,39 @@ static esp_err_t sd_upload_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
+    /* Ender Smart (F3-02): check before receiving anything */
+    if (req->content_len == 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Empty file");
+        return ESP_FAIL;
+    }
+    int32_t free_kb = sdcard_get_free_kb();
+    if (free_kb >= 0 && (int64_t)req->content_len + 1048576 > (int64_t)free_kb * 1024) {
+        httpd_resp_set_status(req, "507 Insufficient Storage");
+        return httpd_resp_sendstr(req, "Not enough free space on the SD card");
+    }
+    if (printer_comm_job_active()) {
+        printer_state_t ps;
+        printer_comm_get_state(&ps);
+        if (strcmp(ps.filename, filename) == 0) {
+            httpd_resp_set_status(req, "409 Conflict");
+            return httpd_resp_sendstr(req, "This file is being printed");
+        }
+    }
+    char want_sha[80] = "";
+    if (httpd_req_get_hdr_value_str(req, "X-SHA256", want_sha, sizeof(want_sha)) == ESP_OK) {
+        bool hex_ok = strlen(want_sha) == 64;
+        for (int i = 0; hex_ok && i < 64; i++) {
+            char c = (char)(want_sha[i] | 0x20);
+            hex_ok = (want_sha[i] >= '0' && want_sha[i] <= '9') || (c >= 'a' && c <= 'f');
+        }
+        if (!hex_ok) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "X-SHA256 must be 64 hex characters");
+            return ESP_FAIL;
+        }
+    } else {
+        want_sha[0] = '\0';
+    }
+
     httpd_req_t *async_req = NULL;
     if (httpd_req_async_handler_begin(req, &async_req) != ESP_OK) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Async init failed");
@@ -436,6 +513,7 @@ static esp_err_t sd_upload_handler(httpd_req_t *req)
     }
     ctx->req = async_req;
     strlcpy(ctx->filename, filename, sizeof(ctx->filename));
+    strlcpy(ctx->want_sha, want_sha, sizeof(ctx->want_sha));
 
     if (xTaskCreatePinnedToCore(sd_upload_task, "sd_upload", 4096, ctx,
                                  5, NULL, 0) != pdPASS) {
@@ -750,10 +828,178 @@ static esp_err_t sd_info_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* ---- Ender Smart (F15-21): GET /sd/sha256 and GET /sd/download ---- */
+
+static bool s_sd_read_busy;   /* one SHA-256 or download at a time (SD bandwidth, sockets) */
+
+typedef struct {
+    httpd_req_t *req;
+    char filename[64];
+    bool download;
+} sd_read_ctx_t;
+
+/* attachment; filename="ascii fallback"; filename*=UTF-8''percent-encoded (RFC 6266) */
+static void content_disposition(const char *name, char *out, size_t out_size)
+{
+    size_t o = (size_t)snprintf(out, out_size, "attachment; filename=\"");
+    for (const unsigned char *p = (const unsigned char *)name; *p && o + 2 < out_size; p++)
+        out[o++] = (*p >= 0x20 && *p < 0x7f) ? (char)*p : '_';
+    o += snprintf(out + o, out_size - o, "\"; filename*=UTF-8''");
+    for (const unsigned char *p = (const unsigned char *)name; *p && o + 4 < out_size; p++) {
+        if ((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') || (*p >= '0' && *p <= '9') || strchr("-._~", *p))
+            out[o++] = (char)*p;
+        else
+            o += snprintf(out + o, out_size - o, "%%%02X", *p);
+    }
+    out[o < out_size ? o : out_size - 1] = '\0';
+}
+
+static void sd_read_task(void *arg)
+{
+    sd_read_ctx_t *ctx = (sd_read_ctx_t *)arg;
+    httpd_req_t *req = ctx->req;
+    char path[300];
+    snprintf(path, sizeof(path), MOUNT_POINT "/%s", ctx->filename);
+    int64_t t0 = esp_timer_get_time();
+
+    /* SDMMC DMA cannot reach PSRAM: read into internal DMA-capable RAM */
+    int bsz = 16384;
+    uint8_t *buf = NULL;
+    while (bsz >= 512 && !(buf = heap_caps_malloc(bsz, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL)))
+        bsz /= 2;
+    int fd = open(path, O_RDONLY);
+
+    if (fd < 0) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "File not found");
+    } else if (!buf) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+    } else {
+        mbedtls_sha256_context sha;
+        mbedtls_sha256_init(&sha);
+        mbedtls_sha256_starts(&sha, 0);
+        if (ctx->download) {
+            char cd[400];
+            content_disposition(ctx->filename, cd, sizeof(cd));
+            httpd_resp_set_type(req, "application/octet-stream");
+            httpd_resp_set_hdr(req, "Content-Disposition", cd);
+        }
+        long total = 0;
+        bool ok = true;
+        while (true) {
+            int n = read(fd, buf, bsz);
+            if (n < 0) { ok = false; break; }
+            if (n == 0) break;
+            mbedtls_sha256_update(&sha, buf, n);
+            total += n;
+            if (ctx->download && httpd_resp_send_chunk(req, (const char *)buf, n) != ESP_OK) { ok = false; break; }
+        }
+        uint8_t dig[32];
+        char hex[65];
+        mbedtls_sha256_finish(&sha, dig);
+        mbedtls_sha256_free(&sha);
+        hex32(dig, hex);
+        int ms = (int)((esp_timer_get_time() - t0) / 1000);
+
+        if (ctx->download) {
+            if (ok) httpd_resp_send_chunk(req, NULL, 0);
+            ESP_LOGI(TAG, "Download %s: %ld bytes in %d ms%s, sha256 %s", ctx->filename, total, ms,
+                     ok ? "" : " (interrupted)", hex);
+        } else if (!ok) {
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "SD read error");
+        } else {
+            char esc[160], json[320];
+            json_escape(ctx->filename, esc, sizeof(esc));
+            snprintf(json, sizeof(json), "{\"name\":\"%s\",\"size\":%ld,\"sha256\":\"%s\",\"ms\":%d}", esc, total, hex, ms);
+            httpd_resp_set_type(req, "application/json");
+            httpd_resp_sendstr(req, json);
+            ESP_LOGI(TAG, "SHA-256 %s: %s (%ld bytes, %d ms)", ctx->filename, hex, total, ms);
+        }
+    }
+
+    if (fd >= 0) close(fd);
+    free(buf);
+    httpd_req_async_handler_complete(req);
+    free(ctx);
+    __atomic_clear(&s_sd_read_busy, __ATOMIC_RELEASE);
+    vTaskDelete(NULL);
+}
+
+static esp_err_t sd_read_start(httpd_req_t *req, bool download)
+{
+    if (!sdcard_is_mounted()) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "SD card not mounted");
+        return ESP_FAIL;
+    }
+    char query[256], filename[200];
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK ||
+        httpd_query_key_value(query, "filename", filename, sizeof(filename)) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing filename");
+        return ESP_FAIL;
+    }
+    url_decode_inplace(filename);
+    if (!sd_name_ok(filename)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid filename");
+        return ESP_FAIL;
+    }
+    /* A full-file read competes with the print's own SD reads */
+    if (printer_comm_job_active()) {
+        httpd_resp_set_status(req, "409 Conflict");
+        return httpd_resp_sendstr(req, "Blocked while a print is running or paused");
+    }
+    if (__atomic_test_and_set(&s_sd_read_busy, __ATOMIC_ACQ_REL)) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_set_hdr(req, "Retry-After", "10");
+        return httpd_resp_sendstr(req, "Another SHA-256 or download is running, try again shortly");
+    }
+
+    httpd_req_t *async_req = NULL;
+    sd_read_ctx_t *ctx = NULL;
+    if (httpd_req_async_handler_begin(req, &async_req) != ESP_OK) {
+        __atomic_clear(&s_sd_read_busy, __ATOMIC_RELEASE);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Async init failed");
+        return ESP_FAIL;
+    }
+    ctx = malloc(sizeof(*ctx));
+    if (!ctx) goto fail;
+    ctx->req = async_req;
+    ctx->download = download;
+    strlcpy(ctx->filename, filename, sizeof(ctx->filename));
+    if (xTaskCreatePinnedToCore(sd_read_task, download ? "sd_dl" : "sd_sha", 6144, ctx, 5, NULL, 0) != pdPASS)
+        goto fail;
+    return ESP_OK;
+
+fail:
+    free(ctx);
+    httpd_req_async_handler_complete(async_req);
+    __atomic_clear(&s_sd_read_busy, __ATOMIC_RELEASE);
+    return ESP_FAIL;
+}
+
+static esp_err_t sd_sha256_handler(httpd_req_t *req) { return sd_read_start(req, false); }
+static esp_err_t sd_download_handler(httpd_req_t *req) { return sd_read_start(req, true); }
+
+/* Remove temporary files left by uploads interrupted before a reboot */
+static void sd_cleanup_tmp_uploads(void)
+{
+    if (!sdcard_is_mounted()) return;
+    DIR *dir = opendir(MOUNT_POINT);
+    if (!dir) return;
+    struct dirent *ent;
+    char path[300];
+    while ((ent = readdir(dir)) != NULL) {
+        if (strncmp(ent->d_name, UPLOAD_TMP_PREFIX, strlen(UPLOAD_TMP_PREFIX)) != 0) continue;
+        snprintf(path, sizeof(path), MOUNT_POINT "/%s", ent->d_name);
+        if (unlink(path) == 0) ESP_LOGW(TAG, "Removed unfinished upload %s", ent->d_name);
+    }
+    closedir(dir);
+}
+
 /* ---- Registration ---- */
 
 esp_err_t sdcard_httpd_register(httpd_handle_t server)
 {
+    sd_cleanup_tmp_uploads();
+
     const httpd_uri_t uris[] = {
         { .uri = "/sd",        .method = HTTP_GET,  .handler = sd_page_handler },
         { .uri = "/sd/files",  .method = HTTP_GET,  .handler = sd_files_handler },
@@ -765,6 +1011,8 @@ esp_err_t sdcard_httpd_register(httpd_handle_t server)
         { .uri = "/sd/cancel", .method = HTTP_POST, .handler = sd_cancel_handler },
         { .uri = "/sd/info",   .method = HTTP_GET,  .handler = sd_info_handler },
         { .uri = "/sd/status", .method = HTTP_GET,  .handler = sd_status_handler },
+        { .uri = "/sd/sha256", .method = HTTP_GET,  .handler = sd_sha256_handler },
+        { .uri = "/sd/download", .method = HTTP_GET, .handler = sd_download_handler },
     };
 
     for (int i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {

@@ -191,6 +191,15 @@ bool printer_comm_cmd_allowed(const char *gcode, char *reason, size_t reason_len
  */
 bool printer_comm_job_active(void);
 
+/** Ender Smart (F15-15): bytes from the printer lost because the RX buffer was full. */
+uint32_t printer_comm_rx_dropped(void);
+
+/** Ender Smart (F2-02): last M115 answer as a JSON object (firmware line, age, capabilities). */
+void printer_comm_info_json(char *out, size_t out_size);
+
+/** Ender Smart (F2-02): queue an M115 (read-only). Refused while a job runs or without USB. */
+esp_err_t printer_comm_request_info(void);
+
 /** Ender Smart (Fase 4): writes the printer settings as JSON members (no braces). */
 void printer_comm_settings_json(char *out, size_t out_size);
 

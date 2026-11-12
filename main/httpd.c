@@ -353,19 +353,20 @@ static esp_err_t api_stats_handler(httpd_req_t *req)
     int client_fds[16];
     if (!s_main_server || httpd_get_client_list(s_main_server, &n_clients, client_fds) != ESP_OK)
         n_clients = 0;
-    char json[384];
+    char json[448];
     snprintf(json, sizeof(json),
         "{\"cpu0\":%d,\"cpu1\":%d,\"heap\":%lu,\"heap_min\":%lu,"
         "\"uptime_s\":%lld,\"reset_reason\":\"%s\",\"rssi\":%d,"
         "\"wifi\":\"%s\",\"emergency_ap\":%s,\"wifi_reconnects\":%lu,\"camera\":%s,"
-        "\"http_clients\":%u,\"stream_clients\":%d}",
+        "\"http_clients\":%u,\"stream_clients\":%d,\"rx_dropped\":%lu}",
         cpu0_pct, cpu1_pct, (unsigned long)free_heap, (unsigned long)min_heap,
         (long long)(esp_timer_get_time() / 1000000), reset_reason_str(esp_reset_reason()),
         sta ? rssi : 0, sta ? "connected" : "disconnected",
         wifi_emergency_ap_active() ? "true" : "false",
         (unsigned long)wifi_get_reconnect_count(),
         camera_is_available() ? "true" : "false",
-        (unsigned)n_clients, __atomic_load_n(&s_stream_clients, __ATOMIC_ACQUIRE));
+        (unsigned)n_clients, __atomic_load_n(&s_stream_clients, __ATOMIC_ACQUIRE),
+        (unsigned long)printer_comm_rx_dropped());
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
@@ -449,6 +450,34 @@ static esp_err_t api_settings_handler(httpd_req_t *req)
     esp_err_t ret = httpd_resp_sendstr(req, json);
     free(json);
     return ret;
+}
+
+/* ---- Ender Smart (F2-02): GET /api/printer_info and POST /api/printer_info/refresh ---- */
+
+static esp_err_t api_printer_info_handler(httpd_req_t *req)
+{
+    char *json = malloc(2560);
+    if (!json) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+        return ESP_FAIL;
+    }
+    printer_comm_info_json(json, 2560);
+    httpd_resp_set_type(req, "application/json");
+    esp_err_t ret = httpd_resp_sendstr(req, json);
+    free(json);
+    return ret;
+}
+
+static esp_err_t api_printer_info_refresh_handler(httpd_req_t *req)
+{
+    /* M115 only reads the firmware identification: no motion, no heating */
+    esp_err_t err = printer_comm_request_info();
+    httpd_resp_set_type(req, "application/json");
+    if (err == ESP_OK)
+        return httpd_resp_sendstr(req, "{\"ok\":true}");
+    httpd_resp_set_status(req, "409 Conflict");
+    return httpd_resp_sendstr(req, err == ESP_ERR_NOT_SUPPORTED ? "{\"ok\":false,\"err\":\"Only for Marlin\"}"
+                                   : "{\"ok\":false,\"err\":\"Printer not connected or a print is running\"}");
 }
 
 /* ---- GET /api/temp_history — temperature history for chart ---- */
@@ -1187,7 +1216,7 @@ esp_err_t httpd_start_server(void)
     config.server_port = 80;
     config.core_id = 0;
     config.stack_size = 10240;  /* TLS (mbedTLS) in /obico/link handler needs ~8KB */
-    config.max_uri_handlers = 56;
+    config.max_uri_handlers = 64;   /* Ender Smart: 55 in use after lote 4 */
     config.max_open_sockets = 13;
     config.lru_purge_enable = true;
 
@@ -1212,6 +1241,11 @@ esp_err_t httpd_start_server(void)
         .handler  = api_settings_handler,
     };
     HTTPD_REGISTER(server, &settings_api_uri);
+
+    httpd_uri_t printer_info_uri = { .uri = "/api/printer_info", .method = HTTP_GET, .handler = api_printer_info_handler };
+    HTTPD_REGISTER(server, &printer_info_uri);
+    httpd_uri_t printer_info_refresh_uri = { .uri = "/api/printer_info/refresh", .method = HTTP_POST, .handler = api_printer_info_refresh_handler };
+    HTTPD_REGISTER(server, &printer_info_refresh_uri);
 
     httpd_uri_t root_uri = {
         .uri      = "/",

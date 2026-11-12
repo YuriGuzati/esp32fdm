@@ -50,6 +50,20 @@ static const char *TAG = "printer_comm";
 /* ---- Line callback (used by bedlevel mesh parsing) ---- */
 static void (*s_line_callback)(const char *line);
 
+/* ---- Ender Smart (F15-15): quieter log + lost RX bytes ---- */
+static volatile uint32_t s_rx_dropped;   /* bytes the RX stream buffer had no room for */
+static bool    s_tx_quiet;               /* set while sending host-print stream lines */
+static bool    s_pos_logged;             /* first M114 answer after a (re)connect is logged */
+static int64_t s_last_heartbeat_us;
+
+/* ---- Ender Smart (F2-02): M115 identification and capabilities ---- */
+#define PRINTER_CAPS_MAX 48
+typedef struct { char name[28]; uint8_t on; } printer_cap_t;
+static char          s_fw_line[200];
+static printer_cap_t s_caps[PRINTER_CAPS_MAX];
+static int           s_caps_count;
+static int64_t       s_info_time_us;      /* when FIRMWARE_NAME was last seen, 0 = never */
+
 /* ---- Synchronous command send ---- */
 static SemaphoreHandle_t s_sync_cmd_sem;
 /* Ender Smart (F15-18 / A2): the old single "pending" flag was released by ANY raw
@@ -371,7 +385,42 @@ static void process_line(const char *line)
         s_line_callback(line);
     }
 
-    ESP_LOGI(TAG, "RX: %s", line);
+    /* F15-15: answers to the automatic polls, temperature reports, "ok" of the host-print
+     * stream and "busy:" go to DEBUG; the first position after a reconnect stays visible
+     * (it shows whether the Ender kept its position, i.e. did not restart). */
+    bool is_ok = strncmp(line, "ok", 2) == 0 && (line[2] == '\0' || line[2] == ' ');
+    bool is_pos = strstr(line, "X:") && strstr(line, "Y:") && strstr(line, "Z:") && strstr(line, "Count");
+    bool quiet = strncmp(line, "busy:", 5) == 0 ||
+                 (strstr(line, "T:") && strstr(line, "B:")) ||
+                 strstr(line, "Not SD printing") || strstr(line, "SD printing byte") ||
+                 (is_ok && (s_tx_quiet || hp_is_active() || s_pending_query == QUERY_M105 ||
+                            s_pending_query == QUERY_M27 || s_pending_query == QUERY_M114 ||
+                            s_pending_query == QUERY_M119)) ||
+                 (is_pos && s_pos_logged);
+    if (is_pos) s_pos_logged = true;
+    if (quiet)
+        ESP_LOGD(TAG, "RX: %s", line);
+    else
+        ESP_LOGI(TAG, "RX: %s", line);
+
+    /* F2-02: M115 answer. A new FIRMWARE_NAME line starts a fresh capability list. */
+    if (strncmp(line, "FIRMWARE_NAME:", 14) == 0) {
+        strlcpy(s_fw_line, line, sizeof(s_fw_line));
+        s_caps_count = 0;
+        s_info_time_us = esp_timer_get_time();
+    } else if (strncmp(line, "Cap:", 4) == 0 && s_caps_count < PRINTER_CAPS_MAX) {
+        const char *nm = line + 4, *colon = strrchr(nm, ':');
+        if (colon && colon > nm) {
+            size_t n = (size_t)(colon - nm);
+            if (n >= sizeof(s_caps[0].name)) n = sizeof(s_caps[0].name) - 1;
+            memcpy(s_caps[s_caps_count].name, nm, n);
+            s_caps[s_caps_count].name[n] = '\0';
+            for (char *c = s_caps[s_caps_count].name; *c; c++)   /* keep it JSON-safe */
+                if (!isalnum((unsigned char)*c) && *c != '_') *c = '_';
+            s_caps[s_caps_count].on = (uint8_t)(atoi(colon + 1) != 0);
+            s_caps_count++;
+        }
+    }
 
     /* Ender Smart (F15-06): Marlin boot banner means the printer restarted (power
      * glitch, reset). Seen on the Ender-3 Max Neo: "start" (often garbled),
@@ -667,7 +716,11 @@ static bool marlin_send_cmd_ex(const char *gcode, query_type_t qtype,
     /* Send command with newline */
     char buf[MARLIN_MAX_LINE + 2];
     int len = snprintf(buf, sizeof(buf), "%s\n", gcode);
-    ESP_LOGI(TAG, "TX: %s", gcode);
+    /* F15-15: automatic polls and the host-print stream go to DEBUG; commands stay visible */
+    if (s_tx_quiet || qtype == QUERY_M105 || qtype == QUERY_M27 || qtype == QUERY_M114 || qtype == QUERY_M119)
+        ESP_LOGD(TAG, "TX: %s", gcode);
+    else
+        ESP_LOGI(TAG, "TX: %s", gcode);
     terminal_feed_tx(gcode);
     esp_err_t err = usb_serial_send((const uint8_t *)buf, len);
     if (err != ESP_OK) {
@@ -787,7 +840,10 @@ bool marlin_send_cmd(const char *gcode, query_type_t qtype)
 /** Host print send: shorter timeout, with stall ping retries. */
 bool marlin_send_cmd_hp(const char *gcode, query_type_t qtype)
 {
-    return marlin_send_cmd_ex(gcode, qtype, HOST_CMD_TIMEOUT_MS, HOST_STALL_PING_RETRIES);
+    s_tx_quiet = true;
+    bool ok = marlin_send_cmd_ex(gcode, qtype, HOST_CMD_TIMEOUT_MS, HOST_STALL_PING_RETRIES);
+    s_tx_quiet = false;
+    return ok;
 }
 
 /** Ender Smart (F15-23): send a user/API command with line number and checksum.
@@ -848,6 +904,7 @@ static void printer_comm_task(void *arg)
                 hp_notify_usb_lost();
             }
             s_m290_queried = false;
+            s_pos_logged = false;
             vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
         }
@@ -993,6 +1050,19 @@ static void printer_comm_task(void *arg)
 poll_done:
 #undef CHECK_COOLDOWN
 
+        /* F15-15: one status line per minute replaces the per-poll log lines */
+        if (esp_timer_get_time() - s_last_heartbeat_us >= 60000000LL) {
+            s_last_heartbeat_us = esp_timer_get_time();
+            printer_state_t hb;
+            xSemaphoreTake(g_state_mutex, portMAX_DELAY);
+            memcpy(&hb, &g_state, sizeof(hb));
+            xSemaphoreGive(g_state_mutex);
+            ESP_LOGI(TAG, "Status: HE %.1f/%.0f BED %.1f/%.0f Z %.2f%s%s, rx_dropped %lu",
+                     hb.hotend_actual, hb.hotend_target, hb.bed_actual, hb.bed_target, hb.z,
+                     hp_is_active() ? ", printing " : "", hp_is_active() ? hb.filename : "",
+                     (unsigned long)s_rx_dropped);
+        }
+
         /* Shorter delay during host print for throughput, normal otherwise */
         vTaskDelay(pdMS_TO_TICKS(hp_is_active() && !hp_is_paused() ? 20 : 100));
     }
@@ -1057,7 +1127,8 @@ void printer_comm_rx_cb(const uint8_t *data, size_t len, void *user_ctx)
     if (s_backend != PRINTER_BACKEND_MARLIN) return;
     if (len > 0) {
         if (s_rx_stream) {
-            xStreamBufferSend(s_rx_stream, data, len, 0);
+            size_t n = xStreamBufferSend(s_rx_stream, data, len, 0);
+            if (n < len) s_rx_dropped += (uint32_t)(len - n);   /* F15-15 */
         }
         terminal_feed_rx(data, len);
     }
@@ -1172,6 +1243,38 @@ void printer_comm_settings_json(char *out, size_t out_size)
              host, (unsigned)s_mr_port,
              s_pause_cmd == PAUSE_CMD_M524 ? "m524" : "m25",
              s_filament_check ? "true" : "false", echo);
+}
+
+/* ---- Ender Smart (F15-15 / F2-02) ---- */
+
+uint32_t printer_comm_rx_dropped(void)
+{
+    return s_rx_dropped;
+}
+
+void printer_comm_info_json(char *out, size_t out_size)
+{
+    size_t o = 0;
+    o += snprintf(out + o, out_size - o, "{\"firmware_line\":\"");
+    for (const unsigned char *p = (const unsigned char *)s_fw_line; *p && o + 8 < out_size; p++) {
+        if (*p == '"' || *p == '\\') { out[o++] = '\\'; out[o++] = (char)*p; }
+        else if (*p >= 0x20 && *p < 0x7f) out[o++] = (char)*p;
+    }
+    o += snprintf(out + o, out_size - o, "\",\"age_s\":%lld,\"caps\":{",
+                  s_info_time_us ? (long long)((esp_timer_get_time() - s_info_time_us) / 1000000) : -1LL);
+    for (int i = 0; i < s_caps_count && o + 40 < out_size; i++)
+        o += snprintf(out + o, out_size - o, "%s\"%s\":%d", i ? "," : "", s_caps[i].name, s_caps[i].on);
+    snprintf(out + o, out_size - o, "}}");
+}
+
+esp_err_t printer_comm_request_info(void)
+{
+    if (s_backend != PRINTER_BACKEND_MARLIN) return ESP_ERR_NOT_SUPPORTED;
+    if (!usb_serial_is_connected()) return ESP_ERR_INVALID_STATE;
+    if (printer_comm_job_active()) return ESP_ERR_INVALID_STATE;
+    printer_cmd_t cmd = { .type = PCMD_RAW };
+    strlcpy(cmd.gcode, "M115", sizeof(cmd.gcode));
+    return printer_comm_send_cmd(&cmd);
 }
 
 bool printer_comm_job_active(void)

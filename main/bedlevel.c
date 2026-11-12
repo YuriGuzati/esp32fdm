@@ -34,6 +34,7 @@ typedef struct {
     float data[BL_MESH_MAX][BL_MESH_MAX];
     float min_z, max_z;
     float bed_c;     /* Ender Smart (Fase 4): bed temperature when the grid was read, -1 = unknown */
+    int src;         /* Ender Smart (F5-01): 1 = G29 from this page, 2 = M420 V read from this page, 0 = other */
 } bl_mesh_t;
 
 typedef struct {
@@ -51,6 +52,7 @@ typedef enum {
     BL_IDLE,
     BL_HOMING,
     BL_PROBING,
+    BL_READING,   /* Ender Smart (F5-01): M420 V, no motion */
     BL_DONE,
     BL_ERROR,
 } bl_state_t;
@@ -60,6 +62,11 @@ static bl_state_t s_state = BL_IDLE;
 static bl_mesh_t  s_current_mesh;
 static bl_config_t s_config = { .bed_w = 220, .bed_h = 220, .screw_spacing = 180, .screw_pitch = 1.0f, .screw_fac = 1.2f };
 static char s_error_msg[64];
+/* Ender Smart (F5-01) */
+static volatile int      s_capture_src;     /* what the next captured grid comes from (see bl_mesh_t.src) */
+static volatile uint32_t s_capture_count;   /* grids parsed so far (saved or not) */
+static volatile bool     s_read_same;       /* last M420 V returned the same grid as the latest saved one */
+static int               s_last_op;         /* 1 = probe, 2 = read */
 
 /* ---- Config persistence ---- */
 
@@ -131,6 +138,7 @@ static void save_mesh(const bl_mesh_t *mesh)
     cJSON_AddNumberToObject(root, "min", mesh->min_z);
     cJSON_AddNumberToObject(root, "max", mesh->max_z);
     if (mesh->bed_c >= 0) cJSON_AddNumberToObject(root, "bed", mesh->bed_c);
+    if (mesh->src > 0) cJSON_AddNumberToObject(root, "src", mesh->src);
 
     cJSON *rows = cJSON_AddArrayToObject(root, "d");
     for (int y = 0; y < mesh->grid_y; y++) {
@@ -183,6 +191,8 @@ static bool load_mesh_file(const char *path, bl_mesh_t *mesh)
     mesh->max_z = cJSON_GetObjectItem(root, "max")->valuedouble;
     cJSON *bed = cJSON_GetObjectItem(root, "bed");
     mesh->bed_c = (bed && cJSON_IsNumber(bed)) ? (float)bed->valuedouble : -1.0f;
+    cJSON *src = cJSON_GetObjectItem(root, "src");
+    mesh->src = (src && cJSON_IsNumber(src)) ? src->valueint : 0;
 
     cJSON *rows = cJSON_GetObjectItem(root, "d");
     if (rows) {
@@ -276,7 +286,22 @@ static void mesh_parse_line(const char *line)
         if (*p < '0' || *p > '9') {
             /* Not a data row — mesh is complete */
             s_parse_state = MESH_PARSE_IDLE;
+            if (s_parse_mesh.grid_y > 0 && s_parse_mesh.grid_x > 0 && s_capture_src == 2 &&
+                s_parse_mesh.grid_x == s_current_mesh.grid_x && s_parse_mesh.grid_y == s_current_mesh.grid_y) {
+                /* F5-01: a read that returns the grid already saved adds no history entry */
+                bool same = true;
+                for (int y = 0; y < s_parse_mesh.grid_y && same; y++)
+                    for (int x = 0; x < s_parse_mesh.grid_x && same; x++)
+                        same = fabsf(s_parse_mesh.data[y][x] - s_current_mesh.data[y][x]) < 0.0005f;
+                if (same) {
+                    s_read_same = true;
+                    s_capture_count++;
+                    ESP_LOGI(TAG, "Mesh read: same as the latest saved grid, not stored again");
+                    break;
+                }
+            }
             if (s_parse_mesh.grid_y > 0 && s_parse_mesh.grid_x > 0) {
+                s_parse_mesh.src = s_capture_src;
                 s_parse_mesh.timestamp = (int64_t)time(NULL);
                 /* Ender Smart (Fase 4): the bed changes shape with temperature — keep it with the mesh.
                  * Safe here: process_line() runs without the state mutex held. */
@@ -288,6 +313,7 @@ static void mesh_parse_line(const char *line)
                 ESP_LOGI(TAG, "Mesh captured: %dx%d, range %.3f..%.3f",
                          s_parse_mesh.grid_x, s_parse_mesh.grid_y,
                          s_parse_mesh.min_z, s_parse_mesh.max_z);
+                s_capture_count++;
             }
             break;
         }
@@ -326,6 +352,8 @@ static bool s_probe_busy;
 static void probe_task(void *arg)
 {
     s_state = BL_HOMING;
+    s_last_op = 1;
+    s_capture_src = 1;
     printer_comm_set_polling_suppressed(true);
 
     ESP_LOGI(TAG, "Probe: homing (G28)...");
@@ -376,8 +404,57 @@ static void probe_task(void *arg)
 
 cleanup:
     printer_comm_set_polling_suppressed(false);
+    s_capture_src = 0;
     __atomic_clear(&s_probe_busy, __ATOMIC_RELEASE);
     vTaskDelete(NULL);
+}
+
+/* ---- Ender Smart (F5-01): read the grid stored in the Ender (M420 V), no motion ---- */
+
+static void read_task(void *arg)
+{
+    s_state = BL_READING;
+    s_last_op = 2;
+    s_read_same = false;
+    uint32_t before = s_capture_count;
+    s_capture_src = 2;
+
+    ESP_LOGI(TAG, "Mesh read (M420 V)...");
+    esp_err_t err = printer_comm_send_gcode_sync("M420 V", 15000);
+    bool got = false;
+    for (int i = 0; i < 10 && err == ESP_OK; i++) {
+        if (s_capture_count != before) { got = true; break; }
+        vTaskDelay(pdMS_TO_TICKS(300));
+    }
+    s_capture_src = 0;
+
+    if (err != ESP_OK) {
+        snprintf(s_error_msg, sizeof(s_error_msg), "M420 V failed: %s", esp_err_to_name(err));
+        s_state = BL_ERROR;
+    } else if (!got) {
+        snprintf(s_error_msg, sizeof(s_error_msg), "No grid in the M420 V answer");
+        s_state = BL_ERROR;
+    } else {
+        s_state = BL_DONE;
+    }
+    if (s_state == BL_ERROR) ESP_LOGW(TAG, "%s", s_error_msg);
+    __atomic_clear(&s_probe_busy, __ATOMIC_RELEASE);
+    vTaskDelete(NULL);
+}
+
+static esp_err_t bedlevel_read_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "application/json");
+    if (printer_comm_job_active())
+        return httpd_resp_sendstr(req, "{\"ok\":false,\"err\":\"Cannot read while printing\"}");
+    if (__atomic_test_and_set(&s_probe_busy, __ATOMIC_ACQ_REL))
+        return httpd_resp_sendstr(req, "{\"ok\":false,\"err\":\"Probing or reading already in progress\"}");
+    s_error_msg[0] = '\0';
+    if (xTaskCreatePinnedToCore(read_task, "bl_read", 4096, NULL, 5, NULL, 0) != pdPASS) {
+        __atomic_clear(&s_probe_busy, __ATOMIC_RELEASE);
+        return httpd_resp_sendstr(req, "{\"ok\":false,\"err\":\"Failed to start read task\"}");
+    }
+    return httpd_resp_sendstr(req, "{\"ok\":true}");
 }
 
 /* ---- Mesh JSON builder ---- */
@@ -387,6 +464,7 @@ static void mesh_to_json(const bl_mesh_t *mesh, html_buf_t *p)
     html_buf_printf(p, "{\"ts\":%lld,\"gx\":%d,\"gy\":%d,\"min\":%.3f,\"max\":%.3f,",
                     (long long)mesh->timestamp, mesh->grid_x, mesh->grid_y, mesh->min_z, mesh->max_z);
     if (mesh->bed_c >= 0) html_buf_printf(p, "\"bed\":%.1f,", mesh->bed_c);
+    if (mesh->src > 0) html_buf_printf(p, "\"src\":%d,", mesh->src);
     html_buf_printf(p, "\"d\":[");
     for (int y = 0; y < mesh->grid_y; y++) {
         html_buf_printf(p, "%s[", y ? "," : "");
@@ -442,6 +520,7 @@ static esp_err_t bedlevel_status_handler(httpd_req_t *req)
     switch (s_state) {
     case BL_HOMING:  state_str = "homing"; break;
     case BL_PROBING: state_str = "probing"; break;
+    case BL_READING: state_str = "reading"; break;
     case BL_DONE:    state_str = "done"; break;
     case BL_ERROR:   state_str = "error"; break;
     default:         state_str = "idle"; break;
@@ -449,7 +528,9 @@ static esp_err_t bedlevel_status_handler(httpd_req_t *req)
 
     html_buf_t p;
     html_buf_init(&p);
-    html_buf_printf(&p, "{\"state\":\"%s\"", state_str);
+    html_buf_printf(&p, "{\"state\":\"%s\",\"op\":\"%s\"", state_str,
+                    s_last_op == 2 ? "read" : s_last_op == 1 ? "probe" : "");
+    if (s_state == BL_DONE && s_last_op == 2 && s_read_same) html_buf_printf(&p, ",\"same\":true");
     if (s_state == BL_ERROR && s_error_msg[0]) {
         html_buf_printf(&p, ",\"err\":\"%s\"", s_error_msg);
     }
@@ -821,6 +902,7 @@ esp_err_t bedlevel_register_httpd(httpd_handle_t server)
     httpd_uri_t uris[] = {
         { .uri = "/bedlevel",        .method = HTTP_GET,  .handler = bedlevel_page_handler },
         { .uri = "/bedlevel/probe",  .method = HTTP_POST, .handler = bedlevel_probe_handler },
+        { .uri = "/bedlevel/read",   .method = HTTP_POST, .handler = bedlevel_read_handler },
         { .uri = "/bedlevel/status", .method = HTTP_GET,  .handler = bedlevel_status_handler },
         { .uri = "/bedlevel/meshlist", .method = HTTP_GET, .handler = bedlevel_meshlist_handler },
         { .uri = "/bedlevel/mesh",   .method = HTTP_GET,  .handler = bedlevel_mesh_handler },
