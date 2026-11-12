@@ -18,6 +18,44 @@ menu "ESP32 FDM Bridge Configuration"
         help
             Default baud rate for USB serial connection to the printer.
 
+    config ESP32FDM_SIMULATION
+        bool "Simulation mode (/obico/simulate) - DEVELOPMENT ONLY"
+        default n
+        help
+            Shows fake printer data and DROPS every command sent to the printer,
+            including cancel. Never enable this in a build used with a real printer.
+
+    menu "Wi-Fi resilience"
+
+        config WIFI_RECONNECT_MAX_BACKOFF_S
+            int "Maximum delay between reconnect attempts (seconds)"
+            default 60
+            range 5 600
+            help
+                After the connection drops, the device retries forever with an
+                exponential backoff (1 s, 2 s, 4 s ...) capped at this value.
+
+        config WIFI_EMERGENCY_AP_MINUTES
+            int "Emergency AP duration (minutes, 0 = disabled)"
+            default 5
+            range 0 60
+            help
+                If the saved network is unreachable at boot, the device keeps
+                booting (camera, SD, USB, printer), keeps retrying the saved
+                network and also opens its own access point for this many
+                minutes (kept open while a client is connected).
+
+    endmenu
+
+    config BOOT_CONFIRM_DELAY_S
+        int "Seconds of stable running before a new OTA image is confirmed"
+        default 30
+        range 5 600
+        help
+            With bootloader rollback enabled, a freshly updated image that
+            crashes or is reset before this delay is rolled back to the
+            previous image by the bootloader.
+
     menu "Obico Integration"
 
         config OBICO_SERVER_URL

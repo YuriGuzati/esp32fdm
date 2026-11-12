@@ -6,10 +6,12 @@
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_sntp.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "freertos/task.h"
 
 static const char *TAG = "wifi";
 
@@ -27,6 +29,12 @@ static const char *TAG = "wifi";
 #define ROAM_RSSI_HYSTERESIS  10      /* only roam if new AP is this much better */
 #define ROAM_SCAN_INTERVAL_MS 30000   /* min interval between roam scans */
 
+/* Ender Smart (F15-02/F15-03): reconnect forever with exponential backoff. */
+#define BACKOFF_MIN_MS        1000
+#define BACKOFF_MAX_MS        ((uint32_t)CONFIG_WIFI_RECONNECT_MAX_BACKOFF_S * 1000)
+#define CONNECT_TIMEOUT_US    (30LL * 1000000)   /* an attempt with no result is abandoned */
+#define SUPERVISOR_PERIOD_MS  1000
+
 static EventGroupHandle_t s_wifi_event_group;
 static int s_retry_num;
 static int s_max_retry;
@@ -35,6 +43,22 @@ static bool s_sta_netif_created;
 static char s_current_ssid[33];
 static char s_current_pass[65];
 static char s_hostname[32] = DEFAULT_HOSTNAME;
+
+/* Supervisor state. Before s_supervise is set (boot phase) the original
+ * "3 retries then FAIL_BIT" behaviour is used to decide how to boot. */
+static volatile bool s_supervise;
+static volatile bool s_connecting;
+static volatile bool s_roaming;
+static volatile int64_t s_next_attempt_us;
+static int64_t s_attempt_started_us;
+static volatile uint32_t s_backoff_ms = BACKOFF_MIN_MS;
+static volatile uint32_t s_reconnects;      /* successful re-connections after a drop */
+static volatile bool s_had_connection;      /* connected at least once since boot */
+
+/* Emergency AP (APSTA) while the saved network is unreachable */
+static volatile bool s_ap_active;
+static int64_t s_ap_deadline_us;
+static bool s_ap_netif_created;
 
 /* Scan for all APs matching ssid, return the BSSID of the strongest one.
  * Returns true if a match was found (best_bssid and best_rssi populated). */
@@ -145,6 +169,8 @@ static void roam_task(void *arg)
         wifi_config.sta.rm_enabled = 1;
         wifi_config.sta.btm_enabled = 1;
 
+        /* The supervisor must not schedule its own reconnect while we roam */
+        s_roaming = true;
         s_max_retry = MAX_RETRY;
         s_retry_num = 0;
         xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
@@ -160,12 +186,15 @@ static void roam_task(void *arg)
 
         bits = xEventGroupGetBits(s_wifi_event_group);
         if (!(bits & WIFI_CONNECTED_BIT)) {
-            /* Roam failed — reconnect without BSSID lock */
+            /* Roam failed — go back to "any AP" and let the supervisor reconnect */
             ESP_LOGW(TAG, "Roam failed, reconnecting to any AP...");
             wifi_config.sta.bssid_set = false;
             esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
-            esp_wifi_connect();
+            s_backoff_ms = BACKOFF_MIN_MS;
+            s_next_attempt_us = esp_timer_get_time();
+            s_connecting = false;
         }
+        s_roaming = false;
     }
 }
 
@@ -173,21 +202,54 @@ static void event_handler(void *arg, esp_event_base_t event_base,
                            int32_t event_id, void *event_data)
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
-    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
-        if (s_retry_num < s_max_retry) {
-            s_retry_num++;
-            ESP_LOGW(TAG, "Retrying connection (%d/%d)...", s_retry_num, s_max_retry);
+        /* Boot phase only: in supervised mode the supervisor issues the connects */
+        if (!s_supervise)
             esp_wifi_connect();
-        } else {
-            xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        wifi_event_sta_disconnected_t *d = (wifi_event_sta_disconnected_t *)event_data;
+        xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+
+        if (!s_supervise) {
+            /* Boot phase: original behaviour, decides STA vs. fallback */
+            if (s_retry_num < s_max_retry) {
+                s_retry_num++;
+                ESP_LOGW(TAG, "Retrying connection (%d/%d)...", s_retry_num, s_max_retry);
+                esp_wifi_connect();
+            } else {
+                xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+            }
+            return;
         }
+
+        if (s_roaming) {
+            /* Roam task is waiting: the first drop is the intentional disconnect,
+             * so retry a few times before reporting failure (original behaviour) */
+            if (s_retry_num < s_max_retry) {
+                s_retry_num++;
+                esp_wifi_connect();
+            } else {
+                xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+            }
+            return;
+        }
+
+        /* Supervised: schedule the next attempt, never give up */
+        s_connecting = false;
+        uint32_t wait = s_backoff_ms;
+        s_next_attempt_us = esp_timer_get_time() + (int64_t)wait * 1000;
+        s_backoff_ms = (wait * 2 > BACKOFF_MAX_MS) ? BACKOFF_MAX_MS : wait * 2;
+        ESP_LOGW(TAG, "Disconnected (reason %d) — next attempt in %lu s",
+                 d ? d->reason : -1, (unsigned long)(wait / 1000));
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         snprintf(s_ip_str, sizeof(s_ip_str), IPSTR, IP2STR(&event->ip_info.ip));
         ESP_LOGI(TAG, "Connected — IP: %s", s_ip_str);
         s_retry_num = 0;
+        s_connecting = false;
+        s_backoff_ms = BACKOFF_MIN_MS;
+        if (s_had_connection)
+            s_reconnects++;
+        s_had_connection = true;
 
         /* Start SNTP time sync (non-blocking, runs in background) */
         if (!esp_sntp_enabled()) {
@@ -261,6 +323,8 @@ static void apply_hostname(void)
     }
 }
 
+/* Boot-phase connection attempt. On failure Wi-Fi is left started (STA mode,
+ * no BSSID lock) so the caller can either supervise or stop it. */
 static esp_err_t try_sta_connect(const char *ssid, const char *pass)
 {
     ESP_LOGI(TAG, "Connecting to \"%s\"...", ssid);
@@ -332,26 +396,32 @@ static esp_err_t try_sta_connect(const char *ssid, const char *pass)
     }
 
     ESP_LOGW(TAG, "Failed to connect to \"%s\"", ssid);
-    esp_wifi_stop();
     return ESP_FAIL;
 }
 
-static void start_ap_mode(void)
+static void fill_ap_config(wifi_config_t *wifi_config, char *ap_ssid, size_t ap_ssid_len)
 {
     uint8_t mac[6];
     esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP);
+    snprintf(ap_ssid, ap_ssid_len, "ESP32FDM-%02X%02X", mac[4], mac[5]);
 
+    memset(wifi_config, 0, sizeof(*wifi_config));
+    strncpy((char *)wifi_config->ap.ssid, ap_ssid, sizeof(wifi_config->ap.ssid) - 1);
+    wifi_config->ap.ssid_len = strlen(ap_ssid);
+    wifi_config->ap.channel = 1;
+    wifi_config->ap.authmode = WIFI_AUTH_OPEN;
+    wifi_config->ap.max_connection = 2;
+}
+
+/* Setup mode: no credentials at all. Permanent AP + captive portal (original behaviour). */
+static void start_ap_mode(void)
+{
     char ap_ssid[32];
-    snprintf(ap_ssid, sizeof(ap_ssid), "ESP32FDM-%02X%02X", mac[4], mac[5]);
+    wifi_config_t wifi_config;
+    fill_ap_config(&wifi_config, ap_ssid, sizeof(ap_ssid));
 
     esp_netif_create_default_wifi_ap();
-
-    wifi_config_t wifi_config = {};
-    strncpy((char *)wifi_config.ap.ssid, ap_ssid, sizeof(wifi_config.ap.ssid) - 1);
-    wifi_config.ap.ssid_len = strlen(ap_ssid);
-    wifi_config.ap.channel = 1;
-    wifi_config.ap.authmode = WIFI_AUTH_OPEN;
-    wifi_config.ap.max_connection = 2;
+    s_ap_netif_created = true;
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
@@ -359,6 +429,98 @@ static void start_ap_mode(void)
 
     snprintf(s_ip_str, sizeof(s_ip_str), "192.168.4.1");
     ESP_LOGW(TAG, "AP mode started: \"%s\" — configure at http://192.168.4.1/", ap_ssid);
+}
+
+/* Ender Smart (F15-03): temporary AP next to the STA retries (APSTA). */
+static void start_emergency_ap(void)
+{
+    if (CONFIG_WIFI_EMERGENCY_AP_MINUTES == 0)
+        return;
+
+    char ap_ssid[32];
+    wifi_config_t wifi_config;
+    fill_ap_config(&wifi_config, ap_ssid, sizeof(ap_ssid));
+
+    if (!s_ap_netif_created) {
+        esp_netif_create_default_wifi_ap();
+        s_ap_netif_created = true;
+    }
+
+    esp_err_t err = esp_wifi_set_mode(WIFI_MODE_APSTA);
+    if (err == ESP_OK)
+        err = esp_wifi_set_config(WIFI_IF_AP, &wifi_config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Emergency AP failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    s_ap_active = true;
+    s_ap_deadline_us = esp_timer_get_time() +
+                       (int64_t)CONFIG_WIFI_EMERGENCY_AP_MINUTES * 60 * 1000000;
+    if (!(xEventGroupGetBits(s_wifi_event_group) & WIFI_CONNECTED_BIT))
+        snprintf(s_ip_str, sizeof(s_ip_str), "192.168.4.1");
+    ESP_LOGW(TAG, "Emergency AP \"%s\" open for %d min at http://192.168.4.1/ "
+                  "(still retrying the saved network)",
+             ap_ssid, CONFIG_WIFI_EMERGENCY_AP_MINUTES);
+}
+
+static void stop_emergency_ap(const char *why)
+{
+    esp_err_t err = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Could not close emergency AP: %s", esp_err_to_name(err));
+        return;
+    }
+    s_ap_active = false;
+    ESP_LOGI(TAG, "Emergency AP closed (%s)", why);
+}
+
+static void supervisor_task(void *arg)
+{
+    (void)arg;
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(SUPERVISOR_PERIOD_MS));
+        int64_t now = esp_timer_get_time();
+        bool connected = (xEventGroupGetBits(s_wifi_event_group) & WIFI_CONNECTED_BIT) != 0;
+
+        if (!connected && !s_roaming) {
+            if (s_connecting && now - s_attempt_started_us > CONNECT_TIMEOUT_US) {
+                ESP_LOGW(TAG, "Connect attempt timed out");
+                s_connecting = false;
+                esp_wifi_disconnect();   /* the DISCONNECTED event schedules the next try */
+            } else if (!s_connecting && now >= s_next_attempt_us) {
+                esp_err_t err = esp_wifi_connect();
+                if (err == ESP_OK) {
+                    s_connecting = true;
+                    s_attempt_started_us = now;
+                } else {
+                    uint32_t wait = s_backoff_ms;
+                    s_next_attempt_us = now + (int64_t)wait * 1000;
+                    s_backoff_ms = (wait * 2 > BACKOFF_MAX_MS) ? BACKOFF_MAX_MS : wait * 2;
+                    ESP_LOGW(TAG, "esp_wifi_connect: %s — next attempt in %lu s",
+                             esp_err_to_name(err), (unsigned long)(wait / 1000));
+                }
+            }
+        }
+
+        if (s_ap_active) {
+            wifi_sta_list_t list;
+            int clients = (esp_wifi_ap_get_sta_list(&list) == ESP_OK) ? list.num : 0;
+            if (clients == 0 && connected)
+                stop_emergency_ap("saved network is back");
+            else if (clients == 0 && now >= s_ap_deadline_us)
+                stop_emergency_ap("time limit, no clients");
+        }
+    }
+}
+
+static void enter_supervised_mode(void)
+{
+    s_supervise = true;
+    s_backoff_ms = BACKOFF_MIN_MS;
+    s_next_attempt_us = esp_timer_get_time();
+    xTaskCreatePinnedToCore(supervisor_task, "wifi_sup", 3072, NULL, 3, NULL, 0);
+    xTaskCreatePinnedToCore(roam_task, "roam", 4096, NULL, 2, NULL, 0);
 }
 
 wifi_result_t wifi_init(void)
@@ -380,11 +542,13 @@ wifi_result_t wifi_init(void)
     /* Try NVS credentials first */
     char ssid[33] = {0};
     char pass[65] = {0};
+    bool have_creds = false;
 
     if (nvs_load_creds(ssid, sizeof(ssid), pass, sizeof(pass))) {
         ESP_LOGI(TAG, "Found WiFi credentials in NVS");
+        have_creds = true;
         if (try_sta_connect(ssid, pass) == ESP_OK) {
-            xTaskCreatePinnedToCore(roam_task, "roam", 4096, NULL, 2, NULL, 0);
+            enter_supervised_mode();
             return WIFI_RESULT_STA_CONNECTED;
         }
     }
@@ -392,16 +556,66 @@ wifi_result_t wifi_init(void)
     /* Try Kconfig credentials (skip if default "myssid") */
     if (strcmp(CONFIG_WIFI_SSID, "myssid") != 0) {
         ESP_LOGI(TAG, "Trying Kconfig credentials...");
+        if (have_creds)
+            esp_wifi_stop();   /* the NVS attempt left Wi-Fi started; start fresh */
+        have_creds = true;
         if (try_sta_connect(CONFIG_WIFI_SSID, CONFIG_WIFI_PASSWORD) == ESP_OK) {
             nvs_save_creds(CONFIG_WIFI_SSID, CONFIG_WIFI_PASSWORD);
-            xTaskCreatePinnedToCore(roam_task, "roam", 4096, NULL, 2, NULL, 0);
+            enter_supervised_mode();
             return WIFI_RESULT_STA_CONNECTED;
         }
     }
 
-    /* All attempts failed — start AP mode */
+    if (have_creds) {
+        /* Ender Smart (F15-03): the saved network is down (e.g. router still booting
+         * after a power cut). Keep booting with the printer, keep retrying forever and
+         * open a temporary AP for local access. */
+        ESP_LOGW(TAG, "Saved network unreachable — booting anyway, retrying in background");
+        enter_supervised_mode();
+        start_emergency_ap();
+        return WIFI_RESULT_STA_PENDING;
+    }
+
+    /* No credentials at all — setup mode */
     start_ap_mode();
     return WIFI_RESULT_AP_MODE;
+}
+
+bool wifi_is_connected(void)
+{
+    return s_wifi_event_group &&
+           (xEventGroupGetBits(s_wifi_event_group) & WIFI_CONNECTED_BIT);
+}
+
+bool wifi_wait_connected(TickType_t ticks)
+{
+    if (!s_wifi_event_group)
+        return false;
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT,
+                                           pdFALSE, pdTRUE, ticks);
+    return (bits & WIFI_CONNECTED_BIT) != 0;
+}
+
+bool wifi_get_rssi(int8_t *rssi)
+{
+    if (!wifi_is_connected())
+        return false;
+    wifi_ap_record_t ap;
+    if (esp_wifi_sta_get_ap_info(&ap) != ESP_OK)
+        return false;
+    if (rssi)
+        *rssi = ap.rssi;
+    return true;
+}
+
+bool wifi_emergency_ap_active(void)
+{
+    return s_ap_active;
+}
+
+uint32_t wifi_get_reconnect_count(void)
+{
+    return s_reconnects;
 }
 
 const char *wifi_get_ip_str(void)

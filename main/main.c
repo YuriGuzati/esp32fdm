@@ -15,6 +15,7 @@
 
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "esp_system.h"
 #include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -40,6 +41,14 @@ static void heap_monitor_task(void *arg)
     }
 }
 
+/* Ender Smart (F15-03): booted without the saved network — start mDNS once it is back */
+static void mdns_when_connected_task(void *arg)
+{
+    wifi_wait_connected(portMAX_DELAY);
+    mdns_service_init();
+    vTaskDelete(NULL);
+}
+
 void app_main(void)
 {
     ESP_LOGI(TAG, "ESP32-S3 FDM Printer Bridge starting...");
@@ -53,34 +62,44 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    /* Confirm OTA boot — cancels rollback if this is a newly flashed firmware */
-    ota_confirm_boot();
-
     /* Log buffer — capture boot logs from here on */
     logbuf_init();
+    ESP_LOGI(TAG, "Reset reason: %d", (int)esp_reset_reason());
 
-    /* WiFi — try STA, fall back to AP */
+    /* WiFi — with saved credentials it never gives up (F15-02/03) */
     wifi_result_t wifi_result = wifi_init();
 
-    if (wifi_result == WIFI_RESULT_STA_CONNECTED) {
-        mdns_service_init();
-    }
-
     if (wifi_result == WIFI_RESULT_AP_MODE) {
+        /* No credentials at all: setup portal only (original behaviour) */
         dns_server_start();
         httpd_start_captive_portal();
         ESP_LOGW(TAG, "========================================");
         ESP_LOGW(TAG, "  AP MODE — configure WiFi at");
         ESP_LOGW(TAG, "  http://192.168.4.1/");
         ESP_LOGW(TAG, "========================================");
+        ota_schedule_boot_confirm(CONFIG_BOOT_CONFIRM_DELAY_S);
         return;
+    }
+
+    if (wifi_result == WIFI_RESULT_STA_CONNECTED) {
+        mdns_service_init();
+    } else {
+        /* WIFI_RESULT_STA_PENDING: keep booting so the printer, USB and camera work
+         * without the router; Wi-Fi keeps retrying in the background */
+        ESP_LOGW(TAG, "Saved Wi-Fi not reachable — continuing boot without it");
+        xTaskCreatePinnedToCore(mdns_when_connected_task, "mdns_wait", 3072,
+                                NULL, 2, NULL, 0);
     }
 
     log_heap("pre-camera");
 
-    /* Camera */
-    ESP_ERROR_CHECK(camera_init());
-    camera_start_capture_task();
+    /* Camera — optional (F15-04): a camera fault must not take the printer down */
+    if (camera_init() == ESP_OK) {
+        camera_start_capture_task();
+    } else {
+        ESP_LOGE(TAG, "Camera unavailable — continuing without video "
+                      "(/stream and /capture answer 503)");
+    }
     log_heap("post-camera");
 
     /* SD card — optional, non-fatal if no card inserted */
@@ -122,6 +141,10 @@ void app_main(void)
 
     /* RFC 2217 serial bridge */
     ESP_ERROR_CHECK(rfc2217_start());
+
+    /* HTTP server and USB host are up: confirm a fresh OTA image after a stable
+     * period, otherwise the bootloader rolls back (F15-13) */
+    ota_schedule_boot_confirm(CONFIG_BOOT_CONFIRM_DELAY_S);
 
     const char *ip = wifi_get_ip_str();
     printer_backend_t backend = printer_comm_get_backend();

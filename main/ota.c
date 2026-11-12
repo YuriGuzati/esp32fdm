@@ -27,6 +27,48 @@ void ota_confirm_boot(void)
     }
 }
 
+static const char *ota_state_str(esp_ota_img_states_t s)
+{
+    switch (s) {
+    case ESP_OTA_IMG_NEW:            return "new";
+    case ESP_OTA_IMG_PENDING_VERIFY: return "pending_verify";
+    case ESP_OTA_IMG_VALID:          return "valid";
+    case ESP_OTA_IMG_INVALID:        return "invalid";
+    case ESP_OTA_IMG_ABORTED:        return "aborted";
+    case ESP_OTA_IMG_UNDEFINED:      return "undefined";
+    default:                         return "?";
+    }
+}
+
+static void boot_confirm_task(void *arg)
+{
+    uint32_t delay_s = (uint32_t)(uintptr_t)arg;
+    vTaskDelay(pdMS_TO_TICKS(delay_s * 1000));
+    ota_confirm_boot();
+    vTaskDelete(NULL);
+}
+
+void ota_schedule_boot_confirm(uint32_t delay_s)
+{
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    esp_ota_img_states_t state = ESP_OTA_IMG_UNDEFINED;
+    bool have_state = running && esp_ota_get_state_partition(running, &state) == ESP_OK;
+    ESP_LOGI(TAG, "Running from %s, OTA state: %s",
+             running ? running->label : "?", have_state ? ota_state_str(state) : "n/a");
+
+#if CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE
+    if (have_state && state == ESP_OTA_IMG_PENDING_VERIFY) {
+        ESP_LOGW(TAG, "New firmware: will be confirmed after %lu s of stable running "
+                      "(a crash or reset before that rolls back)", (unsigned long)delay_s);
+        xTaskCreatePinnedToCore(boot_confirm_task, "ota_ok", 3072,
+                                (void *)(uintptr_t)delay_s, 1, NULL, 0);
+    }
+#else
+    (void)delay_s;
+    (void)boot_confirm_task;
+#endif
+}
+
 /* ---- OTA upload (async) ---- */
 
 #define OTA_BUF_SIZE 4096

@@ -31,6 +31,12 @@ esp_err_t camera_init(void);
 void camera_start_capture_task(void);
 
 /**
+ * True if camera_init() succeeded. When false, the rest of the system runs
+ * without video and /stream and /capture answer 503.
+ */
+bool camera_is_available(void);
+
+/**
  * Get a ref-counted pointer to the latest captured frame.
  * Returns NULL if no frame is available yet.
  * Caller MUST call camera_release_frame() when done.

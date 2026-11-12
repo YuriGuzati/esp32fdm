@@ -879,9 +879,14 @@ void obico_render_settings(html_buf_t *p)
             "</form>",
             s_server_url, s_server_url);
     }
+#if CONFIG_ESP32FDM_SIMULATION
     html_buf_printf(p,
         "<p class='hint'><a href='/obico/status'>Status</a> | "
         "<a href='/obico/simulate'>Simulate</a></p>");
+#else
+    html_buf_printf(p,
+        "<p class='hint'><a href='/obico/status'>Status</a></p>");
+#endif
 }
 
 static esp_err_t obico_link_get_handler(httpd_req_t *req)
@@ -1004,6 +1009,7 @@ static esp_err_t obico_status_handler(httpd_req_t *req)
     return ret;
 }
 
+#if CONFIG_ESP32FDM_SIMULATION
 static esp_err_t obico_simulate_handler(httpd_req_t *req)
 {
     bool currently_on = printer_comm_is_simulating();
@@ -1026,6 +1032,7 @@ static esp_err_t obico_simulate_handler(httpd_req_t *req)
     html_buf_free(&p);
     return ret;
 }
+#endif /* CONFIG_ESP32FDM_SIMULATION */
 
 esp_err_t obico_register_httpd(void *server_handle)
 {
@@ -1066,12 +1073,16 @@ esp_err_t obico_register_httpd(void *server_handle)
     };
     HTTPD_REGISTER(server, &status_uri);
 
+#if CONFIG_ESP32FDM_SIMULATION
+    /* Ender Smart (F15-05): only in development builds. GET would let a click or a
+     * browser prefetch switch to fake data and silently drop every printer command. */
     httpd_uri_t sim_uri = {
         .uri      = "/obico/simulate",
         .method   = HTTP_GET,
         .handler  = obico_simulate_handler,
     };
     HTTPD_REGISTER(server, &sim_uri);
+#endif
 
     ESP_LOGI(TAG, "Obico HTTP endpoints registered");
     return ESP_OK;

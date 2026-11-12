@@ -94,7 +94,12 @@ static char s_line_buf[RX_LINE_BUF_SIZE];
 static size_t s_line_len;
 
 /* Simulation mode */
+#if CONFIG_ESP32FDM_SIMULATION
 static bool s_simulate = false;
+#else
+/* Ender Smart (F15-05): simulation compiled out; the branches below are dead code. */
+static const bool s_simulate = false;
+#endif
 static int64_t s_sim_start_us;
 static printer_opstate_t s_sim_opstate;
 static int64_t s_sim_pause_elapsed_us;  /* accumulated elapsed time before pause */
@@ -1039,6 +1044,7 @@ int printer_comm_get_temp_history(temp_sample_t *buf, int max_count)
 
 void printer_comm_set_simulate(bool enable)
 {
+#if CONFIG_ESP32FDM_SIMULATION
     s_simulate = enable;
     if (enable) {
         s_sim_start_us = esp_timer_get_time();
@@ -1048,6 +1054,10 @@ void printer_comm_set_simulate(bool enable)
     } else {
         ESP_LOGI(TAG, "Simulation mode disabled");
     }
+#else
+    (void)enable;
+    ESP_LOGE(TAG, "Simulation mode is not available in this build");
+#endif
 }
 
 bool printer_comm_is_simulating(void)

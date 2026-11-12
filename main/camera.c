@@ -26,6 +26,7 @@ static int8_t s_brightness = 0;   /* -2..2 */
 static int8_t s_contrast = 0;     /* -2..2 */
 static int8_t s_saturation = 0;   /* -2..2 */
 static int8_t s_ae_level = 0;     /* -2..2 */
+static bool s_available = false;  /* Ender Smart (F15-04): true only after a successful init */
 
 /* ---- Triple-buffered PSRAM frames ---- */
 
@@ -106,9 +107,10 @@ esp_err_t camera_init(void)
 
     esp_err_t err = esp_camera_init(&config);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Camera init failed: 0x%x", err);
+        ESP_LOGE(TAG, "Camera init failed: 0x%x (%s)", err, esp_err_to_name(err));
         return err;
     }
+    s_available = true;
 
     /* Load rotation setting from NVS and apply */
     nvs_handle_t nvs;
@@ -280,6 +282,11 @@ void camera_start_capture_task(void)
 
     xTaskCreatePinnedToCore(camera_capture_task, "cam_cap", 3072,
                             NULL, 5, NULL, 0);
+}
+
+bool camera_is_available(void)
+{
+    return s_available;
 }
 
 camera_frame_t *camera_get_frame(void)

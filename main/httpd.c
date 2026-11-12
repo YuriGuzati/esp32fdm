@@ -82,8 +82,20 @@ static esp_err_t favicon_handler(httpd_req_t *req)
     return httpd_resp_send(req, FAVICON_SVG, HTTPD_RESP_USE_STRLEN);
 }
 
+static esp_err_t camera_unavailable(httpd_req_t *req)
+{
+    httpd_resp_set_status(req, "503 Service Unavailable");
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    return httpd_resp_sendstr(req, "Camera not available (init failed at boot, see /logs)");
+}
+
 static esp_err_t capture_handler(httpd_req_t *req)
 {
+    if (!camera_is_available()) {
+        return camera_unavailable(req);
+    }
+
     httpd_req_t *async_req = NULL;
     if (httpd_req_async_handler_begin(req, &async_req) != ESP_OK) {
         httpd_resp_send_500(req);
@@ -152,6 +164,12 @@ static void stream_task(void *arg)
 
 static esp_err_t stream_handler(httpd_req_t *req)
 {
+    /* Ender Smart (F15-04): without a camera the stream task would loop forever on
+     * "no frame available", holding a socket and a task per client. */
+    if (!camera_is_available()) {
+        return camera_unavailable(req);
+    }
+
     int fd = httpd_req_to_sockfd(req);
 
     /* TCP_NODELAY for low-latency frame delivery */
@@ -236,6 +254,23 @@ static esp_err_t api_status_handler(httpd_req_t *req)
 
 /* ---- GET /api/stats — per-core CPU usage ---- */
 
+static const char *reset_reason_str(esp_reset_reason_t r)
+{
+    switch (r) {
+    case ESP_RST_POWERON:   return "poweron";
+    case ESP_RST_EXT:       return "external";
+    case ESP_RST_SW:        return "software";
+    case ESP_RST_PANIC:     return "panic";
+    case ESP_RST_INT_WDT:   return "int_wdt";
+    case ESP_RST_TASK_WDT:  return "task_wdt";
+    case ESP_RST_WDT:       return "wdt";
+    case ESP_RST_DEEPSLEEP: return "deepsleep";
+    case ESP_RST_BROWNOUT:  return "brownout";
+    case ESP_RST_SDIO:      return "sdio";
+    default:                return "other";
+    }
+}
+
 /* Accumulated idle ticks from previous call, per core */
 static uint32_t s_prev_idle[2];
 static uint32_t s_prev_total;
@@ -289,10 +324,20 @@ static esp_err_t api_stats_handler(httpd_req_t *req)
     uint32_t free_heap = esp_get_free_heap_size();
     uint32_t min_heap = esp_get_minimum_free_heap_size();
 
-    char json[128];
+    /* Ender Smart (F15-17): diagnose restarts and Wi-Fi from the network, without the UART. */
+    int8_t rssi = 0;
+    bool sta = wifi_get_rssi(&rssi);
+    char json[320];
     snprintf(json, sizeof(json),
-        "{\"cpu0\":%d,\"cpu1\":%d,\"heap\":%lu,\"heap_min\":%lu}",
-        cpu0_pct, cpu1_pct, (unsigned long)free_heap, (unsigned long)min_heap);
+        "{\"cpu0\":%d,\"cpu1\":%d,\"heap\":%lu,\"heap_min\":%lu,"
+        "\"uptime_s\":%lld,\"reset_reason\":\"%s\",\"rssi\":%d,"
+        "\"wifi\":\"%s\",\"emergency_ap\":%s,\"wifi_reconnects\":%lu,\"camera\":%s}",
+        cpu0_pct, cpu1_pct, (unsigned long)free_heap, (unsigned long)min_heap,
+        (long long)(esp_timer_get_time() / 1000000), reset_reason_str(esp_reset_reason()),
+        sta ? rssi : 0, sta ? "connected" : "disconnected",
+        wifi_emergency_ap_active() ? "true" : "false",
+        (unsigned long)wifi_get_reconnect_count(),
+        camera_is_available() ? "true" : "false");
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
