@@ -178,7 +178,7 @@ static inline void layout_html_end(html_buf_t *p)
         "+' &middot; Bed '+s.bed[0].toFixed(0)+'/'+s.bed[1].toFixed(0)+'\\u00b0C</div>';}"
         "else{var t='HE '+s.hotend[0].toFixed(0)+'/'+s.hotend[1].toFixed(0)+'\\u00b0C'"
         "+' &middot; Bed '+s.bed[0].toFixed(0)+'/'+s.bed[1].toFixed(0)+'\\u00b0C';"
-        "p.innerHTML=(s.state=='error'?s.backend+': Error':s.usb?s.backend+': Ready':s.backend+': Disconnected')"
+        "p.innerHTML=(s.state=='error'?'<span class=pctl><button onclick=\"fetch(\\'/sd/cancel\\',{method:\\'POST\\'})\">OK</button></span>'+(s.error?s.error:s.backend+': Error'):s.usb?s.backend+': Ready':s.backend+': Disconnected')"
         "+'<div style=\"font-size:12px;color:#888\">'+t+'</div>';}"
         "}).catch(function(){})}"
         "u();setInterval(u,3000);"

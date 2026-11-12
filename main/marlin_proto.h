@@ -48,6 +48,10 @@ typedef enum {
 /* Unsupported command tracking */
 #define UNSUPPORTED_CMD_MAX 16
 
+/* Ender Smart (F15-07): longest line Marlin accepts (MAX_CMD_SIZE 96 incl. NUL).
+ * Longer lines are refused instead of being truncated or overflowing a buffer. */
+#define MARLIN_MAX_LINE 95
+
 /* ---- Shared state (owned by printer_comm.c) ---- */
 
 /** Printer state and its mutex */
@@ -105,6 +109,12 @@ void hp_tick(void);
 
 /** Notifications from process_line() RX parsing */
 void hp_notify_resend(int32_t line_num);
+
+/** Ender Smart (F15-06): Marlin boot banner seen — the printer restarted. */
+void hp_notify_printer_reset(void);
+
+/** Ender Smart (F15-06): USB link lost while a host print is active. */
+void hp_notify_usb_lost(void);
 
 /** Fill printer_state_t fields related to host print progress.
  *  Called while g_state_mutex is held. */

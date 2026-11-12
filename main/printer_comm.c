@@ -21,6 +21,7 @@
 
 #include "layout.h"
 
+#include <ctype.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -314,6 +315,8 @@ static void parse_m114(const char *line)
     if (p) g_state.y = strtof(p + 2, NULL);
     p = strstr(line, "Z:");
     if (p) g_state.z = strtof(p + 2, NULL);
+    p = strstr(line, "E:");
+    if (p) g_state.e = strtof(p + 2, NULL);
 
     xSemaphoreGive(g_state_mutex);
 }
@@ -352,6 +355,15 @@ static void process_line(const char *line)
     }
 
     ESP_LOGI(TAG, "RX: %s", line);
+
+    /* Ender Smart (F15-06): Marlin boot banner means the printer restarted (power
+     * glitch, reset). Seen on the Ender-3 Max Neo: "start" (often garbled),
+     * "DWIN handshake error.", "BL24CXX Check succeeded!". Any host print must stop. */
+    if (strcmp(line, "start") == 0 || strstr(line, "DWIN handshake") ||
+        strstr(line, "BL24CXX Check")) {
+        ESP_LOGW(TAG, "Printer restart detected (\"%s\")", line);
+        hp_notify_printer_reset();
+    }
 
     /* Content-based matching — handles unsolicited auto-reports too */
     if (strstr(line, "T:")) {
@@ -622,11 +634,20 @@ static bool marlin_send_cmd_ex(const char *gcode, query_type_t qtype,
     /* Abort if drain_rx saw busy: and set cooldown */
     if (esp_timer_get_time() < s_cmd_cooldown_until_us) return false;
 
+    /* Ender Smart (F15-07 / C9): the old code used a 100-byte buffer but sent the
+     * *intended* length, leaking stack bytes for long commands. Refuse instead. */
+    size_t glen = strlen(gcode);
+    if (glen > MARLIN_MAX_LINE) {
+        ESP_LOGE(TAG, "Refusing command longer than %d chars (%u): %.40s...",
+                 MARLIN_MAX_LINE, (unsigned)glen, gcode);
+        return false;
+    }
+
     s_pending_query = qtype;
     s_line_len = 0;
 
     /* Send command with newline */
-    char buf[100];
+    char buf[MARLIN_MAX_LINE + 2];
     int len = snprintf(buf, sizeof(buf), "%s\n", gcode);
     ESP_LOGI(TAG, "TX: %s", gcode);
     terminal_feed_tx(gcode);
@@ -766,12 +787,15 @@ static void printer_comm_task(void *arg)
         /* Wait for USB device to connect */
         if (!usb_serial_is_connected()) {
             xSemaphoreTake(g_state_mutex, portMAX_DELAY);
-            /* Preserve printing/paused state during USB disconnect so UI
-             * keeps showing print status — host print will resume on reconnect */
-            if (!hp_is_active()) {
+            if (!hp_is_active() && g_state.opstate != PRINTER_ERROR) {
                 g_state.opstate = PRINTER_DISCONNECTED;
             }
             xSemaphoreGive(g_state_mutex);
+            /* Ender Smart (F15-06 / C4): a host print never resumes by itself after
+             * the link drops — the Ender may have reset (cold, unhomed). */
+            if (hp_is_active()) {
+                hp_notify_usb_lost();
+            }
             s_m290_queried = false;
             vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
@@ -1063,6 +1087,49 @@ void printer_comm_set_simulate(bool enable)
 bool printer_comm_is_simulating(void)
 {
     return s_simulate;
+}
+
+bool printer_comm_cmd_allowed(const char *gcode, char *reason, size_t reason_len)
+{
+    printer_state_t st;
+    printer_comm_get_state(&st);
+    bool active = st.opstate == PRINTER_PRINTING || st.opstate == PRINTER_PAUSED ||
+                  (s_backend == PRINTER_BACKEND_MARLIN && hp_is_active());
+    if (!active)
+        return true;
+
+    while (*gcode == ' ')
+        gcode++;
+    char letter = (char)toupper((unsigned char)gcode[0]);
+    int code = atoi(gcode + 1);
+
+    if (letter == 'M') {
+        switch (code) {
+        /* status queries and messages */
+        case 27: case 31: case 73: case 105: case 114: case 115: case 117: case 118: case 119:
+        /* safe fine-tuning while printing */
+        case 106: case 107: case 220: case 221: case 290:
+            return true;
+        case 104:
+        case 140: {
+            const char *s = strchr(gcode, 'S');
+            if (!s)
+                s = strchr(gcode, 's');
+            float v = s ? strtof(s + 1, NULL) : 0.0f;
+            float current_target = (code == 104) ? st.hotend_target : st.bed_target;
+            if (v <= 0.0f || current_target > 0.0f)
+                return true;   /* cooling, or fine-tuning a heater that is already on */
+            snprintf(reason, reason_len,
+                     "Ligar um aquecedor desligado não é permitido durante a impressão");
+            return false;
+        }
+        default:
+            break;
+        }
+    }
+
+    snprintf(reason, reason_len, "Comando bloqueado durante a impressão: %.20s", gcode);
+    return false;
 }
 
 esp_err_t printer_comm_send_cmd(const printer_cmd_t *cmd)

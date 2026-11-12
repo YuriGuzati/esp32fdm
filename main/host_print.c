@@ -4,6 +4,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 
+#include <ctype.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -58,11 +59,70 @@ typedef struct {
 
     /* Park position */
     float park_x, park_y, park_z;
+
+    /* Ender Smart (F15-09): modes as set by the file, restored after a pause */
+    bool abs_xyz;              /* G90 (true) / G91 */
+    bool abs_e;                /* M82 (true) / M83 */
+    bool homed;                /* a G28 was sent in this job: XY park is safe */
+    float last_f;              /* last feedrate from G0/G1 F..., 0 = unknown */
+    float park_e;              /* logical E at pause (for G92 E in absolute mode) */
+    float saved_hotend, saved_bed;  /* targets at pause, reheated on resume */
+
+    /* Ender Smart (F15-06/07): reasons to stop streaming */
+    volatile bool printer_reset;   /* Marlin boot banner seen */
+    volatile bool usb_lost;        /* USB dropped during the job */
+    bool desync;                   /* printer asked for a line we no longer have */
+    bool line_too_long;            /* a line does not fit Marlin's buffer */
 } hp_ctx_t;
 
 static hp_ctx_t s_hp;
 
 /* ---- Helpers ---- */
+
+/** Show why the job stopped (opstate ERROR + message), until the user clears it. */
+static void hp_set_error(const char *msg)
+{
+    xSemaphoreTake(g_state_mutex, portMAX_DELAY);
+    g_state.opstate = PRINTER_ERROR;
+    strncpy(g_state.error_msg, msg, sizeof(g_state.error_msg) - 1);
+    g_state.error_msg[sizeof(g_state.error_msg) - 1] = '\0';
+    xSemaphoreGive(g_state_mutex);
+    ESP_LOGE(TAG, "%s", msg);
+}
+
+static void hp_clear_error(void)
+{
+    xSemaphoreTake(g_state_mutex, portMAX_DELAY);
+    if (g_state.opstate == PRINTER_ERROR) {
+        g_state.opstate = usb_serial_is_connected() ? PRINTER_OPERATIONAL : PRINTER_DISCONNECTED;
+        ESP_LOGI(TAG, "Error acknowledged: %s", g_state.error_msg);
+    }
+    g_state.error_msg[0] = '\0';
+    xSemaphoreGive(g_state_mutex);
+}
+
+/** Track the modes and feedrate the file sets, so a pause can restore them (F15-09). */
+static void hp_track_modes(const char *line)
+{
+    char c0 = (char)toupper((unsigned char)line[0]);
+    int code = atoi(line + 1);
+    if (c0 == 'G' && (code == 90 || code == 91) && !isdigit((unsigned char)line[3])) {
+        s_hp.abs_xyz = (code == 90);
+        /* In this Marlin, G90/G91 also reset the extruder mode to follow XYZ */
+        s_hp.abs_e = (code == 90);
+    } else if (c0 == 'M' && (code == 82 || code == 83) && !isdigit((unsigned char)line[3])) {
+        s_hp.abs_e = (code == 82);
+    } else if (c0 == 'G' && code == 28) {
+        s_hp.homed = true;
+    } else if (c0 == 'G' && (code == 0 || code == 1)) {
+        const char *f = strchr(line, 'F');
+        if (!f) f = strchr(line, 'f');
+        if (f && (f[-1] == ' ')) {
+            float v = strtof(f + 1, NULL);
+            if (v > 0.0f) s_hp.last_f = v;
+        }
+    }
+}
 
 /** Compute Marlin XOR checksum: XOR all bytes in the string */
 static uint8_t marlin_checksum(const char *line)
@@ -131,10 +191,14 @@ static bool send_query_numbered(const char *gcode)
     s_hp.resend_line = -1;
     s_hp.resend_retries = 0;
 
-    if (format_numbered_line(s_hp.numbered_line, sizeof(s_hp.numbered_line),
-                             s_hp.marlin_line, gcode) < 0) {
-        ESP_LOGE(TAG, "Line too long for numbering: %s", gcode);
-        return sender(gcode, QUERY_CMD); /* fallback unnumbered */
+    int nlen = format_numbered_line(s_hp.numbered_line, sizeof(s_hp.numbered_line),
+                                    s_hp.marlin_line, gcode);
+    if (nlen < 0 || nlen > MARLIN_MAX_LINE) {
+        /* Ender Smart (F15-07): never truncate or send it unnumbered — stop the job */
+        ESP_LOGE(TAG, "Line too long for Marlin (%d > %d): %.40s...",
+                 nlen < 0 ? (int)strlen(gcode) : nlen, MARLIN_MAX_LINE, gcode);
+        s_hp.line_too_long = true;
+        return false;
     }
 
     history_store(s_hp.marlin_line, s_hp.numbered_line);
@@ -179,17 +243,15 @@ static bool send_query_numbered(const char *gcode)
                 }
                 continue; /* check for further resend requests */
             }
-            /* Not in history -- resync as last resort */
-            ESP_LOGW(TAG, "Resend N%ld not in history -- resync + retry",
-                     (long)s_hp.resend_line);
-            char sync[40];
-            format_numbered_line(sync, sizeof(sync), s_hp.marlin_line, "M110");
-            sender(sync, QUERY_CMD);
+            /* Ender Smart (F15-06 / C4): a line outside the history usually means the
+             * printer restarted (it asks for N1 again). The old code resynced with
+             * M110 and kept streaming the middle of the file into a cold, unhomed
+             * machine. Stop instead. */
+            ESP_LOGE(TAG, "Resend N%ld not in history (current N%ld) -- stopping job",
+                     (long)s_hp.resend_line, (long)s_hp.marlin_line);
             s_hp.resend_line = -1;
-            if (!sender(s_hp.numbered_line, QUERY_CMD)) {
-                return false;
-            }
-            break;
+            s_hp.desync = true;
+            return false;
         }
 
         s_hp.resend_retries++;
@@ -212,48 +274,113 @@ static bool send_query_numbered(const char *gcode)
 
 /* ---- Host print lifecycle ---- */
 
-/** Query current position and save it, then park the head */
+/** Save position, E and temperatures, then park the head (F15-09). */
 static void host_print_park(void)
 {
-    /* Get fresh position */
-    marlin_send_cmd("M114", QUERY_M114);
+    char buf[64];
+    marlin_send_cmd("M400", QUERY_CMD);           /* Wait for moves to finish first */
+    marlin_send_cmd("M114", QUERY_M114);          /* ... so the position is the real one */
 
     xSemaphoreTake(g_state_mutex, portMAX_DELAY);
     s_hp.park_x = g_state.x;
     s_hp.park_y = g_state.y;
     s_hp.park_z = g_state.z;
+    s_hp.park_e = g_state.e;
+    s_hp.saved_hotend = g_state.hotend_target;
+    s_hp.saved_bed = g_state.bed_target;
     xSemaphoreGive(g_state_mutex);
 
-    ESP_LOGI(TAG, "Parking head from (%.1f, %.1f, %.1f)", s_hp.park_x, s_hp.park_y, s_hp.park_z);
+    ESP_LOGI(TAG, "Parking from X%.2f Y%.2f Z%.2f E%.3f (%s, E %s, F%.0f, %.0f/%.0f C)",
+             s_hp.park_x, s_hp.park_y, s_hp.park_z, s_hp.park_e,
+             s_hp.abs_xyz ? "G90" : "G91", s_hp.abs_e ? "M82" : "M83", s_hp.last_f,
+             s_hp.saved_hotend, s_hp.saved_bed);
 
-    char buf[64];
-    marlin_send_cmd("M400", QUERY_CMD);           /* Wait for moves to finish */
-    marlin_send_cmd("G91", QUERY_CMD);            /* Relative positioning */
+    marlin_send_cmd("M83", QUERY_CMD);            /* Relative E just for the retract */
     snprintf(buf, sizeof(buf), "G1 E-%.1f F2400", PARK_RETRACT);
-    marlin_send_cmd(buf, QUERY_CMD);              /* Retract filament */
+    marlin_send_cmd(buf, QUERY_CMD);
+    marlin_send_cmd("G91", QUERY_CMD);
     snprintf(buf, sizeof(buf), "G1 Z%.1f F600", PARK_Z_LIFT);
     marlin_send_cmd(buf, QUERY_CMD);              /* Lift Z */
-    marlin_send_cmd("G90", QUERY_CMD);            /* Absolute positioning */
-    snprintf(buf, sizeof(buf), "G1 X%.1f Y%.1f F6000", PARK_X, PARK_Y);
-    marlin_send_cmd(buf, QUERY_CMD);              /* Park at corner */
+    marlin_send_cmd("G90", QUERY_CMD);
+    if (s_hp.homed) {
+        /* Absolute park target only after homing (position known) */
+        snprintf(buf, sizeof(buf), "G1 X%.1f Y%.1f F6000", PARK_X, PARK_Y);
+        marlin_send_cmd(buf, QUERY_CMD);          /* Park at corner */
+    }
 }
 
-/** Restore head position after park */
+/** Reheat, restore position, prime, then restore the file's modes, E and F (F15-09).
+ *  The old code forced M83 at the end, which broke files with absolute E (Cura default). */
 static void host_print_unpark(void)
 {
-    ESP_LOGI(TAG, "Unparking head to (%.1f, %.1f, %.1f)", s_hp.park_x, s_hp.park_y, s_hp.park_z);
-
     char buf[64];
-    marlin_send_cmd("G90", QUERY_CMD);            /* Absolute positioning */
-    snprintf(buf, sizeof(buf), "G1 X%.1f Y%.1f F6000", s_hp.park_x, s_hp.park_y);
-    marlin_send_cmd(buf, QUERY_CMD);              /* Move to saved XY */
-    snprintf(buf, sizeof(buf), "G1 Z%.1f F600", s_hp.park_z);
-    marlin_send_cmd(buf, QUERY_CMD);              /* Lower Z back */
-    marlin_send_cmd("G91", QUERY_CMD);            /* Relative positioning */
+
+    /* Reheat and WAIT before touching the part or priming */
+    if (s_hp.saved_bed > 0.0f) {
+        snprintf(buf, sizeof(buf), "M140 S%.0f", s_hp.saved_bed);
+        marlin_send_cmd(buf, QUERY_CMD);
+    }
+    if (s_hp.saved_hotend > 0.0f) {
+        snprintf(buf, sizeof(buf), "M109 S%.0f", s_hp.saved_hotend);
+        ESP_LOGI(TAG, "Reheating nozzle to %.0f C before resuming", s_hp.saved_hotend);
+        marlin_send_cmd(buf, QUERY_CMD);
+    }
+
+    ESP_LOGI(TAG, "Unparking to X%.2f Y%.2f Z%.2f", s_hp.park_x, s_hp.park_y, s_hp.park_z);
+    marlin_send_cmd("G90", QUERY_CMD);
+    snprintf(buf, sizeof(buf), "G1 X%.2f Y%.2f F6000", s_hp.park_x, s_hp.park_y);
+    marlin_send_cmd(buf, QUERY_CMD);              /* XY first, still lifted */
+    snprintf(buf, sizeof(buf), "G1 Z%.2f F600", s_hp.park_z);
+    marlin_send_cmd(buf, QUERY_CMD);              /* then lower Z */
+
+    marlin_send_cmd("M83", QUERY_CMD);
     snprintf(buf, sizeof(buf), "G1 E%.1f F2400", PARK_RETRACT);
-    marlin_send_cmd(buf, QUERY_CMD);              /* Prime filament */
-    marlin_send_cmd("G90", QUERY_CMD);            /* Absolute positioning */
-    marlin_send_cmd("M83", QUERY_CMD);            /* Extruder relative (most slicers use this) */
+    marlin_send_cmd(buf, QUERY_CMD);              /* undo the retract */
+
+    /* Restore the file's modes. G90/G91 first: in this Marlin it also resets E mode. */
+    marlin_send_cmd(s_hp.abs_xyz ? "G90" : "G91", QUERY_CMD);
+    if (s_hp.abs_e) {
+        marlin_send_cmd("M82", QUERY_CMD);
+        snprintf(buf, sizeof(buf), "G92 E%.5f", s_hp.park_e);
+        marlin_send_cmd(buf, QUERY_CMD);          /* logical E back to what the file expects */
+    } else {
+        marlin_send_cmd("M83", QUERY_CMD);
+    }
+    if (s_hp.last_f > 0.0f) {
+        snprintf(buf, sizeof(buf), "G1 F%.0f", s_hp.last_f);
+        marlin_send_cmd(buf, QUERY_CMD);          /* feedrate for the next move */
+    }
+}
+
+/** Ender Smart (F15-06/08): stop a job whose printer state is unknown or unsafe.
+ *  Unlike a cancel it never moves the head — after a printer reset the position is
+ *  unknown — it only turns the heaters off (a safe action) and reports why. */
+static void host_print_interrupt(const char *why)
+{
+    if (s_hp.file) {
+        fclose(s_hp.file);
+        s_hp.file = NULL;
+    }
+    bool connected = usb_serial_is_connected();
+    if (connected) {
+        marlin_send_cmd("M104 S0", QUERY_CMD);
+        marlin_send_cmd("M140 S0", QUERY_CMD);
+        marlin_send_cmd("M77", QUERY_CMD);
+    }
+    s_hp.printing = false;
+    s_hp.paused = false;
+    s_hp.resend_line = -1;
+
+    xSemaphoreTake(g_state_mutex, portMAX_DELAY);
+    g_state.progress_pct = -1;
+    g_state.print_time_left_s = -1;
+    g_state.host_printing = false;
+    xSemaphoreGive(g_state_mutex);
+
+    char msg[96];
+    snprintf(msg, sizeof(msg), "Impressão interrompida: %s.%s", why,
+             connected ? " Aquecedores desligados." : "");
+    hp_set_error(msg);
 }
 
 /** Finish host print (complete or cancel) */
@@ -289,7 +416,11 @@ static void host_print_finish(bool cancelled)
             marlin_send_cmd("G91", QUERY_CMD);         /* Relative positioning */
             marlin_send_cmd("G1 Z10 F600", QUERY_CMD); /* Raise nozzle 10mm */
             marlin_send_cmd("G90", QUERY_CMD);         /* Absolute positioning */
-            marlin_send_cmd("G1 X0 Y200 F3000", QUERY_CMD); /* Park head at rear-left */
+            /* Ender Smart: an absolute XY move is only safe after homing. Cancelling
+             * during the initial heat-up (before G28) used to drive the head to
+             * X0 Y200 from an unknown position. */
+            if (s_hp.homed)
+                marlin_send_cmd("G1 X0 Y200 F3000", QUERY_CMD); /* Park head at rear-left */
             marlin_send_cmd("M104 S0", QUERY_CMD);     /* Hotend off */
             marlin_send_cmd("M140 S0", QUERY_CMD);     /* Bed off */
             marlin_send_cmd("M107", QUERY_CMD);         /* Fan off */
@@ -354,6 +485,16 @@ void hp_cmd_start(const char *filename)
     s_hp.pause_elapsed_us = 0;
     s_hp.has_pending = false;
     s_hp.line_truncated = false;
+    /* Ender Smart: Marlin defaults until the file says otherwise */
+    s_hp.abs_xyz = true;
+    s_hp.abs_e = true;
+    s_hp.homed = false;
+    s_hp.last_f = 0.0f;
+    s_hp.printer_reset = false;
+    s_hp.usb_lost = false;
+    s_hp.desync = false;
+    s_hp.line_too_long = false;
+    hp_clear_error();
     strncpy(s_hp.filename, filename, sizeof(s_hp.filename) - 1);
     s_hp.filename[sizeof(s_hp.filename) - 1] = '\0';
 
@@ -399,6 +540,7 @@ void hp_cmd_start(const char *filename)
 void hp_cmd_pause(void)
 {
     if (!s_hp.printing || s_hp.paused) return;
+    if (s_hp.usb_lost || s_hp.printer_reset) return;   /* hp_tick interrupts the job */
     s_hp.paused = true;
     s_hp.pause_elapsed_us += esp_timer_get_time() - s_hp.start_us;
     host_print_park();
@@ -413,6 +555,7 @@ void hp_cmd_pause(void)
 void hp_cmd_resume(void)
 {
     if (!s_hp.printing || !s_hp.paused) return;
+    if (s_hp.usb_lost || s_hp.printer_reset) return;   /* never resume after a drop */
     marlin_send_cmd("M75", QUERY_CMD);  /* Resume Marlin print timer */
     host_print_unpark();
     s_hp.paused = false;
@@ -423,20 +566,37 @@ void hp_cmd_resume(void)
     ESP_LOGI(TAG, "Host print resumed (head restored)");
 }
 
-/** Cancel host print */
+/** Cancel host print. With no job running it acknowledges a shown error. */
 void hp_cmd_cancel(void)
 {
-    if (s_hp.printing) host_print_finish(true);
+    if (!s_hp.printing) {
+        hp_clear_error();
+        return;
+    }
+    if (s_hp.usb_lost || s_hp.printer_reset) {
+        /* A cancel queued while the link was down must not park: position unknown */
+        host_print_interrupt(s_hp.printer_reset ? "a Ender reiniciou" : "a conexão USB caiu");
+        return;
+    }
+    host_print_finish(true);
 }
 
 /* ---- Host print streaming loop ---- */
 
 void hp_tick(void)
 {
-    if (!s_hp.printing || s_hp.paused) return;
+    if (!s_hp.printing) return;
 
-    /* Explicit USB disconnect handling: don't advance file position,
-     * don't send commands.  Streaming resumes when USB reconnects. */
+    /* Ender Smart (F15-06 / C4): never resume by itself after the printer restarted
+     * or the USB link dropped. Wait for the link, turn the heaters off, report. */
+    if (s_hp.printer_reset || s_hp.usb_lost) {
+        if (!marlin_is_connected()) return;
+        host_print_interrupt(s_hp.printer_reset ? "a Ender reiniciou"
+                                                : "a conexão USB caiu");
+        return;
+    }
+
+    if (s_hp.paused) return;
     if (!marlin_is_connected()) return;
 
     int lines_this_batch = 0;
@@ -451,6 +611,14 @@ void hp_tick(void)
             s_hp.has_pending = false;
         } else {
             if (!fgets(line, sizeof(line), s_hp.file)) {
+                if (ferror(s_hp.file)) {
+                    /* Ender Smart (F15-08 / C8): a read error is NOT the end of the
+                     * file — the end G-code never ran. Park, heaters off, report. */
+                    host_print_finish(true);
+                    hp_set_error("Impressão cancelada: erro de leitura do cartão SD. "
+                                 "Bico afastado e aquecedores desligados.");
+                    break;
+                }
                 /* EOF -- print complete */
                 host_print_finish(false);
                 break;
@@ -571,19 +739,32 @@ void hp_tick(void)
 
         /* Send to printer with line numbering & checksum. */
         if (!send_query_numbered(line)) {
+            if (s_hp.line_too_long) {
+                /* F15-07: the printer is fine, so a normal cancel (park + cool) is safe */
+                host_print_finish(true);
+                hp_set_error("Impressão cancelada: linha de G-code longa demais para a "
+                             "Ender (mais de 95 caracteres).");
+                break;
+            }
+            if (s_hp.desync || s_hp.printer_reset) {
+                host_print_interrupt(s_hp.printer_reset ? "a Ender reiniciou"
+                                                        : "a impressora pediu uma linha antiga");
+                break;
+            }
             if (esp_timer_get_time() < s_cmd_cooldown_until_us) {
                 /* Printer said "busy: processing" -- defer */
                 strncpy(s_hp.pending_line, line, sizeof(s_hp.pending_line));
                 s_hp.has_pending = true;
                 break;
             }
-            /* send_query already retried with echo pings.  If we still
-             * got no response, something is genuinely wrong -- abort to
-             * avoid losing sync with Marlin's line counter. */
-            ESP_LOGE(TAG, "Command failed after retries, aborting host print: %s", line);
-            host_print_finish(true);
+            /* send_query already retried with echo pings. No answer means the
+             * printer state is unknown (it may have reset without a banner), so do
+             * not move the head: heaters off and report (F15-06). */
+            ESP_LOGE(TAG, "Command failed after retries: %s", line);
+            host_print_interrupt("a impressora parou de responder");
             break;
         }
+        hp_track_modes(line);
         s_hp.lines_sent++;
         lines_this_batch++;
 
@@ -639,6 +820,23 @@ bool hp_is_paused(void)
 void hp_notify_resend(int32_t line_num)
 {
     s_hp.resend_line = line_num;
+}
+
+void hp_notify_printer_reset(void)
+{
+    if (s_hp.printing && !s_hp.printer_reset) {
+        s_hp.printer_reset = true;
+        ESP_LOGE(TAG, "Printer restarted during host print -- job will be interrupted");
+    }
+}
+
+void hp_notify_usb_lost(void)
+{
+    if (s_hp.printing && !s_hp.usb_lost) {
+        s_hp.usb_lost = true;
+        hp_set_error("Impressão interrompida: a conexão USB caiu. "
+                     "Reconecte para desligar os aquecedores.");
+    }
 }
 
 /* ---- Fill state (no-op for now -- progress updated inline in hp_tick) ---- */

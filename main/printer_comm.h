@@ -3,6 +3,7 @@
 #include "esp_err.h"
 #include "layout.h"
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -25,6 +26,7 @@ typedef struct {
     int32_t print_time_s;        /* elapsed print time, or -1 */
     int32_t print_time_left_s;   /* estimated remaining, or -1 */
     float x, y, z;
+    float e;                     /* logical E from M114 (Ender Smart F15-09) */
     char filename[64];
     float layer_height;          /* from slicer metadata, 0 if unknown */
     float first_layer_height;    /* from slicer metadata, 0 if unknown */
@@ -34,6 +36,7 @@ typedef struct {
     int32_t current_layer;       /* current layer from ;LAYER:N comments */
     float probe_z_offset;        /* Z probe offset from M290 query (Marlin) */
     int64_t last_update_us;      /* esp_timer_get_time() of last successful parse */
+    char error_msg[96];          /* why opstate is PRINTER_ERROR (Ender Smart F15-06/08) */
 } printer_state_t;
 
 typedef enum {
@@ -172,6 +175,14 @@ esp_err_t printer_comm_host_print_cancel(void);
  * Returns true if a host print is currently active (printing or paused).
  */
 bool printer_comm_is_host_printing(void);
+
+/**
+ * Ender Smart (F15-10): server-side policy for raw G-code coming from the UI/API.
+ * While a print is running or paused only status queries and safe fine-tuning
+ * (fan, speed/flow, babystep, adjusting an already-on heater, cooling) are allowed.
+ * Returns false and fills reason when the command is refused.
+ */
+bool printer_comm_cmd_allowed(const char *gcode, char *reason, size_t reason_len);
 
 /**
  * Suppress automatic polling (M105/M27/M114/M119).

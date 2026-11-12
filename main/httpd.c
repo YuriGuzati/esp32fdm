@@ -230,11 +230,11 @@ static esp_err_t api_status_handler(httpd_req_t *req)
         s_baby_z_seeded = true;
     }
 
-    char json[448];
+    char json[576];
     snprintf(json, sizeof(json),
         "{\"state\":\"%s\",\"backend\":\"%s\",\"hotend\":[%.1f,%.1f],\"bed\":[%.1f,%.1f],"
         "\"progress\":%.1f,\"filename\":\"%s\",\"elapsed\":%ld,\"remaining\":%ld,"
-        "\"layer\":\"%ld/%ld\",\"z\":%.1f,\"baby_z\":%.2f,\"usb\":%s}",
+        "\"layer\":\"%ld/%ld\",\"z\":%.1f,\"baby_z\":%.2f,\"usb\":%s,\"error\":\"%s\"}",
         state_str, printer_comm_backend_name(),
         st.hotend_actual, st.hotend_target,
         st.bed_actual, st.bed_target,
@@ -245,7 +245,8 @@ static esp_err_t api_status_handler(httpd_req_t *req)
         (long)(layer >= 0 ? layer : 0),
         (long)(total_layers >= 0 ? total_layers : 0),
         st.z, s_baby_z,
-        usb ? "true" : "false");
+        usb ? "true" : "false",
+        st.opstate == PRINTER_ERROR ? st.error_msg : "");
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
@@ -403,6 +404,15 @@ static esp_err_t api_command_handler(httpd_req_t *req)
     if (!parse_form_field(buf, "cmd", cmd, sizeof(cmd)) || cmd[0] == '\0') {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "cmd required");
         return ESP_FAIL;
+    }
+
+    /* Ender Smart (F15-10 / C6): the server decides, not the page's JavaScript */
+    char reason[96];
+    if (!printer_comm_cmd_allowed(cmd, reason, sizeof(reason))) {
+        ESP_LOGW(TAG, "/api/command refused: %s (%s)", cmd, reason);
+        httpd_resp_set_status(req, "409 Conflict");
+        httpd_resp_set_type(req, "text/plain");
+        return httpd_resp_sendstr(req, reason);
     }
 
     /* Track baby-step Z offset accumulator */
