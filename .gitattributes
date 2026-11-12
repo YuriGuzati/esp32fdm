@@ -1,0 +1,8 @@
+# Ender Smart (F15-01): fins de linha LF em qualquer sistema, para o build local (Windows)
+# e o do CI (Linux) partirem dos mesmos arquivos.
+* text=auto eol=lf
+
+*.bin binary
+*.png binary
+*.jpg binary
+*.ico binary

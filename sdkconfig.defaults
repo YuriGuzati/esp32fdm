@@ -1,6 +1,10 @@
 # Target
 CONFIG_IDF_TARGET="esp32s3"
 
+# Ender Smart (F15-01): reproducible build. Removes build date/time and absolute
+# paths from the binaries, so the local build and the CI build produce the same SHA-256.
+CONFIG_APP_REPRODUCIBLE_BUILD=y
+
 # PSRAM (OPI 80MHz)
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_OCT=y

@@ -1,0 +1,55 @@
+# Ender Smart (F15-01): CI build of the ESP32FDM fork.
+# Builds with the same ESP-IDF as the local machine (v5.4.4) and the committed
+# dependencies.lock, then publishes the binaries and their SHA-256 as an artifact.
+# Nothing is flashed or released here.
+name: build
+
+on:
+  push:
+    branches: [ "ender-smart/**" ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: espressif/idf:v5.4.4
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Allow git inside the container (git describe for the app version)
+        shell: bash
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Build
+        shell: bash
+        run: |
+          . "$IDF_PATH/export.sh"
+          idf.py --version
+          idf.py build
+
+      - name: Hashes
+        shell: bash
+        run: |
+          cd build
+          sha256sum esp32fdm.bin bootloader/bootloader.bin partition_table/partition-table.bin ota_data_initial.bin | tee SHA256SUMS.txt
+          git -C "$GITHUB_WORKSPACE" describe --always --dirty --tags
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp32fdm-${{ github.sha }}
+          path: |
+            build/esp32fdm.bin
+            build/bootloader/bootloader.bin
+            build/partition_table/partition-table.bin
+            build/ota_data_initial.bin
+            build/flasher_args.json
+            build/SHA256SUMS.txt
+          if-no-files-found: error
