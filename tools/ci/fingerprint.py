@@ -47,6 +47,19 @@ def main():
             with open(p, "rb") as f:
                 linha(f"bin {rel}", f.read())
 
+    # The app image stores the SHA-256 of the whole .elf (debug info included) at
+    # offset 0xB0 (esp_app_desc_t.app_elf_sha256). Debug info contains host paths
+    # (e.g. the toolchain directory), so this field differs between hosts even when
+    # every loaded byte is the same. The normalized hash zeroes that field and drops
+    # the image checksum byte + appended SHA-256 (last 33 bytes), which depend on it.
+    p = os.path.join(build, f"{elfs[0][:-4]}.bin")
+    if os.path.exists(p):
+        with open(p, "rb") as f:
+            b = bytearray(f.read())
+        print(f"{bytes(b[0xB0:0xD0]).hex()[:16]} {32:8d} field app_elf_sha256")
+        b[0xB0:0xD0] = bytes(32)
+        linha("bin normalized (no elf sha, no checksum/hash)", bytes(b[:-33]))
+
 
 if __name__ == "__main__":
     main()
