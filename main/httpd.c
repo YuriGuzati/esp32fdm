@@ -43,6 +43,12 @@ static bool  s_baby_z_seeded = false;  /* true once we got a real value from the
 
 static const char *STREAM_BOUNDARY = "esp32fdm_frame";
 
+/* Ender Smart (F15-22): each MJPEG client holds a socket and a task for as long as
+ * the page stays open; cap them so the dashboard and the API always get through. */
+#define MAX_STREAM_CLIENTS 3
+static int s_stream_clients;
+static httpd_handle_t s_main_server;
+
 /* ---- /capture handler (async) ---- */
 
 static void capture_task(void *arg)
@@ -159,6 +165,7 @@ static void stream_task(void *arg)
 
     ESP_LOGI(TAG, "Stream client disconnected");
     httpd_req_async_handler_complete(req);
+    __atomic_sub_fetch(&s_stream_clients, 1, __ATOMIC_ACQ_REL);
     vTaskDelete(NULL);
 }
 
@@ -168,6 +175,13 @@ static esp_err_t stream_handler(httpd_req_t *req)
      * "no frame available", holding a socket and a task per client. */
     if (!camera_is_available()) {
         return camera_unavailable(req);
+    }
+
+    if (__atomic_add_fetch(&s_stream_clients, 1, __ATOMIC_ACQ_REL) > MAX_STREAM_CLIENTS) {
+        __atomic_sub_fetch(&s_stream_clients, 1, __ATOMIC_ACQ_REL);
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_set_type(req, "text/plain");
+        return httpd_resp_sendstr(req, "Too many video clients (max 3). Close another camera page.");
     }
 
     int fd = httpd_req_to_sockfd(req);
@@ -184,6 +198,7 @@ static esp_err_t stream_handler(httpd_req_t *req)
         "X-Framerate: 5\r\n"
         "\r\n";
     if (httpd_send(req, resp_hdr, strlen(resp_hdr)) <= 0) {
+        __atomic_sub_fetch(&s_stream_clients, 1, __ATOMIC_ACQ_REL);
         return ESP_FAIL;
     }
 
@@ -191,6 +206,7 @@ static esp_err_t stream_handler(httpd_req_t *req)
     httpd_req_t *async_req = NULL;
     if (httpd_req_async_handler_begin(req, &async_req) != ESP_OK) {
         ESP_LOGE(TAG, "Failed to start async stream handler");
+        __atomic_sub_fetch(&s_stream_clients, 1, __ATOMIC_ACQ_REL);
         return ESP_FAIL;
     }
 
@@ -198,6 +214,7 @@ static esp_err_t stream_handler(httpd_req_t *req)
                                  5, NULL, 0) != pdPASS) {
         ESP_LOGE(TAG, "Failed to create stream task");
         httpd_req_async_handler_complete(async_req);
+        __atomic_sub_fetch(&s_stream_clients, 1, __ATOMIC_ACQ_REL);
         return ESP_FAIL;
     }
 
@@ -328,17 +345,24 @@ static esp_err_t api_stats_handler(httpd_req_t *req)
     /* Ender Smart (F15-17): diagnose restarts and Wi-Fi from the network, without the UART. */
     int8_t rssi = 0;
     bool sta = wifi_get_rssi(&rssi);
-    char json[320];
+    /* F15-22: open HTTP sessions and video clients, to see socket pressure */
+    size_t n_clients = 16;
+    int client_fds[16];
+    if (!s_main_server || httpd_get_client_list(s_main_server, &n_clients, client_fds) != ESP_OK)
+        n_clients = 0;
+    char json[384];
     snprintf(json, sizeof(json),
         "{\"cpu0\":%d,\"cpu1\":%d,\"heap\":%lu,\"heap_min\":%lu,"
         "\"uptime_s\":%lld,\"reset_reason\":\"%s\",\"rssi\":%d,"
-        "\"wifi\":\"%s\",\"emergency_ap\":%s,\"wifi_reconnects\":%lu,\"camera\":%s}",
+        "\"wifi\":\"%s\",\"emergency_ap\":%s,\"wifi_reconnects\":%lu,\"camera\":%s,"
+        "\"http_clients\":%u,\"stream_clients\":%d}",
         cpu0_pct, cpu1_pct, (unsigned long)free_heap, (unsigned long)min_heap,
         (long long)(esp_timer_get_time() / 1000000), reset_reason_str(esp_reset_reason()),
         sta ? rssi : 0, sta ? "connected" : "disconnected",
         wifi_emergency_ap_active() ? "true" : "false",
         (unsigned long)wifi_get_reconnect_count(),
-        camera_is_available() ? "true" : "false");
+        camera_is_available() ? "true" : "false",
+        (unsigned)n_clients, __atomic_load_n(&s_stream_clients, __ATOMIC_ACQUIRE));
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
@@ -916,6 +940,13 @@ static esp_err_t device_config_post_handler(httpd_req_t *req)
     char hostname[32] = {0};
     parse_form_field(buf, "hostname", hostname, sizeof(hostname));
 
+    if (hostname[0] && printer_comm_job_active()) {
+        /* Ender Smart (F15-13): saving the name reboots the ESP32 */
+        httpd_resp_set_status(req, "409 Conflict");
+        httpd_resp_set_type(req, "text/plain");
+        return httpd_resp_sendstr(req, "Blocked while a print is running or paused (this would reboot)");
+    }
+
     if (hostname[0]) {
         wifi_set_hostname(hostname);
         httpd_resp_set_type(req, "text/html");
@@ -933,6 +964,12 @@ static esp_err_t device_config_post_handler(httpd_req_t *req)
 
 static esp_err_t wifi_reset_handler(httpd_req_t *req)
 {
+    if (printer_comm_job_active()) {
+        /* Ender Smart (F15-13): erasing Wi-Fi reboots into setup mode */
+        httpd_resp_set_status(req, "409 Conflict");
+        httpd_resp_set_type(req, "text/plain");
+        return httpd_resp_sendstr(req, "Blocked while a print is running or paused");
+    }
     httpd_resp_set_type(req, "text/html");
     httpd_resp_sendstr(req, "WiFi credentials erased. Rebooting...");
     vTaskDelay(pdMS_TO_TICKS(1000));
@@ -1082,6 +1119,7 @@ esp_err_t httpd_start_server(void)
         ESP_LOGE(TAG, "Failed to start HTTP server: 0x%x", err);
         return err;
     }
+    s_main_server = server;
 
     httpd_uri_t root_uri = {
         .uri      = "/",

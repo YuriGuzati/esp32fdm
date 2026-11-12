@@ -460,6 +460,12 @@ void hp_cmd_start(const char *filename)
         return;
     }
 
+    /* Ender Smart (F15-14): defence in depth — the HTTP layer already validates */
+    if (filename[0] == '\0' || filename[0] == '.' || strchr(filename, '/') || strchr(filename, '\\')) {
+        ESP_LOGE(TAG, "Refusing unsafe file name: %s", filename);
+        return;
+    }
+
     char path[128];
     snprintf(path, sizeof(path), "/sdcard/%s", filename);
 

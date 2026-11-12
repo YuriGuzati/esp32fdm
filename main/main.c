@@ -139,8 +139,12 @@ void app_main(void)
     xTaskCreatePinnedToCore(heap_monitor_task, "heap_mon", 3072,
                             NULL, 1, NULL, 0);
 
-    /* RFC 2217 serial bridge */
+    /* RFC 2217 serial bridge — off by default (F15-11): it bypasses the command policy */
+#if CONFIG_RFC2217_ENABLE
     ESP_ERROR_CHECK(rfc2217_start());
+#else
+    ESP_LOGI(TAG, "RFC 2217 bridge disabled (CONFIG_RFC2217_ENABLE=n)");
+#endif
 
     /* HTTP server and USB host are up: confirm a fresh OTA image after a stable
      * period, otherwise the bootloader rolls back (F15-13) */

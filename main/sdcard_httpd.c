@@ -25,6 +25,42 @@ static const char *TAG = "sdcard_httpd";
 #define MOUNT_POINT "/sdcard"
 #define UPLOAD_BUF_SIZE 8192
 
+/* Ender Smart (F15-14 / A5): one rule for every file name coming from the network.
+ * Rejects path traversal ("..", "/", "\"), hidden/leading-dot names, control
+ * characters and characters that break JSON/HTML/filesystems (" < > | : * ?). */
+static bool sd_name_ok(const char *n)
+{
+    size_t len = strlen(n);
+    /* No separators are allowed, so ".." inside a name cannot traverse; a leading
+     * dot (".", "..", hidden files) is refused outright. */
+    if (len == 0 || len >= 64 || n[0] == '.')
+        return false;
+    for (const unsigned char *p = (const unsigned char *)n; *p; p++) {
+        if (*p < 0x20 || *p == 0x7f)
+            return false;
+        if (strchr("/\\\"<>|:*?", *p))
+            return false;
+    }
+    return true;
+}
+
+/* JSON string escaping for names already on the card (copied from a PC). */
+static void json_escape(const char *in, char *out, size_t out_size)
+{
+    size_t o = 0;
+    for (const unsigned char *p = (const unsigned char *)in; *p && o + 7 < out_size; p++) {
+        if (*p == '"' || *p == '\\') {
+            out[o++] = '\\';
+            out[o++] = (char)*p;
+        } else if (*p < 0x20) {
+            o += snprintf(out + o, out_size - o, "\\u%04x", *p);
+        } else {
+            out[o++] = (char)*p;
+        }
+    }
+    out[o] = '\0';
+}
+
 
 /* ---- GET /sd — HTML file manager ---- */
 
@@ -97,14 +133,18 @@ static esp_err_t sd_page_handler(httpd_req_t *req)
         "else document.getElementById('info-thumb').innerHTML='<em>No preview</em>';"
         "}).catch(function(){document.getElementById('info-thumb').innerHTML='<em>Error loading info</em>'})}"
         "function closeInfo(){document.getElementById('modal-bg').classList.remove('show')}"
+        /* Ender Smart (F15-14): names are escaped for HTML; the Info button refers to
+         * the file by index instead of pasting the name into JavaScript source */
+        "var F=[];"
+        "function esc(s){return String(s).replace(/[&<>\"']/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'}[c]})}"
         "function load(){"
         "fetch('/sd/files').then(function(r){return r.json()}).then(function(f){"
-        "f.sort(function(a,b){return(b.mtime||0)-(a.mtime||0)});"
-        "var h='';f.forEach(function(x){"
-        "h+='<tr><td>'+x.name+'<br><span style=\"color:#888;font-size:.75em\">'+fmt(x.size)+' &mdash; '+fmtDate(x.mtime)+'</span></td><td>'"
-        "+'<button onclick=\"info(\\''+x.name.replace(/'/g,\"\\\\'\")+'\\')\" style=\"background:#48f;color:#fff;border:none;border-radius:3px;padding:4px 12px;margin:2px;cursor:pointer\">Info</button> '"
-        "+'<form method=POST action=/sd/print style=display:inline><input type=hidden name=filename value=\"'+x.name+'\"><button type=submit style=\"background:#4a4;color:#fff;border:none;border-radius:3px;padding:4px 12px;margin:2px;cursor:pointer\">Print</button></form> '"
-        "+'<form method=POST action=/sd/delete style=display:inline><input type=hidden name=filename value=\"'+x.name+'\"><button type=submit style=\"background:#f44;color:#fff;border:none;border-radius:3px;padding:4px 12px;margin:2px;cursor:pointer\">Del</button></form>'"
+        "f.sort(function(a,b){return(b.mtime||0)-(a.mtime||0)});F=f;"
+        "var h='';f.forEach(function(x,i){var n=esc(x.name);"
+        "h+='<tr><td>'+n+'<br><span style=\"color:#888;font-size:.75em\">'+fmt(x.size)+' &mdash; '+fmtDate(x.mtime)+'</span></td><td>'"
+        "+'<button onclick=\"info(F['+i+'].name)\" style=\"background:#48f;color:#fff;border:none;border-radius:3px;padding:4px 12px;margin:2px;cursor:pointer\">Info</button> '"
+        "+'<form method=POST action=/sd/print style=display:inline onsubmit=\"return confirm(\\'Start printing this file?\\')\"><input type=hidden name=filename value=\"'+n+'\"><button type=submit style=\"background:#4a4;color:#fff;border:none;border-radius:3px;padding:4px 12px;margin:2px;cursor:pointer\">Print</button></form> '"
+        "+'<form method=POST action=/sd/delete style=display:inline onsubmit=\"return confirm(\\'Delete this file?\\')\"><input type=hidden name=filename value=\"'+n+'\"><button type=submit style=\"background:#f44;color:#fff;border:none;border-radius:3px;padding:4px 12px;margin:2px;cursor:pointer\">Del</button></form>'"
         "+'</td></tr>'});"
         "document.getElementById('files').innerHTML=h||'<tr><td colspan=2>No files</td></tr>';});}"
         "function upload(){"
@@ -154,9 +194,11 @@ static esp_err_t sd_files_handler(httpd_req_t *req)
         if (stat(path, &st) != 0) continue;
         if (S_ISDIR(st.st_mode)) continue;
 
-        char entry[360];
+        char esc[300];
+        json_escape(ent->d_name, esc, sizeof(esc));
+        char entry[400];
         snprintf(entry, sizeof(entry), "%s{\"name\":\"%s\",\"size\":%ld,\"mtime\":%ld}",
-                 first ? "" : ",", ent->d_name, (long)st.st_size, (long)st.st_mtime);
+                 first ? "" : ",", esc, (long)st.st_size, (long)st.st_mtime);
         httpd_resp_sendstr_chunk(req, entry);
         first = false;
     }
@@ -376,7 +418,7 @@ static esp_err_t sd_upload_handler(httpd_req_t *req)
     slash = strrchr(filename, '\\');
     if (slash) memmove(filename, slash + 1, strlen(slash + 1) + 1);
 
-    if (filename[0] == '\0' || filename[0] == '.') {
+    if (!sd_name_ok(filename)) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid filename");
         return ESP_FAIL;
     }
@@ -426,6 +468,11 @@ static esp_err_t sd_delete_handler(httpd_req_t *req)
     char *amp = strchr(fn, '&');
     if (amp) *amp = '\0';
     url_decode_inplace(fn);
+
+    if (!sd_name_ok(fn)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid filename");
+        return ESP_FAIL;
+    }
 
     char path[300];
     snprintf(path, sizeof(path), MOUNT_POINT "/%s", fn);
@@ -494,6 +541,11 @@ static esp_err_t sd_print_handler(httpd_req_t *req)
     char *amp = strchr(fn, '&');
     if (amp) *amp = '\0';
     url_decode_inplace(fn);
+
+    if (!sd_name_ok(fn)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid filename");
+        return ESP_FAIL;
+    }
 
     httpd_req_t *async_req = NULL;
     if (httpd_req_async_handler_begin(req, &async_req) != ESP_OK) {
@@ -618,12 +670,14 @@ static void sd_info_task(void *arg)
     httpd_resp_set_type(req, "application/json");
 
     /* Send JSON in chunks to avoid huge stack buffer */
-    char buf[256];
+    char esc[160];
+    json_escape(ctx->filename, esc, sizeof(esc));
+    char buf[320];
     snprintf(buf, sizeof(buf),
              "{\"name\":\"%s\",\"size\":%ld,\"layers\":%ld,"
              "\"layerHeight\":%.2f,\"objectHeight\":%.2f,"
              "\"estTime\":%ld,\"filamentMm\":%.1f,\"filamentG\":%.1f",
-             ctx->filename, (long)st.st_size, (long)info.total_layers,
+             esc, (long)st.st_size, (long)info.total_layers,
              info.layer_height, info.max_z,
              (long)info.est_time_s, info.filament_used_mm, info.filament_used_g);
     httpd_resp_sendstr_chunk(req, buf);
@@ -666,10 +720,8 @@ static esp_err_t sd_info_handler(httpd_req_t *req)
     }
     url_decode_inplace(filename);
 
-    /* Sanitize */
-    char *slash = strrchr(filename, '/');
-    if (slash) memmove(filename, slash + 1, strlen(slash + 1) + 1);
-    if (filename[0] == '\0' || filename[0] == '.') {
+    /* Sanitize (F15-14) */
+    if (!sd_name_ok(filename)) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid filename");
         return ESP_FAIL;
     }

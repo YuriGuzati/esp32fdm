@@ -301,6 +301,9 @@ static void mesh_parse_line(const char *line)
 
 /* ---- Probe task ---- */
 
+/* Ender Smart (F15-18): set atomically by the HTTP handler, cleared by the task */
+static bool s_probe_busy;
+
 static void probe_task(void *arg)
 {
     s_state = BL_HOMING;
@@ -348,11 +351,13 @@ static void probe_task(void *arg)
     } else {
         s_state = BL_DONE;
     }
+    __atomic_clear(&s_probe_busy, __ATOMIC_RELEASE);
     vTaskDelete(NULL);
     return;
 
 cleanup:
     printer_comm_set_polling_suppressed(false);
+    __atomic_clear(&s_probe_busy, __ATOMIC_RELEASE);
     vTaskDelete(NULL);
 }
 
@@ -376,23 +381,33 @@ static void mesh_to_json(const bl_mesh_t *mesh, html_buf_t *p)
 
 static esp_err_t bedlevel_probe_handler(httpd_req_t *req)
 {
-    if (s_state == BL_HOMING || s_state == BL_PROBING) {
-        httpd_resp_set_type(req, "application/json");
-        return httpd_resp_sendstr(req, "{\"ok\":false,\"err\":\"Probing already in progress\"}");
+    httpd_resp_set_type(req, "application/json");
+
+    /* Ender Smart (F15-18): G28+G29 moves the machine — require an explicit
+     * confirmation in the request (a bare POST, e.g. from another page, is refused) */
+    char body[64] = {0};
+    int len = httpd_req_recv(req, body, sizeof(body) - 1);
+    if (len < 0) len = 0;
+    body[len] = '\0';
+    if (!strstr(body, "confirm=1")) {
+        return httpd_resp_sendstr(req, "{\"ok\":false,\"err\":\"Confirmation required\"}");
     }
 
-    printer_state_t st;
-    printer_comm_get_state(&st);
-    if (st.opstate == PRINTER_PRINTING || st.opstate == PRINTER_PAUSED) {
-        httpd_resp_set_type(req, "application/json");
+    if (printer_comm_job_active()) {
         return httpd_resp_sendstr(req, "{\"ok\":false,\"err\":\"Cannot probe while printing\"}");
+    }
+
+    /* One probe at a time: atomic test-and-set closes the double-click race
+     * (two requests before the task had changed s_state) */
+    if (__atomic_test_and_set(&s_probe_busy, __ATOMIC_ACQ_REL)) {
+        return httpd_resp_sendstr(req, "{\"ok\":false,\"err\":\"Probing already in progress\"}");
     }
 
     s_state = BL_IDLE;
     s_error_msg[0] = '\0';
 
     if (xTaskCreatePinnedToCore(probe_task, "bl_probe", 4096, NULL, 5, NULL, 0) != pdPASS) {
-        httpd_resp_set_type(req, "application/json");
+        __atomic_clear(&s_probe_busy, __ATOMIC_RELEASE);
         return httpd_resp_sendstr(req, "{\"ok\":false,\"err\":\"Failed to start probe task\"}");
     }
 
@@ -640,9 +655,10 @@ static esp_err_t bedlevel_page_handler(httpd_req_t *req)
         /* Probe */
         "var pollId=0;"
         "function probe(){"
+        "if(!confirm('Home all axes (G28) and probe the bed (G29)? The nozzle will touch the bed several times (~2-3 min). Stay near the printer.'))return;"
         "document.getElementById('probe-btn').disabled=true;"
         "document.getElementById('probe-status').textContent='Starting...';"
-        "fetch('/bedlevel/probe',{method:'POST'}).then(r=>r.json()).then(function(j){"
+        "fetch('/bedlevel/probe',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'confirm=1'}).then(r=>r.json()).then(function(j){"
         "if(!j.ok){document.getElementById('probe-status').textContent=j.err;document.getElementById('probe-btn').disabled=false;return}"
         "pollId=setInterval(pollStatus,2000)})}"
 

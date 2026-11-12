@@ -1,4 +1,5 @@
 #include "rfc2217.h"
+#include "printer_comm.h"
 
 #include "usb_serial.h"
 
@@ -355,6 +356,13 @@ static void rfc2217_server_task(void *arg)
 
         char addr_str[16];
         inet_ntoa_r(client_addr.sin_addr, addr_str, sizeof(addr_str));
+
+        /* Ender Smart (F15-11 / C10): exclusive with the ESP32's own print job */
+        if (printer_comm_job_active()) {
+            ESP_LOGW(TAG, "Refusing client %s: a print is running", addr_str);
+            close(client);
+            continue;
+        }
         ESP_LOGI(TAG, "Client connected from %s", addr_str);
 
         /* Only one client at a time */
@@ -375,6 +383,10 @@ static void rfc2217_server_task(void *arg)
         while (true) {
             int n = recv(client, rx_buf, sizeof(rx_buf), 0);
             if (n <= 0) break;
+            if (printer_comm_job_active()) {
+                ESP_LOGW(TAG, "Print started: disconnecting RFC 2217 client");
+                break;
+            }
 
             for (int i = 0; i < n; i++) {
                 process_byte(client, rx_buf[i]);

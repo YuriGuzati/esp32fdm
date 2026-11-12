@@ -114,6 +114,8 @@ typedef struct {
     log_filter_t filter;
 } logs_ctx_t;
 
+static bool s_logs_busy;   /* Ender Smart (F15-22): one /logs response at a time */
+
 static void logs_task(void *arg)
 {
     logs_ctx_t *ctx = (logs_ctx_t *)arg;
@@ -182,7 +184,12 @@ static void logs_task(void *arg)
         send_ok = false;
     html_buf_free(&page);
 
-    /* Stream log lines from snapshot */
+    /* Stream log lines from snapshot.
+     * Ender Smart (F15-22): the chunk buffer now spans lines and is flushed only
+     * when full — the old code sent one HTTP chunk per log line (~37 000 tiny
+     * chunks for a full 2 MB buffer), holding a socket for minutes. */
+    char chunk[1024];
+    int ci = 0;
     if (send_ok && snap && snap_len > 0) {
         int pos = 0;
         while (pos < snap_len && send_ok) {
@@ -202,10 +209,7 @@ static void logs_task(void *arg)
                 if (filter == FILTER_HEAP && !heap) continue;
             }
 
-            /* HTML-escape and send: we need to escape <, >, & */
-            /* Send in small chunks, escaping as needed */
-            char chunk[1024];
-            int ci = 0;
+            /* HTML-escape into the shared chunk buffer: we need to escape <, >, & */
             for (int i = line_start; i < line_start + line_len && send_ok; i++) {
                 char c = snap[i];
                 if (c == '<') {
@@ -238,11 +242,11 @@ static void logs_task(void *arg)
                     chunk[ci++] = c;
                 }
             }
-            if (ci > 0 && send_ok) {
-                if (httpd_resp_send_chunk(req, chunk, ci) != ESP_OK)
-                    send_ok = false;
-            }
         }
+    }
+    if (ci > 0 && send_ok) {
+        if (httpd_resp_send_chunk(req, chunk, ci) != ESP_OK)
+            send_ok = false;
     }
 
     if (send_ok) {
@@ -263,11 +267,21 @@ static void logs_task(void *arg)
 
     httpd_req_async_handler_complete(req);
     free(ctx);
+    __atomic_clear(&s_logs_busy, __ATOMIC_RELEASE);
     vTaskDelete(NULL);
 }
 
 static esp_err_t logs_handler(httpd_req_t *req)
 {
+    /* Ender Smart (F15-22): each request snapshots the whole 2 MB buffer in PSRAM;
+     * two or three at once took heap_min from 3.7 MB to 1.7 MB on 2026-11-12.
+     * Serve one at a time. */
+    if (__atomic_test_and_set(&s_logs_busy, __ATOMIC_ACQ_REL)) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_set_hdr(req, "Retry-After", "5");
+        return httpd_resp_sendstr(req, "Logs are already being sent to another client, try again in a few seconds");
+    }
+
     /* Parse filter from query string (before async clone) */
     log_filter_t filter = FILTER_ALL;
     char qbuf[32] = {0};
@@ -282,6 +296,7 @@ static esp_err_t logs_handler(httpd_req_t *req)
 
     httpd_req_t *async_req = NULL;
     if (httpd_req_async_handler_begin(req, &async_req) != ESP_OK) {
+        __atomic_clear(&s_logs_busy, __ATOMIC_RELEASE);
         httpd_resp_send_500(req);
         return ESP_FAIL;
     }
@@ -289,6 +304,7 @@ static esp_err_t logs_handler(httpd_req_t *req)
     logs_ctx_t *ctx = malloc(sizeof(logs_ctx_t));
     if (!ctx) {
         httpd_req_async_handler_complete(async_req);
+        __atomic_clear(&s_logs_busy, __ATOMIC_RELEASE);
         return ESP_FAIL;
     }
     ctx->req = async_req;
@@ -299,6 +315,7 @@ static esp_err_t logs_handler(httpd_req_t *req)
                                  5, NULL, 0) != pdPASS) {
         httpd_req_async_handler_complete(async_req);
         free(ctx);
+        __atomic_clear(&s_logs_busy, __ATOMIC_RELEASE);
         return ESP_FAIL;
     }
 

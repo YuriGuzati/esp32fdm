@@ -27,7 +27,10 @@ CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
 CONFIG_FREERTOS_RUN_TIME_STATS_USING_ESP_TIMER=y
 
 # LWIP — larger TCP window to avoid zero-window stalls during uploads
-CONFIG_LWIP_MAX_SOCKETS=16
+# Ender Smart (F15-22): 16 was less than the HTTP server alone may use (13 sessions
+# + listener + control) plus mDNS, SNTP, DNS and RFC 2217 — new connections were
+# reset ("connection reset by peer") once lwIP ran out of sockets.
+CONFIG_LWIP_MAX_SOCKETS=24
 CONFIG_LWIP_SO_RCVBUF=y
 CONFIG_LWIP_TCP_WND_DEFAULT=32768
 CONFIG_LWIP_TCP_RECVMBOX_SIZE=64

@@ -103,6 +103,14 @@ menu "ESP32 FDM Bridge Configuration"
 
     menu "RFC 2217"
 
+        config RFC2217_ENABLE
+            bool "Enable the RFC 2217 serial bridge (OctoPrint)"
+            default n
+            help
+                Ender Smart (F15-11): off by default. When on, OctoPrint writes
+                straight to the printer's USB serial, outside the ESP32 command
+                policy; clients are refused/disconnected while a print runs.
+
         config RFC2217_PORT
             int "RFC 2217 TCP Port"
             default 2217

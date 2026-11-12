@@ -1,5 +1,6 @@
 #include "ota.h"
 #include "httpd.h"
+#include "printer_comm.h"
 
 #include <string.h>
 #include "esp_log.h"
@@ -204,6 +205,13 @@ done:
 
 static esp_err_t ota_upload_handler(httpd_req_t *req)
 {
+    /* Ender Smart (F15-13): never reboot into new firmware in the middle of a print */
+    if (printer_comm_job_active()) {
+        httpd_resp_set_status(req, "409 Conflict");
+        httpd_resp_set_type(req, "text/plain");
+        return httpd_resp_sendstr(req, "Firmware update blocked while a print is running or paused");
+    }
+
     if (req->content_len <= 0) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "No firmware data");
         return ESP_FAIL;

@@ -49,6 +49,7 @@ typedef enum {
 typedef struct {
     printer_cmd_type_t type;
     char gcode[96];  /* only used for PCMD_RAW */
+    uint8_t sync_id; /* Ender Smart (F15-18): non-zero = a printer_comm_send_gcode_sync() waits for THIS command */
 } printer_cmd_t;
 
 /* Temperature history sample */
@@ -183,6 +184,12 @@ bool printer_comm_is_host_printing(void);
  * Returns false and fills reason when the command is refused.
  */
 bool printer_comm_cmd_allowed(const char *gcode, char *reason, size_t reason_len);
+
+/**
+ * Ender Smart (F15-13): true while a print is running or paused (host print or
+ * printer SD). OTA, reboot, Wi-Fi reset, bed probing and RFC 2217 are refused then.
+ */
+bool printer_comm_job_active(void);
 
 /**
  * Suppress automatic polling (M105/M27/M114/M119).

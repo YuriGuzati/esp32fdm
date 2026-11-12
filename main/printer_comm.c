@@ -52,7 +52,14 @@ static void (*s_line_callback)(const char *line);
 
 /* ---- Synchronous command send ---- */
 static SemaphoreHandle_t s_sync_cmd_sem;
-static bool              s_sync_cmd_pending;
+/* Ender Smart (F15-18 / A2): the old single "pending" flag was released by ANY raw
+ * command finishing and ignored the result, so a failed G28 still started G29. */
+static volatile uint8_t   s_sync_wait_id;   /* id of the command a caller waits for */
+static volatile bool      s_sync_ok;        /* "ok" received for that command */
+static uint8_t            s_sync_seq;
+/* F15-23: "Resend: N" seen while sending a user command */
+static volatile int32_t   s_last_resend = -1;
+static uint32_t           s_spam_lines;     /* Creality debug lines dropped */
 
 #define NVS_NAMESPACE           "pcomm"
 #define NVS_KEY_BACKEND         "backend"
@@ -349,6 +356,16 @@ static void process_line(const char *line)
     /* Skip empty lines */
     if (line[0] == '\0') return;
 
+    /* Ender Smart (F15-23): the Creality firmware prints debug garbage on the serial
+     * port while the Z offset is adjusted on its screen ("d:babystep",
+     * "b:%d2,dis:%d", hundreds of lines per adjustment). Drop it. */
+    if (strstr(line, "d:babystep") || strstr(line, "dis:%d")) {
+        if ((s_spam_lines++ % 200) == 0)
+            ESP_LOGW(TAG, "Dropping Creality babystep debug lines (%lu so far)",
+                     (unsigned long)s_spam_lines);
+        return;
+    }
+
     /* Forward line to callback (used by bedlevel mesh parser) */
     if (s_line_callback) {
         s_line_callback(line);
@@ -527,6 +544,7 @@ static void process_line(const char *line)
         if (*p) {
             int32_t rline = (int32_t)atol(p);
             hp_notify_resend(rline);
+            s_last_resend = rline;
             ESP_LOGW(TAG, "Resend requested: N%ld", (long)rline);
         }
         /* Don't return — Marlin sends "ok" after "Resend:" which clears s_pending_query */
@@ -772,6 +790,39 @@ bool marlin_send_cmd_hp(const char *gcode, query_type_t qtype)
     return marlin_send_cmd_ex(gcode, qtype, HOST_CMD_TIMEOUT_MS, HOST_STALL_PING_RETRIES);
 }
 
+/** Ender Smart (F15-23): send a user/API command with line number and checksum.
+ *  Marlin only accepts a checksum together with a line number, so the counter is
+ *  reset with an unnumbered "M110 N0" and the command goes as "N1 <cmd>*cs".
+ *  A corrupted line (seen on 2026-11-12 as "M11M105" during a babystep burst) is
+ *  answered with "Resend: 1" and sent again instead of being executed garbled.
+ *  Only used with no host print running (the job owns the line counter then). */
+static bool marlin_send_checked(const char *gcode)
+{
+    char line[MARLIN_MAX_LINE + 1];
+    int n = snprintf(line, sizeof(line), "N1 %s", gcode);
+    if (n < 0 || n > MARLIN_MAX_LINE - 4) {
+        ESP_LOGE(TAG, "Command too long to send with checksum: %.40s", gcode);
+        return false;
+    }
+    uint8_t cs = 0;
+    for (const char *p = line; *p; p++) cs ^= (uint8_t)*p;
+    snprintf(line + n, sizeof(line) - n, "*%u", cs);
+
+    if (!marlin_send_cmd("M110 N0", QUERY_CMD))
+        return false;
+    for (int attempt = 1; attempt <= 3; attempt++) {
+        s_last_resend = -1;
+        bool ok = marlin_send_cmd(line, QUERY_CMD);
+        if (s_last_resend < 0)
+            return ok;
+        ESP_LOGW(TAG, "Printer asked to resend the command (attempt %d/3): %s", attempt, gcode);
+        if (s_last_resend != 1 && !marlin_send_cmd("M110 N0", QUERY_CMD))
+            return false;
+    }
+    ESP_LOGE(TAG, "Command not accepted after 3 resends: %s", gcode);
+    return false;
+}
+
 /* ---- Polling task ---- */
 
 static void printer_comm_task(void *arg)
@@ -839,11 +890,19 @@ static void printer_comm_task(void *arg)
             }
             if (gcode) {
                 ESP_LOGI(TAG, "Sending command: %s", gcode);
-                marlin_send_cmd(gcode, QUERY_CMD);
+                bool ok;
+                if (cmd.type == PCMD_RAW && !hp_is_active()) {
+                    /* F15-23: user/API commands get a line number and checksum, so a
+                     * byte lost while the Ender is busy is detected and resent */
+                    ok = marlin_send_checked(gcode);
+                } else {
+                    ok = marlin_send_cmd(gcode, QUERY_CMD);
+                }
 
-                /* Notify synchronous caller if waiting */
-                if (cmd.type == PCMD_RAW && s_sync_cmd_pending) {
-                    s_sync_cmd_pending = false;
+                /* Notify the synchronous caller waiting for THIS command */
+                if (cmd.type == PCMD_RAW && cmd.sync_id != 0 && cmd.sync_id == s_sync_wait_id) {
+                    s_sync_ok = ok;
+                    s_sync_wait_id = 0;
                     if (s_sync_cmd_sem) xSemaphoreGive(s_sync_cmd_sem);
                 }
 
@@ -1089,6 +1148,14 @@ bool printer_comm_is_simulating(void)
     return s_simulate;
 }
 
+bool printer_comm_job_active(void)
+{
+    printer_state_t st;
+    printer_comm_get_state(&st);
+    return st.opstate == PRINTER_PRINTING || st.opstate == PRINTER_PAUSED ||
+           (s_backend == PRINTER_BACKEND_MARLIN && hp_is_active());
+}
+
 bool printer_comm_cmd_allowed(const char *gcode, char *reason, size_t reason_len)
 {
     printer_state_t st;
@@ -1253,18 +1320,23 @@ esp_err_t printer_comm_send_gcode_sync(const char *gcode, int timeout_ms)
     printer_cmd_t cmd = { .type = PCMD_RAW };
     strlcpy(cmd.gcode, gcode, sizeof(cmd.gcode));
 
-    s_sync_cmd_pending = true;
+    if (++s_sync_seq == 0) s_sync_seq = 1;   /* 0 means "nobody waits" */
+    cmd.sync_id = s_sync_seq;
+    xSemaphoreTake(s_sync_cmd_sem, 0);       /* drop a stale give */
+    s_sync_ok = false;
+    s_sync_wait_id = cmd.sync_id;
+
     esp_err_t err = printer_comm_send_cmd(&cmd);
     if (err != ESP_OK) {
-        s_sync_cmd_pending = false;
+        s_sync_wait_id = 0;
         return err;
     }
 
     if (xSemaphoreTake(s_sync_cmd_sem, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
-        s_sync_cmd_pending = false;
+        s_sync_wait_id = 0;
         return ESP_ERR_TIMEOUT;
     }
-    return ESP_OK;
+    return s_sync_ok ? ESP_OK : ESP_FAIL;
 }
 
 /* ---- Backend getters ---- */
@@ -1375,6 +1447,13 @@ static esp_err_t printer_config_get_handler(httpd_req_t *req)
 
 static esp_err_t printer_config_post_handler(httpd_req_t *req)
 {
+    if (printer_comm_job_active()) {
+        /* Ender Smart (F15-13): saving this config reboots the ESP32 */
+        httpd_resp_set_status(req, "409 Conflict");
+        httpd_resp_set_type(req, "text/plain");
+        return httpd_resp_sendstr(req, "Blocked while a print is running or paused (this would reboot)");
+    }
+
     char body[256];
     int len = httpd_req_recv(req, body, sizeof(body) - 1);
     if (len <= 0) {
