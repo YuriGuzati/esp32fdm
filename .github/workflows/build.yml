@@ -44,6 +44,14 @@ jobs:
           while read -r h f; do echo "::notice title=sha256 ${f##*/}::$h"; done < SHA256SUMS.txt
           { echo '### SHA-256'; echo '```'; cat SHA256SUMS.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Fingerprint (per-section hashes, to compare with a local build)
+        shell: bash
+        run: |
+          . "$IDF_PATH/export.sh" > /dev/null
+          python tools/ci/fingerprint.py build | tee build/FINGERPRINT.txt
+          echo "::notice title=fingerprint::$(sed ':a;N;$!ba;s/\n/%0A/g' build/FINGERPRINT.txt)"
+          echo "::notice title=git::describe=$(git describe --always --dirty --tags) porcelain=$(git status --porcelain | wc -l)"
+
       - name: Upload binaries
         uses: actions/upload-artifact@v4
         with:
@@ -55,4 +63,5 @@ jobs:
             build/ota_data_initial.bin
             build/flasher_args.json
             build/SHA256SUMS.txt
+            build/FINGERPRINT.txt
           if-no-files-found: error
