@@ -302,7 +302,6 @@ function buildNav() {
     if (i === 4) side.append(h('div', { class: 'grp' }, 'Ferramentas'));
     side.append(h('a', { href: '#' + id, 'data-r': id }, icon(ic), label));
   });
-  side.append(h('div', { class: 'grp' }, 'Outros'), h('a', { href: '/' }, icon('old'), 'Interface antiga'));
   NAV.filter(n => n[3]).forEach(([id, label, ic]) => tabs.append(h('a', { href: '#' + id, 'data-r': id }, icon(ic), label)));
   tabs.append(h('a', { href: '#mais', 'data-r': 'mais' }, icon('more'), 'Mais'));
 }
@@ -1427,8 +1426,7 @@ function Config() {
     const base = location.origin;
     el.append(sec('Endereços para outros programas',
       h('dl', { class: 'kv' }, h('dt', null, 'Vídeo (MJPEG)'), h('dd', null, base + '/stream'), h('dt', null, 'Foto'), h('dd', null, base + '/capture'),
-        h('dt', null, 'mDNS'), h('dd', null, s.hostname + '.local'), h('dt', null, 'OctoPrint (RFC 2217)'), h('dd', null, s.rfc2217 ? 'ligado' : 'desligado neste firmware')),
-      h('a', { class: 'btn sm', href: '/' }, icon('old'), 'Abrir a interface antiga')));
+        h('dt', null, 'mDNS'), h('dd', null, s.hostname + '.local'), h('dt', null, 'OctoPrint (RFC 2217)'), h('dd', null, s.rfc2217 ? 'ligado' : 'desligado neste firmware'))));
   }
   update();
   return { el, update };
@@ -1523,7 +1521,6 @@ function Historico() {
 function Mais() {
   const el = h('div', { class: 'col', style: 'gap:8px' }, h('h1', null, 'Mais'));
   NAV.slice(4).forEach(([id, label, ic]) => el.append(h('a', { class: 'item', href: '#' + id, style: 'text-decoration:none' }, icon(ic), h('span', { class: 'nm' }, label))));
-  el.append(h('a', { class: 'item', href: '/', style: 'text-decoration:none' }, icon('old'), h('span', { class: 'nm' }, 'Interface antiga')));
   return { el, update() { } };
 }
 

@@ -392,6 +392,19 @@ static esp_err_t app_handler(httpd_req_t *req)
     return httpd_resp_send(req, (const char *)app_html_start, app_html_end - app_html_start);
 }
 
+/* Ender Smart (F4-07): the old pages were removed (decision of the user, 2026-11-12, after
+ * the new UI was confirmed in real prints on 2026-11-13). Their addresses open the matching
+ * screen of the new UI; the data and action routes are unchanged. */
+esp_err_t httpd_redirect_app(httpd_req_t *req, const char *screen)
+{
+    char loc[48];
+    snprintf(loc, sizeof(loc), "/app#%s", screen);
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", loc);
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_send(req, NULL, 0);
+}
+
 /* Ender Smart (Fase 4): icon and manifest for "Add to home screen" */
 extern const uint8_t icon192_png_start[] asm("_binary_icon_192_png_start");
 extern const uint8_t icon192_png_end[]   asm("_binary_icon_192_png_end");
@@ -594,415 +607,30 @@ static esp_err_t api_command_handler(httpd_req_t *req)
 
 static esp_err_t root_handler(httpd_req_t *req)
 {
-    html_buf_t p;
-    html_buf_init(&p);
-
-    layout_html_begin(&p, "ESP32 FDM Dashboard", "/");
-
-    html_buf_printf(&p,
-        "<style>"
-        ".ctrl{margin:8px 0}"
-        ".ctrl summary{font-weight:bold;cursor:pointer;padding:8px;background:#f5f5f5;border-radius:4px;user-select:none}"
-        ".ctrl .cg{padding:8px 0}"
-        ".ctrl label{font-size:13px;font-weight:bold;display:block;margin:6px 0 2px}"
-        ".bg{display:flex;flex-wrap:wrap;gap:4px;align-items:center}"
-        ".bg button{min-width:44px;padding:6px 8px;font-size:13px}"
-        ".bg input[type=number]{width:64px;padding:5px;font-size:13px}"
-        ".bg .val{min-width:44px;text-align:center;font-weight:bold;font-size:14px}"
-        "</style>");
-
-    /* Controls panel */
-    html_buf_printf(&p,
-        "<details class='ctrl'><summary>Z Offset (Baby Stepping)</summary><div class='cg'>"
-        "<div class='bg'>"
-        "<button onclick=\"zb(-0.05)\">\xe2\x96\xbc 0.05</button>"
-        "<button onclick=\"zb(-0.01)\">\xe2\x96\xbc 0.01</button>"
-        "<span class='val' id='zof'>%.2f</span>",
-        s_baby_z);
-    html_buf_printf(&p,
-        "<button onclick=\"zb(0.01)\">\xe2\x96\xb2 0.01</button>"
-        "<button onclick=\"zb(0.05)\">\xe2\x96\xb2 0.05</button>"
-        "<button onclick=\"gc('M500')\" style='margin-left:8px' title='Save all settings to EEPROM (M500)'>Save</button>"
-        "</div>"
-        "<p class='hint' style='margin:4px 0 0'>\xe2\x96\xbc closer to bed &middot; \xe2\x96\xb2 farther from bed &middot; Save writes to EEPROM (M500)</p>"
-        "</div></details>");
-
-    html_buf_printf(&p,
-        "<details class='ctrl'><summary>Temperatures</summary><div class='cg'>"
-        "<label>Hotend</label><div class='bg'>"
-        "<button onclick=\"gc('M104 S0')\">Off</button>"
-        "<button onclick=\"gc('M104 S190')\">190</button>"
-        "<button onclick=\"gc('M104 S200')\">200</button>"
-        "<button onclick=\"gc('M104 S210')\">210</button>"
-        "<button onclick=\"gc('M104 S220')\">220</button>"
-        "<input type='number' id='ht' placeholder='&deg;C' min='0' max='300'>"
-        "<button onclick=\"gc('M104 S'+document.getElementById('ht').value)\">Set</button>"
-        "</div>"
-        "<label>Bed</label><div class='bg'>"
-        "<button onclick=\"gc('M140 S0')\">Off</button>"
-        "<button onclick=\"gc('M140 S50')\">50</button>"
-        "<button onclick=\"gc('M140 S55')\">55</button>"
-        "<button onclick=\"gc('M140 S60')\">60</button>"
-        "<button onclick=\"gc('M140 S70')\">70</button>"
-        "<input type='number' id='bt' placeholder='&deg;C' min='0' max='120'>"
-        "<button onclick=\"gc('M140 S'+document.getElementById('bt').value)\">Set</button>"
-        "</div></div></details>");
-
-    html_buf_printf(&p,
-        "<details class='ctrl'><summary>Move / Jog</summary><div class='cg'>"
-        "<label>Step (mm)</label><div class='bg'>"
-        "<button id='s01' onclick=\"setStep(0.1)\" style='font-weight:bold'>0.1</button>"
-        "<button id='s1' onclick=\"setStep(1)\">1</button>"
-        "<button id='s10' onclick=\"setStep(10)\">10</button>"
-        "<button id='s100' onclick=\"setStep(100)\">100</button>"
-        "</div>"
-        "<label>Axes</label><div class='bg'>"
-        "<button id='xm' onclick=\"jog('X',-1)\">X-</button>"
-        "<button id='xp' onclick=\"jog('X',1)\">X+</button>"
-        "<button id='ym' onclick=\"jog('Y',-1)\">Y-</button>"
-        "<button id='yp' onclick=\"jog('Y',1)\">Y+</button>"
-        "<button id='zm' onclick=\"jog('Z',-1)\">Z-</button>"
-        "<button id='zp' onclick=\"jog('Z',1)\">Z+</button>"
-        "</div>"
-        "<label>Extruder</label><div class='bg'>"
-        "<button id='er' onclick=\"extrude(-1)\">Retract</button>"
-        "<button id='ee' onclick=\"extrude(1)\">Extrude</button>"
-        "<button id='esn' onclick=\"setESpd(0)\" style='font-weight:bold'>Normal</button>"
-        "<button id='ess' onclick=\"setESpd(1)\">Slow</button>"
-        "</div>"
-        "<p class='hint' style='margin:2px 0 0'>Normal: 300mm/min. Slow: 60mm/min (for measuring filament length).</p>"
-        "<label>Home</label><div class='bg'>"
-        "<button id='ha' onclick=\"gc('G28')\">All</button>"
-        "<button id='hx' onclick=\"gc('G28 X')\">X</button>"
-        "<button id='hy' onclick=\"gc('G28 Y')\">Y</button>"
-        "<button id='hz' onclick=\"gc('G28 Z')\">Z</button>"
-        "</div></div></details>");
-
-    html_buf_printf(&p,
-        "<details class='ctrl'><summary>Speed / Flow / Fan</summary><div class='cg'>"
-        "<label>Speed</label><div class='bg'>"
-        "<button onclick=\"adj('spd',-10)\">-10%%</button>"
-        "<span class='val' id='spd'>100%%</span>"
-        "<button onclick=\"adj('spd',10)\">+10%%</button>"
-        "</div>"
-        "<label>Flow</label><div class='bg'>"
-        "<button onclick=\"adj('flw',-5)\">-5%%</button>"
-        "<span class='val' id='flw'>100%%</span>"
-        "<button onclick=\"adj('flw',5)\">+5%%</button>"
-        "</div>"
-        "<label>Fan</label><div class='bg'>"
-        "<button onclick=\"gc('M106 S0')\">Off</button>"
-        "<button onclick=\"gc('M106 S64')\">25%%</button>"
-        "<button onclick=\"gc('M106 S128')\">50%%</button>"
-        "<button onclick=\"gc('M106 S191')\">75%%</button>"
-        "<button onclick=\"gc('M106 S255')\">100%%</button>"
-        "</div></div></details>");
-
-    html_buf_printf(&p,
-        "<div style='text-align:center;margin:12px 0'>"
-        "<img id='cam' src='/capture' style='max-width:100%%;border-radius:4px;background:#000' alt='Camera'>"
-        "</div>"
-        "<canvas id='tc' width='600' height='200' style='width:100%%;max-width:600px;display:block;margin:8px auto;background:#1a1a2e;border-radius:4px'></canvas>");
-
-    html_buf_printf(&p,
-        "<script>"
-        "var cam=document.getElementById('cam');"
-        "setInterval(function(){cam.src='/capture?'+Date.now()},5000);"
-        /* gc() — send GCode via /api/command */
-        "function gc(c){fetch('/api/command',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'cmd='+encodeURIComponent(c)})}"
-        "var zoff=%.2f;"
-        "function zb(d){zoff=Math.round((zoff+d)*100)/100;gc('M290 Z'+d);document.getElementById('zof').textContent=zoff.toFixed(2)}",
-        s_baby_z);
-    html_buf_printf(&p,
-        /* Step selector for jog */
-        "var step=0.1;"
-        "function setStep(v){step=v;['s01','s1','s10','s100'].forEach(function(id){document.getElementById(id).style.fontWeight='normal'});"
-        "document.getElementById(v==0.1?'s01':v==1?'s1':v==10?'s10':'s100').style.fontWeight='bold'}"
-        /* Jog function — relative move */
-        "var isPrinting=false;"
-        "function jog(ax,dir){if(isPrinting)return;"
-        "var d=step*dir;var f=ax=='Z'?600:3000;gc('G91\\nG0 '+ax+d+' F'+f+'\\nG90')}"
-        /* Extruder — two speed modes: normal 300mm/min, slow 60mm/min */
-        "var espd=0;"
-        "function setESpd(m){espd=m;document.getElementById('esn').style.fontWeight=m?'normal':'bold';"
-        "document.getElementById('ess').style.fontWeight=m?'bold':'normal'}"
-        "function extrude(dir){if(isPrinting)return;"
-        "var d=step*dir;var f=espd?60:300;gc('M83\\nG1 E'+d+' F'+f+'\\nM82')}"
-        /* Speed/flow adjusters */
-        "var vals={spd:100,flw:100};"
-        "function adj(k,d){vals[k]+=d;"
-        "if(k=='spd'){if(vals[k]<50)vals[k]=50;if(vals[k]>200)vals[k]=200;gc('M220 S'+vals[k])}"
-        "if(k=='flw'){if(vals[k]<75)vals[k]=75;if(vals[k]>150)vals[k]=150;gc('M221 S'+vals[k])}"
-        "document.getElementById(k).textContent=vals[k]+'%%'}"
-        /* Status polling — update controls state */
-        "function u(){"
-        "fetch('/api/status').then(function(r){return r.json()}).then(function(s){"
-        "isPrinting=s.state=='printing'||s.state=='paused';"
-        "['xm','xp','ym','yp','zm','zp','er','ee','ha','hx','hy','hz'].forEach(function(id){var b=document.getElementById(id);if(b)b.disabled=isPrinting});"
-        "if(typeof s.baby_z==='number'){zoff=s.baby_z;document.getElementById('zof').textContent=zoff.toFixed(2)}"
-        "var hi=document.getElementById('ht'),bi=document.getElementById('bt');"
-        "if(hi&&document.activeElement!==hi)hi.value=s.hotend[1]>0?s.hotend[1].toFixed(0):'';"
-        "if(bi&&document.activeElement!==bi)bi.value=s.bed[1]>0?s.bed[1].toFixed(0):'';"
-        "}).catch(function(){})}"
-        "u();setInterval(u,2000);"
-        "</script>"
-        "<script>"
-        "var cv=document.getElementById('tc'),cx=cv.getContext('2d');"
-        "function drawChart(d){"
-        "var W=cv.width,H=cv.height,pad=40,r=pad,b=H-25,t=10,w=W-pad-r;"
-        "if(!d.length)return;"
-        "cx.clearRect(0,0,W,H);"
-        /* compute time range and temp range */
-        "var t0=d[0][0],t1=d[d.length-1][0];"
-        "if(t1<=t0)t1=t0+1;"
-        "var mn=999,mx=0;"
-        "for(var i=0;i<d.length;i++){for(var j=1;j<5;j++){if(d[i][j]>0){if(d[i][j]<mn)mn=d[i][j];if(d[i][j]>mx)mx=d[i][j]}}}"
-        "if(mn>=mx){mn=0;mx=100;}"
-        "mn=Math.floor(mn/10)*10;mx=Math.ceil(mx/10)*10;"
-        "if(mx-mn<20)mx=mn+20;"
-        /* grid lines */
-        "cx.strokeStyle='#333';cx.lineWidth=0.5;cx.font='10px sans-serif';cx.fillStyle='#888';"
-        "var steps=5;for(var i=0;i<=steps;i++){"
-        "var y=b-(b-t)*i/steps,v=mn+(mx-mn)*i/steps;"
-        "cx.beginPath();cx.moveTo(r,y);cx.lineTo(r+w,y);cx.stroke();"
-        "cx.fillText(v.toFixed(0),2,y+3);}"
-        /* x-axis: minutes ago */
-        "cx.fillStyle='#888';"
-        "var dur=t1-t0;var xsteps=Math.min(6,Math.floor(dur/60));"
-        "if(xsteps<1)xsteps=1;"
-        "for(var i=0;i<=xsteps;i++){"
-        "var x=r+w*i/xsteps,sec=dur*i/xsteps;"
-        "cx.fillText('-'+(dur-sec>=60?Math.round((dur-sec)/60)+'m':Math.round(dur-sec)+'s'),x-8,H-4);}"
-        /* draw lines: [he_act=red, he_tgt=red dash, bed_act=blue, bed_tgt=blue dash] */
-        "var colors=['#ff4444','#ff4444','#4488ff','#4488ff'];"
-        "var dashes=[[],[5,4],[],[5,4]];"
-        "for(var li=0;li<4;li++){"
-        "cx.strokeStyle=colors[li];cx.lineWidth=li%%2?1:1.5;cx.setLineDash(dashes[li]);"
-        "cx.beginPath();"
-        "for(var i=0;i<d.length;i++){"
-        "var x=r+((d[i][0]-t0)/(t1-t0))*w;"
-        "var y=b-((d[i][li+1]-mn)/(mx-mn))*(b-t);"
-        "if(i==0)cx.moveTo(x,y);else cx.lineTo(x,y);}"
-        "cx.stroke();cx.setLineDash([]);}"
-        /* legend */
-        "var lx=r+6,ly=t+10;"
-        "var lbl=['HE','HE tgt','Bed','Bed tgt'];"
-        "for(var i=0;i<4;i++){"
-        "cx.strokeStyle=colors[i];cx.lineWidth=i%%2?1:1.5;cx.setLineDash(dashes[i]);"
-        "cx.beginPath();cx.moveTo(lx,ly);cx.lineTo(lx+16,ly);cx.stroke();cx.setLineDash([]);"
-        "cx.fillStyle=colors[i];cx.fillText(lbl[i],lx+19,ly+3);lx+=60;}"
-        "}"
-        "function fetchTemp(){"
-        "fetch('/api/temp_history').then(function(r){return r.json()}).then(function(j){"
-        "drawChart(j.samples)}).catch(function(){})}"
-        "fetchTemp();setInterval(fetchTemp,15000);"
-        "</script>");
-
-    layout_html_end(&p);
-
-    httpd_resp_set_type(req, "text/html");
-    esp_err_t ret = httpd_resp_send(req, p.data, p.len);
-    html_buf_free(&p);
-    return ret;
+    /* Ender Smart (F4-07): the old dashboard was removed; "/" opens the new UI */
+    return app_handler(req);
 }
 
 /* ---- /settings handler ---- */
 
 static esp_err_t settings_get_handler(httpd_req_t *req)
 {
-    html_buf_t p;
-    html_buf_init(&p);
-
-    layout_html_begin(&p, "Settings", "/settings");
-
-    const char *ip = wifi_get_ip_str();
-    bool is_marlin = (printer_comm_get_backend() == PRINTER_BACKEND_MARLIN);
-
-    /* 1. Printer (backend selection) */
-    html_buf_printf(&p,
-        "<div class='sh' style='margin-top:16px'><h2>Printer</h2>"
-        "<button type='submit' form='f-printer'>Save &amp; Reboot</button></div>");
-    printer_config_render_backend(&p);
-
-    /* 2. Marlin (conditionally visible) */
-    if (is_marlin) {
-        html_buf_printf(&p,
-            "<hr><div class='sh'><h2>Marlin</h2>"
-            "<button type='submit' form='f-marlin'>Save</button></div>");
-        printer_config_render_marlin(&p);
-    }
-
-    /* 3. Video (camera + streaming) */
-    bool rot = camera_get_rotate180();
-    int xclk = camera_get_xclk_mhz();
-    const char *jh = obico_get_janus_host();
-    uint16_t jp = obico_get_janus_port();
-    html_buf_printf(&p,
-        "<hr><div class='sh'><h2>Video</h2>"
-        "<button type='submit' form='f-video'>Save</button></div>"
-        "<form id='f-video' method='POST' action='/video/config'>"
-        "<label><input type='checkbox' name='rotate180' value='1'%s> Rotate 180&deg;</label>"
-        "<div style='margin:8px 0'><label>XCLK: "
-        "<select name='xclk'>"
-        "<option value='10'%s>10 MHz (safe)</option>"
-        "<option value='12'%s>12 MHz</option>"
-        "<option value='16'%s>16 MHz</option>"
-        "<option value='20'%s>20 MHz (fast)</option>"
-        "</select></label>"
-        " <span class='hint'>Reboot to apply</span></div>"
-        "<p style='margin:12px 0 4px;font-weight:bold'>Janus Proxy (WebRTC streaming)</p>"
-        "<label>Host<br><input type='text' name='janus_host' value='%s' placeholder='192.168.1.x' "
-        "style='padding:8px;width:100%%;box-sizing:border-box;margin:4px 0'></label>"
-        "<label>Port<br><input type='number' name='janus_port' value='%u' min='1' max='65535' "
-        "style='padding:8px;width:100%%;box-sizing:border-box;margin:4px 0'></label>"
-        "<p class='hint'>Leave host empty to disable Janus proxy.</p>"
-        "</form>",
-        rot ? " checked" : "",
-        xclk == 10 ? " selected" : "",
-        xclk == 12 ? " selected" : "",
-        xclk == 16 ? " selected" : "",
-        xclk == 20 ? " selected" : "",
-        jh, (unsigned)jp);
-
-    /* 4. Obico */
-    if (obico_is_linked()) {
-        html_buf_printf(&p,
-            "<hr><div class='sh'><h2>Obico</h2>"
-            "<button type='submit' form='f-obico' class='btn-red' "
-            "onclick=\"return confirm('Unlink from Obico?')\">Unlink</button></div>");
-    } else {
-        html_buf_printf(&p,
-            "<hr><div class='sh'><h2>Obico</h2>"
-            "<button type='submit' form='f-obico' class='btn-green'>Link</button></div>");
-    }
-    obico_render_settings(&p);
-
-    /* 5. External Endpoints (read-only) */
-    html_buf_printf(&p,
-        "<hr><h2>External Endpoints</h2>"
-        "<p class='hint'>"
-        "MJPEG Stream: <a href='/stream'>http://%s/stream</a><br>"
-        "Snapshot: <a href='/capture'>http://%s/capture</a>",
-        ip, ip);
-    if (is_marlin) {
-        html_buf_printf(&p,
-            "<br>RFC 2217: <code>rfc2217://%s:%d</code>",
-            ip, CONFIG_RFC2217_PORT);
-    }
-    html_buf_printf(&p, "</p>");
-
-    /* 6. Device */
-    const char *hostname = wifi_get_hostname();
-    html_buf_printf(&p,
-        "<hr><div class='sh'><h2>Device</h2>"
-        "<button type='submit' form='f-device'>Save &amp; Reboot</button></div>"
-        "<form id='f-device' method='POST' action='/device/config'>"
-        "<label>Hostname<br>"
-        "<input type='text' name='hostname' value='%s' maxlength='31' "
-        "pattern='[a-zA-Z][a-zA-Z0-9-]*' "
-        "title='Letters, digits, hyphens. Must start with a letter.' "
-        "style='padding:8px;width:100%%;box-sizing:border-box;margin:4px 0'>"
-        "</label>"
-        "<p class='hint'>Visible on router and as <b>%s.local</b> via mDNS.</p>"
-        "</form>",
-        hostname, hostname);
-
-    /* 7. Firmware Update (OTA) */
-    ota_render_settings(&p);
-
-    /* 8. WiFi */
-    char ssid[33] = {0};
-    html_buf_printf(&p,
-        "<hr><div class='sh'><h2>WiFi</h2>"
-        "<form id='f-wifi' method='POST' action='/wifi/reset'>"
-        "<button type='submit' class='btn-red' "
-        "onclick=\"return confirm('Reset WiFi credentials and reboot?')\">Reset WiFi</button>"
-        "</form></div>");
-    if (wifi_get_ssid(ssid, sizeof(ssid))) {
-        html_buf_printf(&p,
-            "<p>Connected to: <b>%s</b></p>", ssid);
-    }
-
-    layout_html_end(&p);
-
-    httpd_resp_set_type(req, "text/html");
-    esp_err_t ret = httpd_resp_send(req, p.data, p.len);
-    html_buf_free(&p);
-    return ret;
+    /* Ender Smart (F4-07): the old page was removed; its screen in the new UI */
+    return httpd_redirect_app(req, "config");
 }
 
 /* ---- /camera handler ---- */
 
 static esp_err_t utils_page_handler(httpd_req_t *req)
 {
-    html_buf_t p;
-    html_buf_init(&p);
-    layout_html_begin(&p, "Utilities", "/utils");
-    html_buf_printf(&p,
-        "<h2>Utilities</h2>"
-        "<table>"
-        "<tr><td><a href='/bedlevel'><b>Bed Leveling</b></a></td>"
-        "<td>Probe bed mesh, visualize, and calculate screw adjustments</td></tr>"
-        "</table>");
-    layout_html_end(&p);
-
-    httpd_resp_set_type(req, "text/html");
-    esp_err_t ret = httpd_resp_send(req, p.data, p.len);
-    html_buf_free(&p);
-    return ret;
+    /* Ender Smart (F4-07): the old page was removed; its screen in the new UI */
+    return httpd_redirect_app(req, "sistema");
 }
 
 static esp_err_t camera_page_handler(httpd_req_t *req)
 {
-    int bright, contrast, sat, ae;
-    camera_get_image_params(&bright, &contrast, &sat, &ae);
-
-    html_buf_t p;
-    html_buf_init(&p);
-
-    layout_html_begin(&p, "Camera", "/camera");
-    html_buf_printf(&p,
-        "<style>"
-        ".cam-ctl{margin:12px 0;font-size:14px}"
-        ".cam-ctl label{display:inline-block;width:90px}"
-        ".cam-ctl input[type=range]{width:140px;vertical-align:middle}"
-        ".cam-ctl .val{display:inline-block;width:24px;text-align:center}"
-        "</style>"
-        "<div style='text-align:center'>"
-        "<img src='/stream' style='max-width:100%%;border-radius:4px;background:#000' alt='MJPEG Stream'>"
-        "</div>"
-        "<details open>"
-        "<summary>Image Settings</summary>"
-        "<div class='cam-ctl'><label>Brightness</label>"
-        "<input type='range' min='-2' max='2' value='%d' id='s-br' oninput='camUpd(this,\"vbr\")'>"
-        "<span class='val' id='vbr'>%d</span></div>"
-        "<div class='cam-ctl'><label>Contrast</label>"
-        "<input type='range' min='-2' max='2' value='%d' id='s-co' oninput='camUpd(this,\"vco\")'>"
-        "<span class='val' id='vco'>%d</span></div>"
-        "<div class='cam-ctl'><label>Saturation</label>"
-        "<input type='range' min='-2' max='2' value='%d' id='s-sa' oninput='camUpd(this,\"vsa\")'>"
-        "<span class='val' id='vsa'>%d</span></div>"
-        "<div class='cam-ctl'><label>AE Level</label>"
-        "<input type='range' min='-2' max='2' value='%d' id='s-ae' oninput='camUpd(this,\"vae\")'>"
-        "<span class='val' id='vae'>%d</span></div>"
-        "</details>"
-        "<script>"
-        "function camUpd(el,vid){"
-        "document.getElementById(vid).textContent=el.value;"
-        "fetch('/camera/settings',{method:'POST',"
-        "headers:{'Content-Type':'application/x-www-form-urlencoded'},"
-        "body:'brightness='+document.getElementById('s-br').value"
-        "+'&contrast='+document.getElementById('s-co').value"
-        "+'&saturation='+document.getElementById('s-sa').value"
-        "+'&ae_level='+document.getElementById('s-ae').value})}"
-        "</script>",
-        bright, bright, contrast, contrast, sat, sat, ae, ae);
-    layout_html_end(&p);
-
-    httpd_resp_set_type(req, "text/html");
-    esp_err_t ret = httpd_resp_send(req, p.data, p.len);
-    html_buf_free(&p);
-    return ret;
+    /* Ender Smart (F4-07): the old page was removed; its screen in the new UI */
+    return httpd_redirect_app(req, "camera");
 }
 
 static esp_err_t camera_settings_post_handler(httpd_req_t *req)

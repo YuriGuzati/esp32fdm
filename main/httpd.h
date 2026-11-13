@@ -23,6 +23,9 @@
  */
 esp_err_t httpd_start_server(void);
 
+/** Ender Smart (F4-07): 302 to "/app#<screen>" — the old pages now open the new UI. */
+esp_err_t httpd_redirect_app(httpd_req_t *req, const char *screen);
+
 /**
  * Start a captive portal HTTP server for WiFi configuration.
  * Only GET / (config form), POST / (save + reboot), and wildcard redirect.

@@ -112,7 +112,6 @@ typedef enum { FILTER_ALL, FILTER_PRINTER, FILTER_SYSTEM, FILTER_HEAP } log_filt
 typedef struct {
     httpd_req_t *req;
     log_filter_t filter;
-    bool text;          /* Ender Smart (Fase 4): ?format=text → plain text for the new UI */
     int tail;           /* ?tail=N → only the last N bytes (0 = all) */
 } logs_ctx_t;
 
@@ -145,8 +144,8 @@ static void logs_task(void *arg)
         xSemaphoreGive(s_mutex);
     }
 
-    bool text = ctx->text;
-    httpd_resp_set_type(req, text ? "text/plain; charset=utf-8" : "text/html");
+    /* Ender Smart (F4-07): always plain text; the old HTML page went with the old UI */
+    httpd_resp_set_type(req, "text/plain; charset=utf-8");
 
     /* Only the last N bytes, starting at a line boundary */
     int first_pos = 0;
@@ -154,47 +153,6 @@ static void logs_task(void *arg)
         first_pos = snap_len - ctx->tail;
         while (first_pos < snap_len && snap[first_pos] != '\n') first_pos++;
         if (first_pos < snap_len) first_pos++;
-    }
-
-    if (!text) {
-    /* HTML header via layout */
-    html_buf_t page;
-    html_buf_init(&page);
-    layout_html_begin(&page, "Logs", "/logs");
-
-    /* Filter buttons */
-    html_buf_printf(&page,
-        "<div style='margin:12px 0'>"
-        "<b>Filter:</b> ");
-    if (filter == FILTER_ALL)
-        html_buf_printf(&page, "<b>[All]</b> ");
-    else
-        html_buf_printf(&page, "<a href='/logs'>All</a> ");
-    if (filter == FILTER_PRINTER)
-        html_buf_printf(&page, "<b>[Printer]</b> ");
-    else
-        html_buf_printf(&page, "<a href='/logs?filter=printer'>Printer</a> ");
-    if (filter == FILTER_SYSTEM)
-        html_buf_printf(&page, "<b>[System]</b> ");
-    else
-        html_buf_printf(&page, "<a href='/logs?filter=system'>System</a> ");
-    if (filter == FILTER_HEAP)
-        html_buf_printf(&page, "<b>[Heap]</b> ");
-    else
-        html_buf_printf(&page, "<a href='/logs?filter=heap'>Heap</a> ");
-    html_buf_printf(&page,
-        " | <form method='POST' action='/logs/clear' style='display:inline'>"
-        "<button type='submit' onclick=\"return confirm('Clear all logs?')\">"
-        "Clear</button></form>");
-    html_buf_printf(&page, "</div>"
-        "<pre style='background:#1e1e1e;color:#d4d4d4;padding:12px;"
-        "font-size:13px;border-radius:4px;white-space:pre-wrap;word-wrap:break-word;"
-        "max-height:70vh;overflow-y:auto' id='log'>");
-
-    /* Send header */
-    if (httpd_resp_send_chunk(req, page.data, page.len) != ESP_OK)
-        send_ok = false;
-    html_buf_free(&page);
     }
 
     /* Stream log lines from snapshot.
@@ -222,45 +180,14 @@ static void logs_task(void *arg)
                 if (filter == FILTER_HEAP && !heap) continue;
             }
 
-            /* HTML-escape into the shared chunk buffer: we need to escape <, >, & */
+            /* Copy into the shared chunk buffer */
             for (int i = line_start; i < line_start + line_len && send_ok; i++) {
-                char c = snap[i];
-                if (text) {
-                    if (ci + 1 > (int)sizeof(chunk)) {
-                        if (httpd_resp_send_chunk(req, chunk, ci) != ESP_OK)
-                            send_ok = false;
-                        ci = 0;
-                    }
-                    chunk[ci++] = c;
-                } else if (c == '<') {
-                    if (ci + 4 > (int)sizeof(chunk)) {
-                        if (httpd_resp_send_chunk(req, chunk, ci) != ESP_OK)
-                            send_ok = false;
-                        ci = 0;
-                    }
-                    memcpy(chunk + ci, "&lt;", 4); ci += 4;
-                } else if (c == '>') {
-                    if (ci + 4 > (int)sizeof(chunk)) {
-                        if (httpd_resp_send_chunk(req, chunk, ci) != ESP_OK)
-                            send_ok = false;
-                        ci = 0;
-                    }
-                    memcpy(chunk + ci, "&gt;", 4); ci += 4;
-                } else if (c == '&') {
-                    if (ci + 5 > (int)sizeof(chunk)) {
-                        if (httpd_resp_send_chunk(req, chunk, ci) != ESP_OK)
-                            send_ok = false;
-                        ci = 0;
-                    }
-                    memcpy(chunk + ci, "&amp;", 5); ci += 5;
-                } else {
-                    if (ci + 1 > (int)sizeof(chunk)) {
-                        if (httpd_resp_send_chunk(req, chunk, ci) != ESP_OK)
-                            send_ok = false;
-                        ci = 0;
-                    }
-                    chunk[ci++] = c;
+                if (ci + 1 > (int)sizeof(chunk)) {
+                    if (httpd_resp_send_chunk(req, chunk, ci) != ESP_OK)
+                        send_ok = false;
+                    ci = 0;
                 }
+                chunk[ci++] = snap[i];
             }
         }
     }
@@ -270,17 +197,6 @@ static void logs_task(void *arg)
     }
 
     if (send_ok) {
-        if (!text) {
-        /* HTML footer */
-        html_buf_t foot;
-        html_buf_init(&foot);
-        html_buf_printf(&foot, "</pre>"
-            "<script>var e=document.getElementById('log');e.scrollTop=e.scrollHeight;</script>");
-        layout_html_end(&foot);
-        httpd_resp_send_chunk(req, foot.data, foot.len);
-        html_buf_free(&foot);
-        }
-
         /* End chunked response */
         httpd_resp_send_chunk(req, NULL, 0);
     }
@@ -306,7 +222,6 @@ static esp_err_t logs_handler(httpd_req_t *req)
 
     /* Parse filter from query string (before async clone) */
     log_filter_t filter = FILTER_ALL;
-    bool text = false;
     int tail = 0;
     char qbuf[96] = {0};
     if (httpd_req_get_url_query_str(req, qbuf, sizeof(qbuf)) == ESP_OK) {
@@ -316,8 +231,7 @@ static esp_err_t logs_handler(httpd_req_t *req)
             else if (strcmp(val, "system") == 0) filter = FILTER_SYSTEM;
             else if (strcmp(val, "heap") == 0) filter = FILTER_HEAP;
         }
-        if (httpd_query_key_value(qbuf, "format", val, sizeof(val)) == ESP_OK)
-            text = (strcmp(val, "text") == 0);
+        /* "format=text" is still accepted: plain text is now the only format */
         if (httpd_query_key_value(qbuf, "tail", val, sizeof(val)) == ESP_OK)
             tail = atoi(val);
     }
@@ -337,7 +251,6 @@ static esp_err_t logs_handler(httpd_req_t *req)
     }
     ctx->req = async_req;
     ctx->filter = filter;
-    ctx->text = text;
     ctx->tail = tail;
 
     /* 6KB stack: 1KB chunk buf + html_buf + PSRAM snapshot pointer */

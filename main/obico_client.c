@@ -891,10 +891,8 @@ void obico_render_settings(html_buf_t *p)
 
 static esp_err_t obico_link_get_handler(httpd_req_t *req)
 {
-    /* Redirect to unified settings page */
-    httpd_resp_set_status(req, "302 Found");
-    httpd_resp_set_hdr(req, "Location", "/settings");
-    return httpd_resp_send(req, NULL, 0);
+    /* Ender Smart (F4-07): the old page was removed; its screen in the new UI */
+    return httpd_redirect_app(req, "config");
 }
 
 static esp_err_t obico_link_post_handler(httpd_req_t *req)
