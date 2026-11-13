@@ -24,7 +24,8 @@ static const char *TAG = "host_print";
 #define PARK_X       0.0f
 #define PARK_Y       0.0f
 #define PARK_Z_LIFT  5.0f    /* mm to lift Z on pause */
-#define PARK_RETRACT 2.0f    /* mm filament retract on pause */
+/* Ender Smart (lote 6): the retract (default 6.5 mm) and the nozzle temperature while
+ * paused (default 170 C) are settings now: printer_comm_pause_retract_mm()/_temp_c(). */
 
 /* ---- Host print state ---- */
 
@@ -72,6 +73,15 @@ typedef struct {
     float park_e;              /* logical E at pause (for G92 E in absolute mode) */
     float saved_hotend, saved_bed;  /* targets at pause, reheated on resume */
 
+    /* Ender Smart (lote 6): what the pause really did, so the resume undoes exactly that */
+    bool counter_unsure;       /* a numbered sequence command failed: resync before the next */
+    bool user_wait;            /* the Ender answered "paused for user" during a sequence */
+    int resync_fails;          /* failed M110 resyncs in a row (hp_tick gives up at 3) */
+    bool pos_known;            /* park_x/y/z/e came from a fresh M114 answer */
+    bool park_lifted;          /* the Z lift got its "ok" */
+    float park_retracted;      /* mm retracted with an "ok" (0 = none) */
+    bool expect_layers;        /* the file has ;LAYER: / ;LAYER_CHANGE markers */
+
     /* Ender Smart (F15-06/07): reasons to stop streaming */
     volatile bool printer_reset;   /* Marlin boot banner seen */
     volatile bool usb_lost;        /* USB dropped during the job */
@@ -103,6 +113,64 @@ static void hp_clear_error(void)
     }
     g_state.error_msg[0] = '\0';
     xSemaphoreGive(g_state_mutex);
+}
+
+/** Ender Smart (lote 6): a warning shown while the job is still on (empty string = none). */
+static void hp_set_notice(const char *msg)
+{
+    xSemaphoreTake(g_state_mutex, portMAX_DELAY);
+    strncpy(g_state.notice, msg, sizeof(g_state.notice) - 1);
+    g_state.notice[sizeof(g_state.notice) - 1] = '\0';
+    xSemaphoreGive(g_state_mutex);
+    if (msg[0]) ESP_LOGW(TAG, "%s", msg);
+}
+
+/** Ender Smart (lote 6): one command of a pause/resume/cancel sequence, result checked.
+ *  The old sequences ignored the result, and a command dropped while the printer was
+ *  busy left the nozzle on the part with the screen showing "Pausado" (2026-11-12). */
+/** Checks shared by hp_seq() and hp_num() after the "ok". */
+static bool hp_seq_checks(const char *gcode, uint32_t unk0, uint32_t usr0)
+{
+    if (s_busy_user_seq != usr0) {
+        /* "busy: paused for user" (M0/M600 on the Ender): the command was only queued */
+        s_hp.user_wait = true;
+        ESP_LOGE(TAG, "The printer is waiting for someone at its screen: %s not done", gcode);
+        return false;
+    }
+    if (s_unknown_seq != unk0) {
+        /* Marlin answers "Unknown command" and then "ok" when a line arrives damaged:
+         * the "ok" alone does not mean the command was done */
+        ESP_LOGE(TAG, "The printer did not understand %s", gcode);
+        return false;
+    }
+    return true;
+}
+
+/** Unnumbered: for heaters off, the interrupt (line counter unknown after a printer
+ *  reset) and the commands after the counter reset. */
+static bool hp_seq(const char *gcode)
+{
+    if (!marlin_is_connected()) return false;
+    marlin_drain_rx();               /* old lines must not count as this command's answer */
+    uint32_t unk0 = s_unknown_seq, usr0 = s_busy_user_seq;
+    s_send_patient = true;           /* wait for a busy printer instead of being refused */
+    bool ok = marlin_send_cmd(gcode, QUERY_CMD);
+    s_send_patient = false;
+    if (!ok) {
+        ESP_LOGE(TAG, "No \"ok\" from the printer for %s", gcode);
+        return false;
+    }
+    return hp_seq_checks(gcode, unk0, usr0);
+}
+
+/** Same, tried again: only for commands that are safe to repeat (heaters off). */
+static bool hp_seq_retry(const char *gcode, int tries)
+{
+    for (int i = 0; i < tries; i++) {
+        if (hp_seq(gcode)) return true;
+        if (!marlin_is_connected() || s_hp.user_wait) return false;
+    }
+    return false;
 }
 
 /** Ender Smart (F3-06): add the job that is ending to the print history. */
@@ -199,7 +267,8 @@ static bool is_long_running_cmd(const char *gcode)
     }
     if (*p == 'M' || *p == 'm') {
         int code = atoi(p + 1);
-        return (code == 109 || code == 190 || code == 116);
+        /* Ender Smart (lote 6): M400 waits for every queued move */
+        return (code == 109 || code == 190 || code == 116 || code == 400);
     }
     return false;
 }
@@ -300,12 +369,57 @@ static bool send_query_numbered(const char *gcode)
 
 /* ---- Host print lifecycle ---- */
 
-/** Save position, E and temperatures, then park the head (F15-09). */
-static void host_print_park(void)
+/** Ender Smart (lote 6): a pause/resume/cancel command sent NUMBERED and with a checksum,
+ *  in the job's own line sequence like the file lines. A byte lost on the USB then gets a
+ *  "Resend" instead of being run as a different but still valid command (a lost digit can
+ *  turn "G1 Z25.3" into "G1 Z5.3"). After a failure the printer's line number is not
+ *  known, so it is set again (unnumbered M110) before the next numbered command. */
+static bool hp_num(const char *gcode)
+{
+    if (!marlin_is_connected()) return false;
+    /* A restart or a request for an old line is exactly what the numbering detects:
+     * never paper over it with an M110 (hp_tick interrupts the job instead). And once the
+     * Ender waits for someone at its screen, nothing more is queued behind that. */
+    if (s_hp.printer_reset || s_hp.desync || s_hp.usb_lost || s_hp.user_wait) return false;
+    if (s_hp.counter_unsure) {
+        char m110[24];
+        snprintf(m110, sizeof(m110), "M110 N%ld", (long)(s_hp.marlin_line - 1));
+        if (!hp_seq(m110)) return false;
+        s_hp.counter_unsure = false;
+    }
+    ESP_LOGI(TAG, "Seq N%ld: %s", (long)s_hp.marlin_line, gcode);
+    marlin_drain_rx();               /* old lines must not count as this command's answer */
+    uint32_t unk0 = s_unknown_seq, usr0 = s_busy_user_seq;
+    s_send_patient = true;           /* wait for a busy printer instead of being refused */
+    bool ok = send_query_numbered(gcode);
+    s_send_patient = false;
+    if (!ok) {
+        s_hp.counter_unsure = true;
+        ESP_LOGE(TAG, "No \"ok\" from the printer for %s", gcode);
+        return false;
+    }
+    return hp_seq_checks(gcode, unk0, usr0);
+}
+
+/** Save position, E and temperatures, then park the head (F15-09).
+ *  Ender Smart (lote 6): every command is checked, and only what got an "ok" is recorded,
+ *  so the resume undoes exactly that. The head only moves to the corner after the lift
+ *  and with a confirmed position, never at the height of the part. On 2026-11-12 the
+ *  1st pause sent only M400 and M114: the rest was dropped after a "busy:" and the
+ *  nozzle stayed on the part. Returns false (and what failed) if the park is incomplete. */
+static bool host_print_park(char *failed, size_t failed_len)
 {
     char buf[64];
-    marlin_send_cmd("M400", QUERY_CMD);           /* Wait for moves to finish first */
-    marlin_send_cmd("M114", QUERY_M114);          /* ... so the position is the real one */
+    failed[0] = '\0';
+    s_hp.user_wait = false;
+    s_hp.pos_known = false;
+    s_hp.park_lifted = false;
+    s_hp.park_retracted = 0.0f;
+
+    /* Wait for every queued move, then read the real position */
+    uint32_t seq0 = s_m114_seq;
+    if (hp_num("M400") && hp_num("M114") && s_m114_seq != seq0)
+        s_hp.pos_known = true;
 
     xSemaphoreTake(g_state_mutex, portMAX_DELAY);
     s_hp.park_x = g_state.x;
@@ -316,66 +430,157 @@ static void host_print_park(void)
     s_hp.saved_bed = g_state.bed_target;
     xSemaphoreGive(g_state_mutex);
 
-    ESP_LOGI(TAG, "Parking from X%.2f Y%.2f Z%.2f E%.3f (%s, E %s, F%.0f, %.0f/%.0f C)",
+    ESP_LOGI(TAG, "Parking from X%.2f Y%.2f Z%.2f E%.3f%s (%s, E %s, F%.0f, %.0f/%.0f C)",
              s_hp.park_x, s_hp.park_y, s_hp.park_z, s_hp.park_e,
+             s_hp.pos_known ? "" : " [position NOT confirmed]",
              s_hp.abs_xyz ? "G90" : "G91", s_hp.abs_e ? "M82" : "M83", s_hp.last_f,
              s_hp.saved_hotend, s_hp.saved_bed);
 
-    marlin_send_cmd("M83", QUERY_CMD);            /* Relative E just for the retract */
-    snprintf(buf, sizeof(buf), "G1 E-%.1f F2400", PARK_RETRACT);
-    marlin_send_cmd(buf, QUERY_CMD);
-    marlin_send_cmd("G91", QUERY_CMD);
-    snprintf(buf, sizeof(buf), "G1 Z%.1f F600", PARK_Z_LIFT);
-    marlin_send_cmd(buf, QUERY_CMD);              /* Lift Z */
-    marlin_send_cmd("G90", QUERY_CMD);
-    if (s_hp.homed) {
-        /* Absolute park target only after homing (position known) */
-        snprintf(buf, sizeof(buf), "G1 X%.1f Y%.1f F6000", PARK_X, PARK_Y);
-        marlin_send_cmd(buf, QUERY_CMD);          /* Park at corner */
+    /* 1. Retract (relative E just for this). Not with a cold nozzle: Marlin refuses it
+     *    ("cold extrusion prevented"), and that line makes the job be cancelled. */
+    float retract = printer_comm_pause_retract_mm();
+    float nozzle;
+    xSemaphoreTake(g_state_mutex, portMAX_DELAY);
+    nozzle = g_state.hotend_actual;
+    xSemaphoreGive(g_state_mutex);
+    if (retract > 0.0f && nozzle >= 175.0f) {
+        snprintf(buf, sizeof(buf), "G1 E-%.2f F2400", retract);
+        if (hp_num("M83") && hp_num(buf))
+            s_hp.park_retracted = retract;
+        else
+            snprintf(failed, failed_len, "recolher o filamento");
     }
+
+    /* 2. Lift Z off the part: the most important step, done even if the retract failed.
+     *    With a confirmed position the lift is an absolute move, so a damaged G91 can
+     *    never turn "up 5 mm" into "go to Z5" inside a taller part. */
+    bool absolute;
+    if (s_hp.pos_known) {
+        snprintf(buf, sizeof(buf), "G1 Z%.2f F600", s_hp.park_z + PARK_Z_LIFT);
+        absolute = hp_num("G90");
+        if (absolute && hp_num(buf))
+            s_hp.park_lifted = true;
+        else if (!failed[0])
+            snprintf(failed, failed_len, "subir o bico");
+    } else {
+        snprintf(buf, sizeof(buf), "G1 Z%.1f F600", PARK_Z_LIFT);
+        if (hp_num("G91") && hp_num(buf))
+            s_hp.park_lifted = true;
+        else if (!failed[0])
+            snprintf(failed, failed_len, "subir o bico");
+        absolute = hp_num("G90");
+    }
+
+    /* 3. Corner: only lifted, homed, in absolute mode and with a position to return to */
+    if (s_hp.park_lifted && s_hp.homed && s_hp.pos_known && absolute) {
+        snprintf(buf, sizeof(buf), "G1 X%.1f Y%.1f F6000", PARK_X, PARK_Y);
+        if (!hp_num(buf) && !failed[0])
+            snprintf(failed, failed_len, "levar a cabeça para o canto");
+    } else if (!s_hp.pos_known && !failed[0]) {
+        snprintf(failed, failed_len, "ler a posição (M114)");
+    }
+
+    /* 4. Lower the nozzle temperature while paused: stops the ooze. Not critical (the
+     *    resume waits for the print temperature anyway), so a failure is only logged. */
+    int standby = printer_comm_pause_temp_c();
+    if (standby > 0 && s_hp.saved_hotend > (float)standby) {
+        snprintf(buf, sizeof(buf), "M104 S%d", standby);
+        if (hp_num(buf))
+            ESP_LOGI(TAG, "Nozzle at %d C while paused (print %.0f C)", standby, s_hp.saved_hotend);
+    }
+    return failed[0] == '\0';
 }
 
 /** Reheat, restore position, prime, then restore the file's modes, E and F (F15-09).
- *  The old code forced M83 at the end, which broke files with absolute E (Cura default). */
-static void host_print_unpark(void)
+ *  The old code forced M83 at the end, which broke files with absolute E (Cura default).
+ *  Ender Smart (lote 6): every step is checked; on a failure the job stays paused and the
+ *  steps already done are not repeated on the next attempt (moves are absolute). */
+static bool host_print_unpark(char *failed, size_t failed_len)
 {
     char buf[64];
+    failed[0] = '\0';
+    s_hp.user_wait = false;
 
     /* Reheat and WAIT before touching the part or priming */
     if (s_hp.saved_bed > 0.0f) {
         snprintf(buf, sizeof(buf), "M140 S%.0f", s_hp.saved_bed);
-        marlin_send_cmd(buf, QUERY_CMD);
+        hp_num(buf);
     }
     if (s_hp.saved_hotend > 0.0f) {
         snprintf(buf, sizeof(buf), "M109 S%.0f", s_hp.saved_hotend);
         ESP_LOGI(TAG, "Reheating nozzle to %.0f C before resuming", s_hp.saved_hotend);
-        marlin_send_cmd(buf, QUERY_CMD);
+        if (!hp_num(buf)) {
+            snprintf(failed, failed_len, "reaquecer o bico");
+            return false;
+        }
     }
 
-    ESP_LOGI(TAG, "Unparking to X%.2f Y%.2f Z%.2f", s_hp.park_x, s_hp.park_y, s_hp.park_z);
-    marlin_send_cmd("G90", QUERY_CMD);
-    snprintf(buf, sizeof(buf), "G1 X%.2f Y%.2f F6000", s_hp.park_x, s_hp.park_y);
-    marlin_send_cmd(buf, QUERY_CMD);              /* XY first, still lifted */
-    snprintf(buf, sizeof(buf), "G1 Z%.2f F600", s_hp.park_z);
-    marlin_send_cmd(buf, QUERY_CMD);              /* then lower Z */
+    if (!hp_num("G90")) {
+        snprintf(failed, failed_len, "voltar ao modo absoluto (G90)");
+        return false;
+    }
+    if (s_hp.pos_known) {
+        ESP_LOGI(TAG, "Unparking to X%.2f Y%.2f Z%.2f", s_hp.park_x, s_hp.park_y, s_hp.park_z);
+        snprintf(buf, sizeof(buf), "G1 X%.2f Y%.2f F6000", s_hp.park_x, s_hp.park_y);
+        if (!hp_num(buf)) {                       /* XY first, still lifted */
+            snprintf(failed, failed_len, "voltar para cima da peça");
+            return false;
+        }
+        snprintf(buf, sizeof(buf), "G1 Z%.2f F600", s_hp.park_z);
+        if (!hp_num(buf)) {                       /* then lower Z */
+            snprintf(failed, failed_len, "descer o bico");
+            return false;
+        }
+        s_hp.park_lifted = false;
+    } else if (s_hp.park_lifted) {
+        /* No confirmed position: the head did not leave XY, so only undo the lift.
+         * The flag is cleared BEFORE the relative move is sent: if its "ok" is lost, a
+         * 2nd Resume must not lower the nozzle again into the part. */
+        snprintf(buf, sizeof(buf), "G1 Z-%.1f F600", PARK_Z_LIFT);
+        if (!hp_num("G91")) {
+            snprintf(failed, failed_len, "descer o bico");
+            return false;
+        }
+        s_hp.park_lifted = false;
+        if (!(hp_num(buf) && hp_num("G90"))) {
+            snprintf(failed, failed_len, "descer o bico");
+            return false;
+        }
+    }
 
-    marlin_send_cmd("M83", QUERY_CMD);
-    snprintf(buf, sizeof(buf), "G1 E%.1f F2400", PARK_RETRACT);
-    marlin_send_cmd(buf, QUERY_CMD);              /* undo the retract */
+    if (s_hp.park_retracted > 0.0f) {
+        snprintf(buf, sizeof(buf), "G1 E%.2f F2400", s_hp.park_retracted);
+        if (!hp_num("M83")) {
+            snprintf(failed, failed_len, "devolver o filamento");
+            return false;
+        }
+        s_hp.park_retracted = 0.0f;   /* same: never extrude it twice */
+        if (!hp_num(buf)) {           /* undo the retract */
+            snprintf(failed, failed_len, "devolver o filamento");
+            return false;
+        }
+    }
 
     /* Restore the file's modes. G90/G91 first: in this Marlin it also resets E mode. */
-    marlin_send_cmd(s_hp.abs_xyz ? "G90" : "G91", QUERY_CMD);
+    bool ok = hp_num(s_hp.abs_xyz ? "G90" : "G91");
     if (s_hp.abs_e) {
-        marlin_send_cmd("M82", QUERY_CMD);
-        snprintf(buf, sizeof(buf), "G92 E%.5f", s_hp.park_e);
-        marlin_send_cmd(buf, QUERY_CMD);          /* logical E back to what the file expects */
+        ok = hp_num("M82") && ok;
+        if (s_hp.pos_known) {
+            snprintf(buf, sizeof(buf), "G92 E%.5f", s_hp.park_e);
+            ok = hp_num(buf) && ok;               /* logical E back to what the file expects */
+        }
     } else {
-        marlin_send_cmd("M83", QUERY_CMD);
+        ok = hp_num("M83") && ok;
     }
     if (s_hp.last_f > 0.0f) {
         snprintf(buf, sizeof(buf), "G1 F%.0f", s_hp.last_f);
-        marlin_send_cmd(buf, QUERY_CMD);          /* feedrate for the next move */
+        ok = hp_num(buf) && ok;                   /* feedrate for the next move */
     }
+    if (!ok) {
+        snprintf(failed, failed_len, "restaurar os modos do arquivo (G90/M82/F)");
+        return false;
+    }
+    return true;
 }
 
 /** Ender Smart (F15-06/08): stop a job whose printer state is unknown or unsafe.
@@ -389,10 +594,13 @@ static void host_print_interrupt(const char *why)
         s_hp.file = NULL;
     }
     bool connected = usb_serial_is_connected();
+    bool heaters_off = false;
+    s_hp.user_wait = false;
     if (connected) {
-        marlin_send_cmd("M104 S0", QUERY_CMD);
-        marlin_send_cmd("M140 S0", QUERY_CMD);
-        marlin_send_cmd("M77", QUERY_CMD);
+        /* Ender Smart (lote 6): confirmed and tried again; the message says what happened */
+        heaters_off = hp_seq_retry("M104 S0", 3);
+        heaters_off = hp_seq_retry("M140 S0", 3) && heaters_off;
+        hp_seq("M77");
     }
     s_hp.printing = false;
     s_hp.paused = false;
@@ -403,15 +611,18 @@ static void host_print_interrupt(const char *why)
     g_state.print_time_left_s = -1;
     g_state.host_printing = false;
     xSemaphoreGive(g_state_mutex);
+    hp_set_notice("");
 
-    char msg[96];
+    char msg[192];
     snprintf(msg, sizeof(msg), "Impressão interrompida: %s.%s", why,
-             connected ? " Aquecedores desligados." : "");
+             !connected ? "" : heaters_off ? " Aquecedores desligados."
+                                           : " A Ender não confirmou o desligamento dos aquecedores: confira na tela dela.");
     hp_set_error(msg);
 }
 
-/** Finish host print (complete or cancel) */
-static void host_print_finish(bool cancelled)
+/** Finish host print (complete or cancel).
+ *  Ender Smart (lote 6): returns false if a cancel could not confirm the heaters off. */
+static bool host_print_finish(bool cancelled)
 {
     hp_record(cancelled ? "cancelled" : "completed", "");
     if (s_hp.file) {
@@ -420,13 +631,48 @@ static void host_print_finish(bool cancelled)
     }
 
     bool connected = usb_serial_is_connected();
+    bool heaters_off = true;
+    s_hp.user_wait = false;
+    if (cancelled && s_hp.has_pending) {
+        /* lote 6: the deferred line is not printed; its number may already be taken by
+         * the Ender, so resync before the numbered lift (see hp_cmd_pause) */
+        s_hp.has_pending = false;
+        s_hp.counter_unsure = true;
+    }
+
+    if (cancelled && connected) {
+        /* Ender Smart (lote 6): heaters FIRST, confirmed and tried again. They used to
+         * come last, after an M400 whose "busy:" could make the ESP32 drop every command
+         * that followed: a cancel could leave the heaters on. Unnumbered lines are always
+         * accepted by Marlin, so this can go before the line counter reset. */
+        heaters_off = hp_seq_retry("M104 S0", 3);
+        heaters_off = hp_seq_retry("M140 S0", 3) && heaters_off;
+        ESP_LOGI(TAG, "Host print cancelled -- heaters %s, raising and parking",
+                 heaters_off ? "off" : "NOT confirmed off");
+        /* Lift and park NUMBERED, still in the job's line sequence (lote 6): a damaged
+         * line gets a Resend instead of becoming another move. No M400 first: the
+         * planner runs moves in order, so the lift comes after the queued ones anyway,
+         * and M400 was what made the printer busy. */
+        bool lifted = hp_num("G91") && hp_num("G1 Z10 F600");  /* Raise nozzle 10mm */
+        bool absolute = hp_num("G90");                          /* Absolute positioning */
+        /* Ender Smart: an absolute XY move is only safe after homing. Cancelling
+         * during the initial heat-up (before G28) used to drive the head to
+         * X0 Y200 from an unknown position. Lote 6: and only after the lift. */
+        if (s_hp.homed && lifted && absolute)
+            hp_num("G1 X0 Y200 F3000");                         /* Park head at rear-left */
+    }
 
     if (connected) {
         /* Reset Marlin's line counter so it stops expecting numbered lines.
-         * Must be sent as a numbered command with the expected line number. */
+         * Sent as a numbered command with the expected line number; lote 6: unnumbered
+         * when that number is not known after a failed sequence command. */
         char reset[40];
-        format_numbered_line(reset, sizeof(reset), s_hp.marlin_line, "M110 N0");
+        if (s_hp.counter_unsure)
+            snprintf(reset, sizeof(reset), "M110 N0");
+        else
+            format_numbered_line(reset, sizeof(reset), s_hp.marlin_line, "M110 N0");
         marlin_send_cmd(reset, QUERY_CMD);
+        s_hp.counter_unsure = false;
 
         /* Stop Marlin print timer */
         marlin_send_cmd("M77", QUERY_CMD);
@@ -439,20 +685,11 @@ static void host_print_finish(bool cancelled)
 
     if (cancelled) {
         if (connected) {
-            ESP_LOGI(TAG, "Host print cancelled -- parking and turning off heaters");
-            marlin_send_cmd("M400", QUERY_CMD);       /* Wait for planner to drain */
-            marlin_send_cmd("G91", QUERY_CMD);         /* Relative positioning */
-            marlin_send_cmd("G1 Z10 F600", QUERY_CMD); /* Raise nozzle 10mm */
-            marlin_send_cmd("G90", QUERY_CMD);         /* Absolute positioning */
-            /* Ender Smart: an absolute XY move is only safe after homing. Cancelling
-             * during the initial heat-up (before G28) used to drive the head to
-             * X0 Y200 from an unknown position. */
-            if (s_hp.homed)
-                marlin_send_cmd("G1 X0 Y200 F3000", QUERY_CMD); /* Park head at rear-left */
-            marlin_send_cmd("M104 S0", QUERY_CMD);     /* Hotend off */
-            marlin_send_cmd("M140 S0", QUERY_CMD);     /* Bed off */
-            marlin_send_cmd("M107", QUERY_CMD);         /* Fan off */
-            marlin_send_cmd("M84", QUERY_CMD);          /* Disable steppers */
+            hp_seq("M107");                                        /* Fan off */
+            /* M84 waits for the moves above; with M400 first (a wait command now) its
+             * "ok" does not time out and get taken for a later command's answer */
+            hp_seq("M400");
+            hp_seq("M84");                                         /* Disable steppers */
         } else {
             ESP_LOGW(TAG, "Host print cancelled -- USB disconnected, skipping park/cooldown");
         }
@@ -478,6 +715,8 @@ static void host_print_finish(bool cancelled)
     g_state.current_layer = 0;
     g_state.filename[0] = '\0';
     xSemaphoreGive(g_state_mutex);
+    hp_set_notice("");
+    return heaters_off;
 }
 
 /** Start host print from within the task context */
@@ -515,6 +754,14 @@ void hp_cmd_start(const char *filename)
     s_hp.total_lines = scan.total_lines;
     s_hp.layer = 0;
     s_hp.has_layer_comments = false;
+    s_hp.expect_layers = scan.has_layer_markers;
+    s_hp.pos_known = false;
+    s_hp.park_lifted = false;
+    s_hp.park_retracted = 0.0f;
+    s_hp.counter_unsure = false;
+    s_hp.user_wait = false;
+    s_hp.resync_fails = 0;
+    hp_set_notice("");
     s_hp.start_us = esp_timer_get_time();
     s_hp.pause_elapsed_us = 0;
     {
@@ -578,24 +825,67 @@ void hp_cmd_start(const char *filename)
 void hp_cmd_pause(void)
 {
     if (!s_hp.printing || s_hp.paused) return;
-    if (s_hp.usb_lost || s_hp.printer_reset) return;   /* hp_tick interrupts the job */
+    if (s_hp.usb_lost || s_hp.printer_reset || s_hp.desync) return;   /* hp_tick interrupts */
+    /* lote 6: a file line deferred on "busy" keeps the line number the next command would
+     * get. Send it first (pausing one line later), or the pause would reuse its number:
+     * the Ender answers "already have it" and that command is silently not executed. */
+    if (s_hp.has_pending) {
+        s_send_patient = true;
+        bool sent = send_query_numbered(s_hp.pending_line);
+        s_send_patient = false;
+        if (sent) {
+            s_hp.has_pending = false;
+            hp_track_modes(s_hp.pending_line);
+            s_hp.lines_sent++;
+        } else {
+            s_hp.counter_unsure = true;
+            ESP_LOGW(TAG, "Deferred line not confirmed before the pause: %s", s_hp.pending_line);
+        }
+    }
     s_hp.paused = true;
     s_hp.pause_elapsed_us += esp_timer_get_time() - s_hp.start_us;
-    host_print_park();
-    marlin_send_cmd("M76", QUERY_CMD);  /* Pause Marlin print timer */
+    char failed[48];
+    bool parked = host_print_park(failed, sizeof(failed));
+    hp_num("M76");  /* Pause Marlin print timer */
     xSemaphoreTake(g_state_mutex, portMAX_DELAY);
     g_state.opstate = PRINTER_PAUSED;
     xSemaphoreGive(g_state_mutex);
-    ESP_LOGI(TAG, "Host print paused (head parked)");
+    if (parked) {
+        hp_set_notice("");
+        ESP_LOGI(TAG, "Host print paused (head parked)");
+    } else {
+        /* Ender Smart (lote 6): the screen used to say "Pausado" with the head on the part */
+        char msg[160];
+        if (s_hp.user_wait)
+            snprintf(msg, sizeof(msg), "Pausado, mas a Ender está esperando alguém na tela dela "
+                     "(troca de filamento ou M0). Confira a impressora antes de retomar.");
+        else
+            snprintf(msg, sizeof(msg), "Pausado, mas a Ender não confirmou: %s. "
+                     "Confira a impressora antes de retomar.", failed);
+        hp_set_notice(msg);
+    }
 }
 
 /** Resume host print: restore position, restart timer */
 void hp_cmd_resume(void)
 {
     if (!s_hp.printing || !s_hp.paused) return;
-    if (s_hp.usb_lost || s_hp.printer_reset) return;   /* never resume after a drop */
-    marlin_send_cmd("M75", QUERY_CMD);  /* Resume Marlin print timer */
-    host_print_unpark();
+    if (s_hp.usb_lost || s_hp.printer_reset || s_hp.desync) return;   /* never after a drop */
+    char failed[48];
+    if (!host_print_unpark(failed, sizeof(failed))) {
+        /* Ender Smart (lote 6): stay paused; a 2nd Resume repeats only what is missing */
+        char msg[160];
+        if (s_hp.user_wait)
+            snprintf(msg, sizeof(msg), "A retomada parou: a Ender está esperando alguém na tela "
+                     "dela (troca de filamento ou M0). Continua pausado.");
+        else
+            snprintf(msg, sizeof(msg), "A retomada parou: a Ender não confirmou %s. "
+                     "Continua pausado; tente Retomar de novo ou cancele.", failed);
+        hp_set_notice(msg);
+        return;
+    }
+    hp_num("M75");  /* Resume Marlin print timer */
+    hp_set_notice("");
     s_hp.paused = false;
     s_hp.start_us = esp_timer_get_time();
     xSemaphoreTake(g_state_mutex, portMAX_DELAY);
@@ -611,12 +901,19 @@ void hp_cmd_cancel(void)
         hp_clear_error();
         return;
     }
-    if (s_hp.usb_lost || s_hp.printer_reset) {
+    if (s_hp.usb_lost || s_hp.printer_reset || s_hp.desync) {
         /* A cancel queued while the link was down must not park: position unknown */
-        host_print_interrupt(s_hp.printer_reset ? "a Ender reiniciou" : "a conexão USB caiu");
+        host_print_interrupt(s_hp.printer_reset ? "a Ender reiniciou"
+                             : s_hp.desync ? "a impressora pediu uma linha antiga"
+                                           : "a conexão USB caiu");
         return;
     }
-    host_print_finish(true);
+    if (!host_print_finish(true))
+        hp_set_error(s_hp.user_wait
+            ? "Impressão cancelada, mas a Ender está esperando alguém na tela dela e não "
+              "confirmou o desligamento dos aquecedores. Confira e use Resfriar."
+            : "Impressão cancelada, mas a Ender não confirmou o desligamento dos "
+              "aquecedores. Confira na tela dela e use Resfriar se precisar.");
 }
 
 /* ---- Host print streaming loop ---- */
@@ -627,15 +924,29 @@ void hp_tick(void)
 
     /* Ender Smart (F15-06 / C4): never resume by itself after the printer restarted
      * or the USB link dropped. Wait for the link, turn the heaters off, report. */
-    if (s_hp.printer_reset || s_hp.usb_lost) {
+    if (s_hp.printer_reset || s_hp.usb_lost || s_hp.desync) {
         if (!marlin_is_connected()) return;
         host_print_interrupt(s_hp.printer_reset ? "a Ender reiniciou"
-                                                : "a conexão USB caiu");
+                             : s_hp.desync ? "a impressora pediu uma linha antiga"
+                                           : "a conexão USB caiu");
         return;
     }
 
     if (s_hp.paused) return;
     if (!marlin_is_connected()) return;
+
+    /* lote 6: a failed sequence command left the printer's line number unknown */
+    if (s_hp.counter_unsure) {
+        char m110[24];
+        snprintf(m110, sizeof(m110), "M110 N%ld", (long)(s_hp.marlin_line - 1));
+        if (!hp_seq(m110)) {
+            if (++s_hp.resync_fails >= 3)
+                host_print_interrupt("a impressora parou de responder");
+            return;
+        }
+        s_hp.counter_unsure = false;
+    }
+    s_hp.resync_fails = 0;
 
     int lines_this_batch = 0;
     char line[256];
@@ -652,9 +963,11 @@ void hp_tick(void)
                 if (ferror(s_hp.file)) {
                     /* Ender Smart (F15-08 / C8): a read error is NOT the end of the
                      * file — the end G-code never ran. Park, heaters off, report. */
-                    host_print_finish(true);
-                    hp_set_error("Impressão cancelada: erro de leitura do cartão SD. "
-                                 "Bico afastado e aquecedores desligados.");
+                    bool off = host_print_finish(true);
+                    hp_set_error(off ? "Impressão cancelada: erro de leitura do cartão SD. "
+                                       "Bico afastado e aquecedores desligados."
+                                     : "Impressão cancelada: erro de leitura do cartão SD. A Ender "
+                                       "não confirmou o desligamento dos aquecedores: confira na tela dela.");
                     break;
                 }
                 /* EOF -- print complete */
@@ -762,8 +1075,10 @@ void hp_tick(void)
             }
         }
 
-        /* Track Z from G0/G1 moves for real-time position */
-        if ((line[0] == 'G') && (line[1] == '0' || line[1] == '1') && line[2] == ' ') {
+        /* Track Z from G0/G1 moves for real-time position.
+         * Ender Smart (lote 6): absolute moves only; the end G-code's relative "G1 Z10"
+         * showed Z 10.0 while the nozzle was at ~30 mm (2026-11-12). */
+        if (s_hp.abs_xyz && (line[0] == 'G') && (line[1] == '0' || line[1] == '1') && line[2] == ' ') {
             const char *zp = strstr(line, "Z");
             if (zp && (zp == line + 3 || *(zp - 1) == ' ')) {
                 float z = strtof(zp + 1, NULL);
@@ -779,9 +1094,11 @@ void hp_tick(void)
         if (!send_query_numbered(line)) {
             if (s_hp.line_too_long) {
                 /* F15-07: the printer is fine, so a normal cancel (park + cool) is safe */
-                host_print_finish(true);
-                hp_set_error("Impressão cancelada: linha de G-code longa demais para a "
-                             "Ender (mais de 95 caracteres).");
+                bool off = host_print_finish(true);
+                hp_set_error(off ? "Impressão cancelada: linha de G-code longa demais para a "
+                                   "Ender (mais de 95 caracteres)."
+                                 : "Impressão cancelada: linha de G-code longa demais. A Ender não "
+                                   "confirmou o desligamento dos aquecedores: confira na tela dela.");
                 break;
             }
             if (s_hp.desync || s_hp.printer_reset) {
@@ -813,9 +1130,13 @@ void hp_tick(void)
         }
         int64_t elapsed_us = s_hp.pause_elapsed_us + (esp_timer_get_time() - s_hp.start_us);
         g_state.print_time_s = (int32_t)(elapsed_us / 1000000);
-        g_state.current_layer = s_hp.layer + 1;  /* ;LAYER: is 0-based, display 1-based */
-        /* If no ;LAYER: comments in file, estimate from Z */
-        if (!s_hp.has_layer_comments && g_state.z > 0 && g_state.layer_height > 0) {
+        /* ;LAYER: is 0-based, display 1-based; 0 until the first marker (lote 6) */
+        g_state.current_layer = s_hp.has_layer_comments ? s_hp.layer + 1 : 0;
+        /* If no ;LAYER: comments in file, estimate from Z.
+         * Ender Smart (lote 6): not when the file HAS layer markers and the first one was
+         * not reached yet: the head is still at its old height (Z 30.2 gave "142/100"). */
+        if (!s_hp.has_layer_comments && !s_hp.expect_layers &&
+            g_state.z > 0 && g_state.layer_height > 0) {
             float flh = g_state.first_layer_height > 0 ? g_state.first_layer_height : g_state.layer_height;
             if (g_state.z <= flh)
                 g_state.current_layer = 1;

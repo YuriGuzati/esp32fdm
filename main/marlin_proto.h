@@ -61,6 +61,19 @@ extern printer_state_t   g_state;
 /** Cooldown timestamp — set by busy: handler, checked by host_print to defer */
 extern int64_t s_cmd_cooldown_until_us;
 
+/** Ender Smart (lote 6): incremented by every parsed M114 answer (under g_state_mutex) */
+extern volatile uint32_t s_m114_seq;
+
+/** Ender Smart (lote 6): incremented by every "Unknown command:" line from Marlin */
+extern volatile uint32_t s_unknown_seq;
+
+/** Ender Smart (lote 6): incremented by every "busy: paused for user/input" line */
+extern volatile uint32_t s_busy_user_seq;
+
+/** Ender Smart (lote 6): while true, a command sent during "busy:" waits instead of
+ *  being refused (set by host_print around pause/resume/cancel commands only) */
+extern volatile bool s_send_patient;
+
 /** Commands Marlin reported as unknown (numeric codes, e.g. 73 for M73) */
 extern uint16_t s_unsupported_cmds[UNSUPPORTED_CMD_MAX];
 extern int s_unsupported_count;

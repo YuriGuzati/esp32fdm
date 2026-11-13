@@ -251,11 +251,12 @@ static esp_err_t api_status_handler(httpd_req_t *req)
         s_baby_z_seeded = true;
     }
 
-    char json[576];
+    char json[896];
     snprintf(json, sizeof(json),
         "{\"state\":\"%s\",\"backend\":\"%s\",\"hotend\":[%.1f,%.1f],\"bed\":[%.1f,%.1f],"
         "\"progress\":%.1f,\"filename\":\"%s\",\"elapsed\":%ld,\"remaining\":%ld,"
-        "\"layer\":\"%ld/%ld\",\"z\":%.1f,\"baby_z\":%.2f,\"usb\":%s,\"error\":\"%s\"}",
+        "\"layer\":\"%ld/%ld\",\"z\":%.1f,\"baby_z\":%.2f,\"usb\":%s,\"error\":\"%s\","
+        "\"notice\":\"%s\"}",
         state_str, printer_comm_backend_name(),
         st.hotend_actual, st.hotend_target,
         st.bed_actual, st.bed_target,
@@ -267,7 +268,8 @@ static esp_err_t api_status_handler(httpd_req_t *req)
         (long)(total_layers >= 0 ? total_layers : 0),
         st.z, s_baby_z,
         usb ? "true" : "false",
-        st.opstate == PRINTER_ERROR ? st.error_msg : "");
+        st.opstate == PRINTER_ERROR ? st.error_msg : "",
+        st.notice);
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
@@ -442,7 +444,7 @@ static esp_err_t api_settings_handler(httpd_req_t *req)
     int bright = 0, contrast = 0, sat = 0, ae = 0;
     camera_get_image_params(&bright, &contrast, &sat, &ae);
 
-    char printer[400];
+    char printer[512];   /* lote 6: + pause_retract/pause_temp */
     printer_comm_settings_json(printer, sizeof(printer));
 
     char *json = malloc(1400);

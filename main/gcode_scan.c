@@ -83,6 +83,7 @@ void gcode_scan_file(FILE *f, gcode_scan_t *out)
     rewind(f);
 
     /* Derive values if not found in comments */
+    out->has_layer_markers = (max_layer >= 0 || layer_change_count > 0);
     if (max_layer >= 0)
         out->total_layers = max_layer + 1;  /* ;LAYER: is 0-based */
     else if (layer_change_count > 0)

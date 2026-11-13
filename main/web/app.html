@@ -330,6 +330,10 @@ function renderChrome() {
       h('span', null, S.status.error || 'A impressora informou um erro.'),
       h('button', { class: 'btn sm danger', onclick: async () => { try { await post('/sd/cancel'); toast('Erro reconhecido'); pollStatus(); } catch (e) { toast(e.message, true); } } }, 'OK')));
   }
+  /* aviso com a impressão ainda ativa (lote 6): ex. uma pausa que não estacionou */
+  if (S.status && S.status.notice && S.status.state !== 'error') {
+    b.append(h('div', { class: 'note', role: 'alert', style: 'margin-bottom:4px;font-weight:600' }, '⚠ ' + S.status.notice));
+  }
 }
 
 /* ---------- gráficos ---------- */
@@ -383,10 +387,12 @@ function Inicio() {
   const cam = h('section', { class: 'cam o2', 'aria-label': 'Câmera' }, img, ph,
     h('span', { class: 'ov' }, 'Foto a cada 3 s'),
     h('a', { class: 'btn sm', href: '#camera', style: 'position:absolute;right:10px;bottom:10px;background:rgba(15,17,21,.78);color:#E8EAED;border-color:transparent', 'aria-label': 'Abrir vídeo ao vivo' }, icon('full'), 'Ao vivo'));
-  let camBusy = false;
+  let camBusy = false, camT = 0;
   img.onload = () => { ph.classList.add('hide'); camBusy = false; };
   img.onerror = () => { ph.textContent = 'Câmera indisponível'; ph.classList.remove('hide'); camBusy = false; };
-  const snap = () => { if (camBusy || document.hidden) return; camBusy = true; img.src = '/capture?t=' + Date.now(); };
+  /* lote 6: uma foto que não chega em 8 s (a página abrindo, muitas requisições) é pedida de novo;
+     antes a tela esperava para sempre */
+  const snap = () => { if (document.hidden || (camBusy && Date.now() - camT < 8000)) return; camBusy = true; camT = Date.now(); img.src = '/capture?t=' + camT; };
   const camTimer = setInterval(snap, 3000); snap();
   const chartBody = h('div');
   const chartBox = h('div', { class: 'card o6' }, h('div', { class: 'row between' }, h('h2', null, 'Temperaturas · 30 min'),
@@ -1359,14 +1365,25 @@ function Config() {
       const p25 = h('input', { type: 'radio', name: 'pc', checked: s.pause_cmd !== 'm524' }), p524 = h('input', { type: 'radio', name: 'pc', checked: s.pause_cmd === 'm524' });
       const fc = h('input', { type: 'checkbox', checked: s.filament_chk }), ep = h('input', { type: 'text', value: s.echo_ping || '', placeholder: 'ex.: M119, G92' });
       const at = h('input', { type: 'checkbox', checked: s.autotemp });
+      /* pausa da impressão pela ESP32 (lote 6) */
+      const pr = h('input', { type: 'number', min: 0, max: 10, step: 0.5, value: s.pause_retract != null ? s.pause_retract : 6.5 });
+      const pt = h('input', { type: 'number', min: 0, max: 260, step: 5, value: s.pause_temp != null ? s.pause_temp : 170 });
       el.append(sec('Marlin',
         h('span', { class: 'small muted' }, 'Pausa de impressão feita pelo cartão da própria Ender:'),
         h('label', { class: 'chk' }, p25, 'M25: pausa (pode retomar)'), h('label', { class: 'chk' }, p524, 'M524: aborta (se o M25 travar o firmware)'),
+        h('span', { class: 'small muted' }, 'Pausa de impressão enviada pela ESP32 (a cabeça sobe 5 mm e vai para o canto X0 Y0):'),
+        h('div', { class: 'grid2' },
+          h('label', { class: 'f' }, 'Recolher o filamento (mm, 0 a 10)', pr),
+          h('label', { class: 'f' }, 'Bico durante a pausa (°C, 0 = manter)', pt)),
+        h('span', { class: 'tiny faint' }, 'Bowden (Ender-3 Max Neo): 6,5 mm, como o perfil do Cura. Com o bico mais frio, o plástico não escorre; ao retomar, a ESP32 espera voltar à temperatura da impressão.'),
         h('label', { class: 'chk' }, fc, 'Consultar o sensor de filamento (M119) durante a impressão e pausar se acabar'),
         h('label', { class: 'chk' }, at, 'Temperatura enviada pela Ender a cada 2 s (M155 S2), em vez de a ESP32 perguntar com M105. Atualiza a temperatura também durante a impressão'),
         h('label', { class: 'f' }, 'Comandos que precisam de "ping" (ajuste avançado)', ep),
         h('button', { class: 'btn sm', onclick: async () => {
-          const d = { pause_cmd: p524.checked ? 'm524' : 'm25', echo_ping: ep.value, autotemp: at.checked ? 1 : 0 }; if (fc.checked) d.filament_chk = 1;
+          const rv = parseFloat(pr.value), tv = parseInt(pt.value, 10);
+          if (!(rv >= 0 && rv <= 10)) { toast('Recolher: use de 0 a 10 mm', true); return; }
+          if (!(tv === 0 || (tv >= 100 && tv <= 260))) { toast('Bico na pausa: 0 (manter) ou de 100 a 260 °C', true); return; }
+          const d = { pause_cmd: p524.checked ? 'm524' : 'm25', echo_ping: ep.value, autotemp: at.checked ? 1 : 0, pause_retract: rv, pause_temp: tv }; if (fc.checked) d.filament_chk = 1;
           try { await post('/printer/config/marlin', d); toast('Salvo'); loadSettings(); } catch (e) { toast(e.message, true); }
         } }, 'Salvar')));
     }

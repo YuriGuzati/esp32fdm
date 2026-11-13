@@ -83,6 +83,8 @@ static uint32_t           s_spam_lines;     /* Creality debug lines dropped */
 #define NVS_KEY_FILAMENT_CHK    "fil_chk"
 #define NVS_KEY_ECHO_PING       "echo_ping"
 #define NVS_KEY_AUTOTEMP        "autotemp"
+#define NVS_KEY_PAUSE_RETR      "pause_retr"   /* lote 6: tenths of mm */
+#define NVS_KEY_PAUSE_TEMP      "pause_temp"   /* lote 6: nozzle C while paused, 0 = keep */
 
 /* ---- Backend config ---- */
 
@@ -104,6 +106,35 @@ static volatile bool s_autotemp_dirty;  /* setting changed: send M155 S2 / S0 */
 static int64_t s_last_auto_temp_us;     /* last unsolicited temperature line */
 static int64_t s_last_m155_us;
 #define AUTOTEMP_FRESH_US (6 * 1000000LL)  /* reports newer than this replace M105 */
+/* Ender Smart (lote 6): pause settings. The Ender-3 Max Neo is a Bowden machine and its
+ * Cura profile retracts 6.5 mm; the old fixed 2 mm let the nozzle ooze for the whole pause
+ * (seen on 2026-11-12). A lower nozzle temperature while paused stops the ooze; resume
+ * waits (M109) for the print temperature again. */
+static uint16_t s_pause_retract_x10 = 65;  /* 0..100 = 0.0..10.0 mm */
+static uint16_t s_pause_temp_c = 170;      /* 0 = keep the print temperature */
+/* Ender Smart (lote 6): bumped by every parsed M114 answer, so a pause can tell a fresh
+ * position from a stale one (the 1st pause on 2026-11-12 saved X0.4 Y20 from long before). */
+volatile uint32_t s_m114_seq;
+/* Ender Smart (lote 6): how long a command waits for a busy printer before it is sent anyway */
+#define BUSY_WAIT_MAX_US (15 * 1000000LL)
+/* Ender Smart (lote 6): longest wait for the "ok" of a normal (non-wait) command, even while
+ * "busy: processing" keeps arriving */
+#define NONWAIT_MAX_US   (120 * 1000000LL)
+/* Ender Smart (lote 6): set by host_print around pause/resume/cancel commands. Only then a
+ * command sent while the printer is busy waits for it; every other caller keeps the old
+ * behaviour (refused at once, the caller sees false), so a click during an operation started
+ * on the Ender's own screen is not executed minutes later. */
+volatile bool s_send_patient;
+/* Ender Smart (lote 6): bumped by every "Unknown command:" line. An "ok" follows it, so a
+ * sequence checks this to know its command was really understood (a byte lost on the USB
+ * turned "M110 M105" into "M11M105" on 2026-11-12). */
+volatile uint32_t s_unknown_seq;
+/* Ender Smart (lote 6): the last "busy:" was "paused for user/input" (M0/M1/M600 waiting for
+ * someone at the printer): then the wait for an "ok" is not stretched, as before. */
+static bool s_busy_for_user;
+/* ... and how many such lines came: a pause/resume/cancel command that sees one was only
+ * queued by the Ender, not done, so the sequence treats it as a failure */
+volatile uint32_t s_busy_user_seq;
 static char s_echo_ping_cmds[128] = "";  /* Comma-separated GCode prefixes that need CDC flush ping */
 
 /* ---- Temperature history circular buffer ---- */
@@ -347,6 +378,7 @@ static void parse_m114(const char *line)
     if (p) g_state.z = strtof(p + 2, NULL);
     p = strstr(line, "E:");
     if (p) g_state.e = strtof(p + 2, NULL);
+    s_m114_seq++;
 
     xSemaphoreGive(g_state_mutex);
 }
@@ -468,6 +500,7 @@ static void process_line(const char *line)
     /* Detect unsupported commands: echo:Unknown command: "M73 P15 R21" */
     const char *unk = strstr(line, "Unknown command:");
     if (unk) {
+        s_unknown_seq++;   /* lote 6 */
         /* Find the M/G code in the quoted string */
         const char *q = strchr(unk, '"');
         if (q && (q[1] == 'M' || q[1] == 'G')) {
@@ -582,6 +615,8 @@ static void process_line(const char *line)
 
     /* Marlin says "busy: processing" when it can't accept commands yet */
     if (strstr(line, "busy:")) {
+        s_busy_for_user = strstr(line, "paused for") != NULL;   /* lote 6 */
+        if (s_busy_for_user) s_busy_user_seq++;
         s_cmd_cooldown_until_us = esp_timer_get_time() + 4000000LL; /* back off 4s */
         s_pending_query = QUERY_NONE;
         return;
@@ -592,6 +627,7 @@ static void process_line(const char *line)
      * gap between probes (~6-8 s).  The final "ok" after the mesh grid
      * clears the cooldown and resumes polling. */
     if (strstr(line, "measured_z:")) {
+        s_busy_for_user = false;   /* lote 6: a probe point, not a person at the printer */
         s_cmd_cooldown_until_us = esp_timer_get_time() + 10000000LL; /* 10 s */
         s_pending_query = QUERY_NONE;
         return;
@@ -620,6 +656,21 @@ static void process_line(const char *line)
         /* Clear cooldown so the wait-loop doesn't mistake this real "ok"
          * for a "busy: processing" clear and re-arm the query. */
         s_cmd_cooldown_until_us = 0;
+        s_busy_for_user = false;   /* lote 6 */
+    }
+}
+
+/** Add one received byte to the line being assembled; process it at the end of line. */
+static void rx_feed_byte(uint8_t rx_byte)
+{
+    if (rx_byte == '\n' || rx_byte == '\r') {
+        if (s_line_len > 0) {
+            s_line_buf[s_line_len] = '\0';
+            process_line(s_line_buf);
+            s_line_len = 0;
+        }
+    } else if (s_line_len < RX_LINE_BUF_SIZE - 1) {
+        s_line_buf[s_line_len++] = (char)rx_byte;
     }
 }
 
@@ -627,17 +678,8 @@ static void process_line(const char *line)
 void marlin_drain_rx(void)
 {
     uint8_t rx_byte;
-    while (xStreamBufferReceive(s_rx_stream, &rx_byte, 1, 0) > 0) {
-        if (rx_byte == '\n' || rx_byte == '\r') {
-            if (s_line_len > 0) {
-                s_line_buf[s_line_len] = '\0';
-                process_line(s_line_buf);
-                s_line_len = 0;
-            }
-        } else if (s_line_len < RX_LINE_BUF_SIZE - 1) {
-            s_line_buf[s_line_len++] = (char)rx_byte;
-        }
-    }
+    while (xStreamBufferReceive(s_rx_stream, &rx_byte, 1, 0) > 0)
+        rx_feed_byte(rx_byte);
 }
 
 /** Check if a GCode line is a long-running command that blocks until done.
@@ -659,6 +701,13 @@ static bool is_wait_cmd(const char *gcode, bool *is_silent, int *timeout_overrid
     }
     if (*p == 'M') {
         int code = atoi(p + 1);
+        if (code == 400) {
+            /* Ender Smart (lote 6): M400 answers only when every queued move is done.
+             * As a normal command it timed out or ended on "busy:", and its late "ok"
+             * was taken for the next command's answer (the pause read a stale position). */
+            if (timeout_override_ms) *timeout_override_ms = 60000;
+            return true;
+        }
         return (code == 109 || code == 190 || code == 116);
     }
     if (*p == 'G') {
@@ -709,8 +758,23 @@ static bool marlin_send_cmd_ex(const char *gcode, query_type_t qtype,
     s_pending_query = QUERY_NONE;
     marlin_drain_rx();
 
-    /* Abort if drain_rx saw busy: and set cooldown */
-    if (esp_timer_get_time() < s_cmd_cooldown_until_us) return false;
+    /* Abort if drain_rx saw busy: and set cooldown.
+     * Ender Smart (lote 6): this silently lost commands for callers that ignore the result.
+     * On 2026-11-12 a pause lost the retract, lift and park after one "busy:", leaving the
+     * nozzle on the part. Pause/resume/cancel (s_send_patient) now wait for the printer
+     * instead: its "ok" clears the cooldown; after BUSY_WAIT_MAX_US the command is sent
+     * anyway and Marlin queues it. Other callers keep the immediate refusal. */
+    if (esp_timer_get_time() < s_cmd_cooldown_until_us) {
+        if (!s_send_patient) return false;
+        int64_t give_up = esp_timer_get_time() + BUSY_WAIT_MAX_US;
+        uint8_t b;
+        while (esp_timer_get_time() < s_cmd_cooldown_until_us && esp_timer_get_time() < give_up) {
+            if (!usb_serial_is_connected()) return false;
+            if (xStreamBufferReceive(s_rx_stream, &b, 1, pdMS_TO_TICKS(50)) > 0)
+                rx_feed_byte(b);
+        }
+        s_pending_query = QUERY_NONE;
+    }
 
     /* Ender Smart (F15-07 / C9): the old code used a 100-byte buffer but sent the
      * *intended* length, leaking stack bytes for long commands. Refuse instead. */
@@ -817,21 +881,29 @@ static bool marlin_send_cmd_ex(const char *gcode, query_type_t qtype,
                 s_line_len = 0;
 
                 /* "busy: processing" clears s_pending_query in process_line.
-                 * For wait/long commands, restore it — we still need the real "ok".
-                 * For all commands, extend deadline since printer is alive. */
+                 * Ender Smart (lote 6): restore it for normal commands too, not only the
+                 * wait commands. "busy: processing" means this command is still running
+                 * and its "ok" is still to come; the old code stopped waiting, so that late
+                 * "ok" was taken as the answer to the next command (the pause read a stale
+                 * position). Not for "paused for user" (M0/M600 waits for a person, maybe
+                 * for ever: the old behaviour, and pause/resume/cancel treat it as a
+                 * failure), and a normal command waits NONWAIT_MAX_US at most. The deadline
+                 * is extended, never shortened, since the printer is alive. */
                 if (s_pending_query == QUERY_NONE
-                    && esp_timer_get_time() < s_cmd_cooldown_until_us) {
-                    if (wait) {
-                        s_pending_query = qtype;
-                    }
+                    && esp_timer_get_time() < s_cmd_cooldown_until_us
+                    && !s_busy_for_user) {
+                    s_pending_query = qtype;
                     int ext_ms = wait_silent ? timeout_ms : CMD_RESPONSE_TIMEOUT_MS;
-                    deadline = esp_timer_get_time() + (int64_t)ext_ms * 1000LL;
+                    int64_t nd = esp_timer_get_time() + (int64_t)ext_ms * 1000LL;
+                    if (!wait && nd > start_us + NONWAIT_MAX_US) nd = start_us + NONWAIT_MAX_US;
+                    if (nd > deadline) deadline = nd;
                 }
                 /* Wait commands: printer sends temp reports ("T:... W:N") while
                  * waiting — extend deadline on any received line, not just "busy". */
                 else if (wait && s_pending_query != QUERY_NONE) {
                     int ext_ms = wait_silent ? timeout_ms : CMD_RESPONSE_TIMEOUT_MS;
-                    deadline = esp_timer_get_time() + (int64_t)ext_ms * 1000LL;
+                    int64_t nd = esp_timer_get_time() + (int64_t)ext_ms * 1000LL;
+                    if (nd > deadline) deadline = nd;
                 }
             }
         } else if (s_line_len < RX_LINE_BUF_SIZE - 1) {
@@ -1045,7 +1117,11 @@ static void printer_comm_task(void *arg)
             CHECK_COOLDOWN();
         }
 
-        /* Poll M105 (temperatures) every 4s — not needed while autoreport lines arrive */
+        /* Poll M105 (temperatures) every 4s — not needed while autoreport lines arrive.
+         * Ender Smart (lote 6): read what is buffered first. When idle nothing else drains
+         * the RX stream for up to 10 s, so the reports looked stale and an M105 went out
+         * every ~10 s even with M155 on (seen on 2026-11-12). */
+        marlin_drain_rx();
         now = esp_timer_get_time();
         bool auto_fresh = s_autotemp && now - s_last_auto_temp_us < AUTOTEMP_FRESH_US;
         if (!auto_fresh && now - s_last_m105_us >= POLL_M105_INTERVAL_MS * 1000LL) {
@@ -1088,10 +1164,11 @@ poll_done:
             xSemaphoreTake(g_state_mutex, portMAX_DELAY);
             memcpy(&hb, &g_state, sizeof(hb));
             xSemaphoreGive(g_state_mutex);
-            ESP_LOGI(TAG, "Status: HE %.1f/%.0f BED %.1f/%.0f Z %.2f%s%s, rx_dropped %lu",
+            ESP_LOGI(TAG, "Status: HE %.1f/%.0f BED %.1f/%.0f Z %.2f%s%s, rx_dropped %lu, stack_free %u",
                      hb.hotend_actual, hb.hotend_target, hb.bed_actual, hb.bed_target, hb.z,
                      hp_is_active() ? ", printing " : "", hp_is_active() ? hb.filename : "",
-                     (unsigned long)s_rx_dropped);
+                     (unsigned long)s_rx_dropped,
+                     (unsigned)uxTaskGetStackHighWaterMark(NULL));  /* lote 6: bytes never used */
         }
 
         /* Shorter delay during host print for throughput, normal otherwise */
@@ -1134,6 +1211,12 @@ static void load_config_from_nvs(void)
     if (nvs_get_u8(nvs, NVS_KEY_AUTOTEMP, &autotemp) == ESP_OK) {
         s_autotemp = (autotemp == 1);
     }
+
+    uint16_t u16 = 0;
+    if (nvs_get_u16(nvs, NVS_KEY_PAUSE_RETR, &u16) == ESP_OK && u16 <= 100)
+        s_pause_retract_x10 = u16;
+    if (nvs_get_u16(nvs, NVS_KEY_PAUSE_TEMP, &u16) == ESP_OK && (u16 == 0 || (u16 >= 100 && u16 <= 260)))
+        s_pause_temp_c = u16;
 
     size_t ping_len = sizeof(s_echo_ping_cmds);
     if (nvs_get_str(nvs, NVS_KEY_ECHO_PING, s_echo_ping_cmds, &ping_len) != ESP_OK) {
@@ -1274,11 +1357,25 @@ void printer_comm_settings_json(char *out, size_t out_size)
     host[o] = '\0';
     snprintf(out, out_size,
              "\"backend\":\"%s\",\"mr_host\":\"%s\",\"mr_port\":%u,"
-             "\"pause_cmd\":\"%s\",\"filament_chk\":%s,\"echo_ping\":\"%s\",\"autotemp\":%s",
+             "\"pause_cmd\":\"%s\",\"filament_chk\":%s,\"echo_ping\":\"%s\",\"autotemp\":%s,"
+             "\"pause_retract\":%.1f,\"pause_temp\":%u",
              s_backend == PRINTER_BACKEND_KLIPPER ? "klipper" : "marlin",
              host, (unsigned)s_mr_port,
              s_pause_cmd == PAUSE_CMD_M524 ? "m524" : "m25",
-             s_filament_check ? "true" : "false", echo, s_autotemp ? "true" : "false");
+             s_filament_check ? "true" : "false", echo, s_autotemp ? "true" : "false",
+             s_pause_retract_x10 / 10.0f, (unsigned)s_pause_temp_c);
+}
+
+/* ---- Ender Smart (lote 6): pause settings for host_print.c ---- */
+
+float printer_comm_pause_retract_mm(void)
+{
+    return s_pause_retract_x10 / 10.0f;
+}
+
+int printer_comm_pause_temp_c(void)
+{
+    return s_pause_temp_c;
 }
 
 /* ---- Ender Smart (F15-15 / F2-02) ---- */
@@ -1446,7 +1543,9 @@ esp_err_t printer_comm_init(void)
     g_state.print_time_left_s = -1;
     g_state.total_layers = -1;
 
-    xTaskCreatePinnedToCore(printer_comm_task, "printer_comm", 6144,
+    /* lote 6: 6144 -> 8192; printer_state_t grew (error_msg/notice) and is copied on the
+     * stack here and in the mesh parser, which runs inside process_line */
+    xTaskCreatePinnedToCore(printer_comm_task, "printer_comm", 8192,
                             NULL, 8, NULL, 1);  /* Core 1: with USB host, isolated from WiFi/HTTP */
 
     ESP_LOGI(TAG, "Printer comm initialized (Marlin backend)");
@@ -1689,13 +1788,52 @@ static esp_err_t printer_config_post_handler(httpd_req_t *req)
 
 static esp_err_t printer_config_marlin_post_handler(httpd_req_t *req)
 {
-    char body[256];
-    int len = httpd_req_recv(req, body, sizeof(body) - 1);
-    if (len <= 0) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Empty body");
+    char body[512];
+    /* lote 6: a body longer than the buffer used to be cut silently (the last field,
+     * filament_chk, could be lost and the sensor turned off): refuse it */
+    if (req->content_len >= sizeof(body)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Body too long");
+        return ESP_FAIL;
+    }
+    /* lote 6: the body may arrive in more than one piece: read all of it */
+    int len = 0, timeouts = 0;
+    while (len < (int)req->content_len) {
+        int r = httpd_req_recv(req, body + len, req->content_len - len);
+        if (r == HTTPD_SOCK_ERR_TIMEOUT && ++timeouts <= 3) continue;
+        if (r <= 0) break;
+        len += r;
+    }
+    if (len <= 0 || len < (int)req->content_len) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, len <= 0 ? "Empty body" : "Incomplete body");
         return ESP_FAIL;
     }
     body[len] = '\0';
+
+    /* Ender Smart (lote 6): pause retract (mm) and nozzle temperature while paused.
+     * Validated before anything is changed; a field that is not sent keeps its value. */
+    const char *pr = strstr(body, "pause_retract=");
+    const char *pt = strstr(body, "pause_temp=");
+    int new_retr = -1, new_ptemp = -1;
+    if (pr) {
+        char *endp = NULL;
+        float v = strtof(pr + 14, &endp);
+        if (endp == pr + 14 || !(v >= 0.0f && v <= 10.0f)) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "pause_retract: 0 a 10 mm");
+            return ESP_FAIL;
+        }
+        new_retr = (int)(v * 10.0f + 0.5f);
+    }
+    if (pt) {
+        char *endp = NULL;
+        int v = (int)strtol(pt + 11, &endp, 10);
+        if (endp == pt + 11 || !(v == 0 || (v >= 100 && v <= 260))) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "pause_temp: 0 (manter) ou 100 a 260 C");
+            return ESP_FAIL;
+        }
+        new_ptemp = v;
+    }
+    if (new_retr >= 0) s_pause_retract_x10 = (uint16_t)new_retr;
+    if (new_ptemp >= 0) s_pause_temp_c = (uint16_t)new_ptemp;
 
     pause_cmd_t new_cmd = (strstr(body, "pause_cmd=m524") != NULL)
                            ? PAUSE_CMD_M524 : PAUSE_CMD_M25;
@@ -1736,6 +1874,8 @@ static esp_err_t printer_config_marlin_post_handler(httpd_req_t *req)
         nvs_set_u8(nvs, NVS_KEY_FILAMENT_CHK, new_fil_chk ? 1 : 0);
         nvs_set_str(nvs, NVS_KEY_ECHO_PING, s_echo_ping_cmds);
         if (autotemp_given) nvs_set_u8(nvs, NVS_KEY_AUTOTEMP, s_autotemp ? 1 : 0);
+        if (new_retr >= 0) nvs_set_u16(nvs, NVS_KEY_PAUSE_RETR, s_pause_retract_x10);
+        if (new_ptemp >= 0) nvs_set_u16(nvs, NVS_KEY_PAUSE_TEMP, s_pause_temp_c);
         nvs_commit(nvs);
         nvs_close(nvs);
     }

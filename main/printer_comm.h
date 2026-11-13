@@ -36,7 +36,10 @@ typedef struct {
     int32_t current_layer;       /* current layer from ;LAYER:N comments */
     float probe_z_offset;        /* Z probe offset from M290 query (Marlin) */
     int64_t last_update_us;      /* esp_timer_get_time() of last successful parse */
-    char error_msg[96];          /* why opstate is PRINTER_ERROR (Ender Smart F15-06/08) */
+    char error_msg[192];         /* why opstate is PRINTER_ERROR (Ender Smart F15-06/08;
+                                    lote 6: 96 -> 192, the heater messages are longer) */
+    char notice[192];            /* Ender Smart (lote 6): warning shown while a job is still on,
+                                    e.g. a pause that could not park; empty = none */
 } printer_state_t;
 
 typedef enum {
@@ -196,6 +199,12 @@ uint32_t printer_comm_rx_dropped(void);
 
 /** Ender Smart (F2-03): true while M155 autoreport lines are arriving (M105 polling skipped). */
 bool printer_comm_autotemp_active(void);
+
+/** Ender Smart (lote 6): filament retract on pause, in mm (0..10, default 6.5). */
+float printer_comm_pause_retract_mm(void);
+
+/** Ender Smart (lote 6): nozzle temperature while paused, in C (0 = keep, default 170). */
+int printer_comm_pause_temp_c(void);
 
 /** Ender Smart (F2-02): last M115 answer as a JSON object (firmware line, age, capabilities). */
 void printer_comm_info_json(char *out, size_t out_size);

@@ -16,6 +16,7 @@ typedef struct {
     float layer_height;       /* from slicer comment or computed */
     float first_layer_height; /* from slicer comment or first Z */
     int32_t total_layers;     /* from ;LAYER: comments */
+    bool has_layer_markers;   /* Ender Smart (lote 6): ;LAYER: or ;LAYER_CHANGE seen */
 } gcode_scan_t;
 
 /**
