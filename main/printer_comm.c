@@ -1555,6 +1555,10 @@ esp_err_t printer_comm_init(void)
     g_state.print_time_left_s = -1;
     g_state.total_layers = -1;
 
+    /* lote 8: host print module; reads the job journal (a job that was running when the
+     * ESP32 went down gets its heaters turned off once the Ender answers) */
+    hp_init();
+
     /* lote 6: 6144 -> 8192; printer_state_t grew (error_msg/notice) and is copied on the
      * stack here and in the mesh parser, which runs inside process_line */
     xTaskCreatePinnedToCore(printer_comm_task, "printer_comm", 8192,

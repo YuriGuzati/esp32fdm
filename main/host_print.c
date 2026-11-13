@@ -2,7 +2,9 @@
 #include "gcode_scan.h"
 
 #include "esp_log.h"
+#include "esp_system.h"
 #include "esp_timer.h"
+#include "nvs.h"
 
 #include <ctype.h>
 #include <math.h>
@@ -219,6 +221,151 @@ static void hp_record(const char *result, const char *reason)
         .total_layers = total_layers,
     };
     job_history_add(&r);
+}
+
+/* ---- Ender Smart (lote 8 / F3-01): job journal in NVS ----
+ * If the ESP32 restarts in the middle of a host print (power loss, crash, watchdog), the
+ * stream stops and the Ender keeps the nozzle and the bed at their targets for as long as it
+ * stays on: it has no host timeout. The journal survives the restart; on the next boot, once
+ * the Ender answers, the heaters are turned off (never a move), the job goes to the history
+ * as "interrupted" and the screen shows why. Written at start, every 5 min and at pause and
+ * resume; erased when the job ends any other way. */
+
+#define JOURNAL_NS     "hpjob"
+#define JOURNAL_KEY    "job"
+#define JOURNAL_MAGIC  0x4A4F4231u          /* "JOB1" */
+#define JOURNAL_EVERY_US (5 * 60 * 1000000LL)
+
+typedef struct {
+    uint32_t magic;
+    char     file[64];
+    int64_t  start_epoch;
+    int32_t  elapsed_s;                     /* printing time when last saved, pauses excluded */
+    int32_t  lines_sent, total_lines;
+    int32_t  layer, total_layers;           /* layer 1-based, 0 = before the first marker */
+    uint8_t  paused;
+} hp_journal_t;
+
+static hp_journal_t s_orphan;               /* journal found at boot */
+static bool    s_orphan_pending;            /* ... and not handled yet */
+static int     s_orphan_tries;
+static esp_reset_reason_t s_boot_reason;
+static int64_t s_journal_saved_us;
+
+static void hp_journal_save(void)
+{
+    hp_journal_t j = { .magic = JOURNAL_MAGIC };
+    strncpy(j.file, s_hp.filename, sizeof(j.file) - 1);
+    j.start_epoch = s_hp.start_epoch;
+    int64_t el = s_hp.pause_elapsed_us + (s_hp.paused ? 0 : (esp_timer_get_time() - s_hp.start_us));
+    j.elapsed_s = (int32_t)(el / 1000000);
+    j.lines_sent = s_hp.lines_sent;
+    j.total_lines = s_hp.total_lines;
+    j.layer = s_hp.has_layer_comments ? s_hp.layer + 1 : 0;
+    xSemaphoreTake(g_state_mutex, portMAX_DELAY);
+    j.total_layers = g_state.total_layers;
+    xSemaphoreGive(g_state_mutex);
+    j.paused = s_hp.paused ? 1 : 0;
+
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(JOURNAL_NS, NVS_READWRITE, &h);
+    if (err == ESP_OK) {
+        err = nvs_set_blob(h, JOURNAL_KEY, &j, sizeof(j));
+        if (err == ESP_OK) err = nvs_commit(h);
+        nvs_close(h);
+    }
+    if (err != ESP_OK)
+        ESP_LOGW(TAG, "Job journal not saved (%s): an ESP32 restart would not be detected",
+                 esp_err_to_name(err));
+    s_journal_saved_us = esp_timer_get_time();
+}
+
+static void hp_journal_clear(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(JOURNAL_NS, NVS_READWRITE, &h) == ESP_OK) {
+        if (nvs_erase_key(h, JOURNAL_KEY) == ESP_OK) nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
+static const char *hp_reset_reason_text(esp_reset_reason_t r)
+{
+    switch (r) {
+    case ESP_RST_POWERON:   return "a ESP32 ficou sem energia";
+    case ESP_RST_BROWNOUT:  return "a alimentação da ESP32 caiu de tensão";
+    case ESP_RST_PANIC:     return "o firmware da ESP32 travou";
+    case ESP_RST_INT_WDT:
+    case ESP_RST_TASK_WDT:
+    case ESP_RST_WDT:       return "o watchdog reiniciou a ESP32";
+    case ESP_RST_SW:        return "a ESP32 reiniciou por software";
+    case ESP_RST_EXT:       return "a ESP32 foi reiniciada pelo botão ou pelo cabo";
+    default:                return "a ESP32 reiniciou";
+    }
+}
+
+/** Called at boot: was a host print running when the ESP32 went down? */
+static void hp_journal_check_at_boot(void)
+{
+    s_boot_reason = esp_reset_reason();
+    hp_journal_t j;
+    size_t len = sizeof(j);
+    nvs_handle_t h;
+    if (nvs_open(JOURNAL_NS, NVS_READONLY, &h) != ESP_OK) return;
+    esp_err_t err = nvs_get_blob(h, JOURNAL_KEY, &j, &len);
+    nvs_close(h);
+    if (err != ESP_OK || len != sizeof(j) || j.magic != JOURNAL_MAGIC) return;
+    j.file[sizeof(j.file) - 1] = '\0';
+    s_orphan = j;
+    s_orphan_pending = true;
+    ESP_LOGW(TAG, "The ESP32 restarted during a print of %s (%s, reset reason %d): "
+             "heaters go off as soon as the Ender answers", j.file,
+             hp_reset_reason_text(s_boot_reason), (int)s_boot_reason);
+}
+
+/** Run from hp_tick once the Ender is connected after such a boot. */
+static void hp_handle_orphan(void)
+{
+    /* Is the Ender printing from its own card meanwhile? Then it is not ours to stop. */
+    xSemaphoreTake(g_state_mutex, portMAX_DELAY);
+    g_state.opstate = PRINTER_OPERATIONAL;
+    xSemaphoreGive(g_state_mutex);
+    bool asked = hp_seq("M27");
+    if (!asked && ++s_orphan_tries < 5) return;            /* busy or no answer: next tick */
+    printer_state_t st;
+    printer_comm_get_state(&st);
+    bool own_sd = asked && st.opstate == PRINTER_PRINTING;
+
+    bool heaters_off = false;
+    if (!own_sd) {
+        heaters_off = hp_seq_retry("M104 S0", 3);
+        heaters_off = hp_seq_retry("M140 S0", 3) && heaters_off;
+        hp_seq("M77");
+    }
+
+    const char *why = hp_reset_reason_text(s_boot_reason);
+    job_record_t r = {
+        .file = s_orphan.file,
+        .start_epoch = s_orphan.start_epoch,
+        .duration_s = s_orphan.elapsed_s,
+        .result = "interrupted",
+        .reason = why,
+        .lines_sent = s_orphan.lines_sent,
+        .total_lines = s_orphan.total_lines,
+        .layer = s_orphan.layer,
+        .total_layers = s_orphan.total_layers,
+    };
+    job_history_add(&r);
+    hp_journal_clear();
+    s_orphan_pending = false;
+
+    /* worst case ~180 bytes: fits g_state.error_msg (192) without cutting a UTF-8 character */
+    char msg[256];
+    snprintf(msg, sizeof(msg), "Impressão interrompida: %s durante %.40s.%s", why, s_orphan.file,
+             own_sd ? " A Ender imprime pelo próprio cartão: aquecedores mantidos."
+             : heaters_off ? " Aquecedores desligados."
+                           : " A Ender não confirmou o desligamento: confira na tela dela.");
+    hp_set_error(msg);
 }
 
 /** Track the modes and feedrate the file sets, so a pause can restore them (F15-09). */
@@ -710,8 +857,10 @@ static void host_print_interrupt(const char *why)
     g_state.progress_pct = -1;
     g_state.print_time_left_s = -1;
     g_state.host_printing = false;
+    g_state.total_layers = -1;     /* lote 8: the screen kept the last job's total */
     xSemaphoreGive(g_state_mutex);
     hp_set_notice("");
+    hp_journal_clear();            /* lote 8 */
 
     char msg[192];
     snprintf(msg, sizeof(msg), "Impressão interrompida: %s.%s", why,
@@ -822,8 +971,10 @@ static bool host_print_finish(bool cancelled)
     g_state.host_printing = false;
     g_state.current_layer = 0;
     g_state.filename[0] = '\0';
+    g_state.total_layers = -1;     /* lote 8: the screen kept the last job's total */
     xSemaphoreGive(g_state_mutex);
     hp_set_notice("");
+    hp_journal_clear();            /* lote 8 */
     return heaters_off;
 }
 
@@ -833,6 +984,17 @@ void hp_cmd_start(const char *filename)
     if (s_hp.printing) {
         ESP_LOGW(TAG, "Host print already active");
         return;
+    }
+    /* lote 8: a job interrupted by an ESP32 restart is recorded (and its heaters turned off)
+     * before a new one starts; the new file heats again on its own */
+    if (s_orphan_pending) {
+        if (!marlin_is_connected()) {
+            ESP_LOGW(TAG, "Not starting %s: the job interrupted by the restart is still to be "
+                     "handled (waiting for the Ender)", filename);
+            return;
+        }
+        s_orphan_tries = 5;
+        hp_handle_orphan();
     }
 
     /* Ender Smart (F15-14): defence in depth — the HTTP layer already validates */
@@ -933,6 +1095,8 @@ void hp_cmd_start(const char *filename)
     strncpy(g_state.filename, filename, sizeof(g_state.filename) - 1);
     g_state.filename[sizeof(g_state.filename) - 1] = '\0';
     xSemaphoreGive(g_state_mutex);
+    hp_journal_save();             /* lote 8: survives an ESP32 restart */
+    ESP_LOGI(TAG, "Job journal written");
 }
 
 /** Pause host print: park head, stop timer */
@@ -978,6 +1142,7 @@ void hp_cmd_pause(void)
                      "Confira a impressora antes de retomar.", failed);
         hp_set_notice(msg);
     }
+    hp_journal_save();             /* lote 8 */
 }
 
 /** Resume host print: restore position, restart timer */
@@ -1006,6 +1171,7 @@ void hp_cmd_resume(void)
     g_state.opstate = PRINTER_PRINTING;
     xSemaphoreGive(g_state_mutex);
     ESP_LOGI(TAG, "Host print resumed (head restored)");
+    hp_journal_save();             /* lote 8 */
 }
 
 /** Cancel host print. With no job running it acknowledges a shown error. */
@@ -1034,7 +1200,14 @@ void hp_cmd_cancel(void)
 
 void hp_tick(void)
 {
+    /* lote 8: a job was running when the ESP32 went down: deal with it first */
+    if (s_orphan_pending && !s_hp.printing) {
+        if (marlin_is_connected()) hp_handle_orphan();
+        return;
+    }
     if (!s_hp.printing) return;
+    if (!s_hp.paused && esp_timer_get_time() - s_journal_saved_us >= JOURNAL_EVERY_US)
+        hp_journal_save();         /* lote 8: progress for the history if the ESP32 dies */
 
     /* Ender Smart (F15-06 / C4): never resume by itself after the printer restarted
      * or the USB link dropped. Wait for the link, turn the heaters off, report. */
@@ -1270,6 +1443,7 @@ void hp_tick(void)
 
 void hp_init(void)
 {
+    hp_journal_check_at_boot();    /* lote 8 */
     /* Struct is zero-initialized -- nothing to do */
 }
 
