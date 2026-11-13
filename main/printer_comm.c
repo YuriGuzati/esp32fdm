@@ -85,6 +85,7 @@ static uint32_t           s_spam_lines;     /* Creality debug lines dropped */
 #define NVS_KEY_AUTOTEMP        "autotemp"
 #define NVS_KEY_PAUSE_RETR      "pause_retr"   /* lote 6: tenths of mm */
 #define NVS_KEY_PAUSE_TEMP      "pause_temp"   /* lote 6: nozzle C while paused, 0 = keep */
+#define NVS_KEY_PAUSE_WIPE      "pause_wipe"   /* lote 7: purge line on resume, 1 = on */
 
 /* ---- Backend config ---- */
 
@@ -112,6 +113,8 @@ static int64_t s_last_m155_us;
  * waits (M109) for the print temperature again. */
 static uint16_t s_pause_retract_x10 = 65;  /* 0..100 = 0.0..10.0 mm */
 static uint16_t s_pause_temp_c = 170;      /* 0 = keep the print temperature */
+/* Ender Smart (lote 7): purge line + wipe at the left edge before resuming (host_print.c) */
+static bool s_pause_wipe = true;
 /* Ender Smart (lote 6): bumped by every parsed M114 answer, so a pause can tell a fresh
  * position from a stale one (the 1st pause on 2026-11-12 saved X0.4 Y20 from long before). */
 volatile uint32_t s_m114_seq;
@@ -1217,6 +1220,9 @@ static void load_config_from_nvs(void)
         s_pause_retract_x10 = u16;
     if (nvs_get_u16(nvs, NVS_KEY_PAUSE_TEMP, &u16) == ESP_OK && (u16 == 0 || (u16 >= 100 && u16 <= 260)))
         s_pause_temp_c = u16;
+    uint8_t wipe = 1;
+    if (nvs_get_u8(nvs, NVS_KEY_PAUSE_WIPE, &wipe) == ESP_OK)
+        s_pause_wipe = (wipe == 1);
 
     size_t ping_len = sizeof(s_echo_ping_cmds);
     if (nvs_get_str(nvs, NVS_KEY_ECHO_PING, s_echo_ping_cmds, &ping_len) != ESP_OK) {
@@ -1358,12 +1364,18 @@ void printer_comm_settings_json(char *out, size_t out_size)
     snprintf(out, out_size,
              "\"backend\":\"%s\",\"mr_host\":\"%s\",\"mr_port\":%u,"
              "\"pause_cmd\":\"%s\",\"filament_chk\":%s,\"echo_ping\":\"%s\",\"autotemp\":%s,"
-             "\"pause_retract\":%.1f,\"pause_temp\":%u",
+             "\"pause_retract\":%.1f,\"pause_temp\":%u,\"pause_wipe\":%s",
              s_backend == PRINTER_BACKEND_KLIPPER ? "klipper" : "marlin",
              host, (unsigned)s_mr_port,
              s_pause_cmd == PAUSE_CMD_M524 ? "m524" : "m25",
              s_filament_check ? "true" : "false", echo, s_autotemp ? "true" : "false",
-             s_pause_retract_x10 / 10.0f, (unsigned)s_pause_temp_c);
+             s_pause_retract_x10 / 10.0f, (unsigned)s_pause_temp_c,
+             s_pause_wipe ? "true" : "false");
+}
+
+bool printer_comm_pause_wipe(void)
+{
+    return s_pause_wipe;
 }
 
 /* ---- Ender Smart (lote 6): pause settings for host_print.c ---- */
@@ -1834,6 +1846,9 @@ static esp_err_t printer_config_marlin_post_handler(httpd_req_t *req)
     }
     if (new_retr >= 0) s_pause_retract_x10 = (uint16_t)new_retr;
     if (new_ptemp >= 0) s_pause_temp_c = (uint16_t)new_ptemp;
+    /* lote 7: purge line on resume; a field that is not sent keeps its value */
+    const char *pw = strstr(body, "pause_wipe=");
+    if (pw) s_pause_wipe = (pw[11] == '1');
 
     pause_cmd_t new_cmd = (strstr(body, "pause_cmd=m524") != NULL)
                            ? PAUSE_CMD_M524 : PAUSE_CMD_M25;
@@ -1876,6 +1891,7 @@ static esp_err_t printer_config_marlin_post_handler(httpd_req_t *req)
         if (autotemp_given) nvs_set_u8(nvs, NVS_KEY_AUTOTEMP, s_autotemp ? 1 : 0);
         if (new_retr >= 0) nvs_set_u16(nvs, NVS_KEY_PAUSE_RETR, s_pause_retract_x10);
         if (new_ptemp >= 0) nvs_set_u16(nvs, NVS_KEY_PAUSE_TEMP, s_pause_temp_c);
+        if (pw) nvs_set_u8(nvs, NVS_KEY_PAUSE_WIPE, s_pause_wipe ? 1 : 0);
         nvs_commit(nvs);
         nvs_close(nvs);
     }

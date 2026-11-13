@@ -24,6 +24,24 @@ static const char *TAG = "host_print";
 #define PARK_X       0.0f
 #define PARK_Y       0.0f
 #define PARK_Z_LIFT  5.0f    /* mm to lift Z on pause */
+
+/* Ender Smart (lote 7): purge line drawn when resuming, so what oozed while the nozzle
+ * reheated stays on the bed instead of on the part (a small scar was left at the resume
+ * point on 2026-11-13). It is drawn in the strip where this Ender's start G-code draws its
+ * own purge lines (X0.1/X0.4, Y20..200), so the area is known to be free of clips, and
+ * only when the part is far from it. The head reaches the strip lifted above the part and
+ * leaves it lifted again before travelling back. */
+#define PURGE_X0      1.5f    /* 1st line of the job; each next pause moves 0.8 mm right */
+#define PURGE_DX      0.8f
+#define PURGE_MAX     8       /* lines per job (X up to 7.1) */
+#define PURGE_Y0      20.0f
+#define PURGE_LEN     40.0f   /* extruding part of the line */
+#define PURGE_WIPE    10.0f   /* then on without extruding: the string stays on the bed */
+#define PURGE_Z       0.3f    /* same height as the start purge line */
+#define PURGE_E       3.0f    /* mm of filament over PURGE_LEN (start purge: 15 mm / 180 mm) */
+#define PURGE_RETRACT 1.0f    /* small retract before leaving, undone at the part */
+#define PURGE_MARGIN  50.0f   /* part this far to the RIGHT of the strip: room for the hotend,
+                                 duct and carriage beside the nozzle at bed height */
 /* Ender Smart (lote 6): the retract (default 6.5 mm) and the nozzle temperature while
  * paused (default 170 C) are settings now: printer_comm_pause_retract_mm()/_temp_c(). */
 
@@ -81,6 +99,14 @@ typedef struct {
     bool park_lifted;          /* the Z lift got its "ok" */
     float park_retracted;      /* mm retracted with an "ok" (0 = none) */
     bool expect_layers;        /* the file has ;LAYER: / ;LAYER_CHANGE markers */
+
+    /* Ender Smart (lote 7): purge line on resume */
+    bool has_part_area;        /* XY extent of the part known from the file scan */
+    float part_x0, part_x1, part_y0, part_y1;
+    int purge_count;           /* purge lines already drawn in this job */
+    bool park_purge;           /* parked at the strip: the resume draws a line there */
+    float purge_x;             /* X of that line */
+    bool at_bed;               /* nozzle down at the strip (a resume stopped there): lift first */
 
     /* Ender Smart (F15-06/07): reasons to stop streaming */
     volatile bool printer_reset;   /* Marlin boot banner seen */
@@ -401,6 +427,53 @@ static bool hp_num(const char *gcode)
     return hp_seq_checks(gcode, unk0, usr0);
 }
 
+/** Ender Smart (lote 7): is the purge strip at X=x far enough from the part? */
+static bool hp_purge_strip_free(float x)
+{
+    if (!s_hp.has_part_area) return false;
+    /* Only "the whole part is to the right of the strip": separation in Y alone would need
+     * the size of the head body (duct, probe, carriage) in Y, which was not measured. */
+    return s_hp.part_x0 > x + 0.5f + PURGE_MARGIN;              /* the strip spans X0..x */
+}
+
+/** Ender Smart (lote 7): draw the purge line and wipe on the bed. Called hot, lifted above the
+ *  part, at the strip; it ends lifted again, before any XY move toward the part. E moves are
+ *  relative and their flags are cleared before they are sent, so a retry never extrudes twice;
+ *  at_bed makes a retry lift first if this stops with the nozzle down. */
+static bool hp_purge(char *failed, size_t failed_len)
+{
+    char buf[64];
+    const float x = s_hp.purge_x;
+    s_hp.park_purge = false;                                    /* never drawn twice */
+    snprintf(failed, failed_len, "desenhar a linha de limpeza");
+
+    snprintf(buf, sizeof(buf), "G1 X%.2f Y%.2f F6000", x, PURGE_Y0);
+    if (!hp_num(buf)) return false;                             /* still lifted: safe */
+    snprintf(buf, sizeof(buf), "G1 Z%.2f F600", PURGE_Z);
+    s_hp.at_bed = true;
+    s_hp.purge_count++;        /* now: a line cut short is never drawn over by the next pause */
+    if (!hp_num(buf) || !hp_num("M83")) return false;
+    if (s_hp.park_retracted > 0.0f) {                           /* undo the pause retract */
+        snprintf(buf, sizeof(buf), "G1 E%.2f F2400", s_hp.park_retracted);
+        s_hp.park_retracted = 0.0f;
+        if (!hp_num(buf)) return false;
+    }
+    snprintf(buf, sizeof(buf), "G1 Y%.2f E%.2f F1000", PURGE_Y0 + PURGE_LEN, PURGE_E);
+    if (!hp_num(buf)) return false;
+    snprintf(buf, sizeof(buf), "G1 E-%.2f F2400", PURGE_RETRACT);
+    if (!hp_num(buf)) return false;
+    s_hp.park_retracted = PURGE_RETRACT;                        /* undone at the part */
+    snprintf(buf, sizeof(buf), "G1 Y%.2f F3000", PURGE_Y0 + PURGE_LEN + PURGE_WIPE);
+    if (!hp_num(buf)) return false;                             /* wipe: string stays here */
+    snprintf(buf, sizeof(buf), "G1 Z%.2f F600", s_hp.park_z + PARK_Z_LIFT);
+    if (!hp_num(buf)) return false;                             /* lift BEFORE travelling */
+    s_hp.at_bed = false;
+    failed[0] = '\0';
+    ESP_LOGI(TAG, "Purge line %d drawn at X%.1f Y%.0f..%.0f", s_hp.purge_count, x,
+             PURGE_Y0, PURGE_Y0 + PURGE_LEN);
+    return true;
+}
+
 /** Save position, E and temperatures, then park the head (F15-09).
  *  Ender Smart (lote 6): every command is checked, and only what got an "ok" is recorded,
  *  so the resume undoes exactly that. The head only moves to the corner after the lift
@@ -471,11 +544,24 @@ static bool host_print_park(char *failed, size_t failed_len)
         absolute = hp_num("G90");
     }
 
-    /* 3. Corner: only lifted, homed, in absolute mode and with a position to return to */
+    /* 3. Corner: only lifted, homed, in absolute mode and with a position to return to.
+     *    Lote 7: by the purge strip when the resume will draw a line there, else X0 Y0. */
+    s_hp.park_purge = false;
     if (s_hp.park_lifted && s_hp.homed && s_hp.pos_known && absolute) {
-        snprintf(buf, sizeof(buf), "G1 X%.1f Y%.1f F6000", PARK_X, PARK_Y);
-        if (!hp_num(buf) && !failed[0])
+        float px = PURGE_X0 + PURGE_DX * (float)s_hp.purge_count;
+        const char *why_not = !printer_comm_pause_wipe() ? "turned off"
+                            : s_hp.purge_count >= PURGE_MAX ? "too many pauses"
+                            : s_hp.saved_hotend < 175.0f ? "nozzle not at print temperature"
+                            : !hp_purge_strip_free(px) ? "part near the strip or area unknown" : NULL;
+        float tx = why_not ? PARK_X : px, ty = why_not ? PARK_Y : PURGE_Y0;
+        snprintf(buf, sizeof(buf), "G1 X%.1f Y%.1f F6000", tx, ty);
+        if (hp_num(buf)) {
+            s_hp.park_purge = (why_not == NULL);
+            s_hp.purge_x = px;
+            if (why_not) ESP_LOGI(TAG, "No purge line on resume: %s", why_not);
+        } else if (!failed[0]) {
             snprintf(failed, failed_len, "levar a cabeça para o canto");
+        }
     } else if (!s_hp.pos_known && !failed[0]) {
         snprintf(failed, failed_len, "ler a posição (M114)");
     }
@@ -519,6 +605,20 @@ static bool host_print_unpark(char *failed, size_t failed_len)
         snprintf(failed, failed_len, "voltar ao modo absoluto (G90)");
         return false;
     }
+    /* lote 7: always start above the part (absolute, so it can be repeated): covers a
+     * previous attempt that stopped with the nozzle down at the strip, and a head moved
+     * from the Ender's own menu during the pause */
+    if (s_hp.pos_known) {
+        snprintf(buf, sizeof(buf), "G1 Z%.2f F600", s_hp.park_z + PARK_Z_LIFT);
+        if (!hp_num(buf)) {
+            snprintf(failed, failed_len, "subir o bico acima da peça");
+            return false;
+        }
+        s_hp.at_bed = false;
+    }
+    /* lote 7: purge line and wipe at the strip, then back up before travelling */
+    if (s_hp.park_purge && s_hp.pos_known && !hp_purge(failed, failed_len))
+        return false;
     if (s_hp.pos_known) {
         ESP_LOGI(TAG, "Unparking to X%.2f Y%.2f Z%.2f", s_hp.park_x, s_hp.park_y, s_hp.park_z);
         snprintf(buf, sizeof(buf), "G1 X%.2f Y%.2f F6000", s_hp.park_x, s_hp.park_y);
@@ -653,12 +753,20 @@ static bool host_print_finish(bool cancelled)
          * line gets a Resend instead of becoming another move. No M400 first: the
          * planner runs moves in order, so the lift comes after the queued ones anyway,
          * and M400 was what made the printer busy. */
+        if (s_hp.at_bed && s_hp.pos_known) {
+            /* lote 7: a resume stopped with the nozzle down at the purge strip: first back
+             * above the part, so the trip to the corner never goes at bed height */
+            char up[32];
+            snprintf(up, sizeof(up), "G1 Z%.2f F600", s_hp.park_z + PARK_Z_LIFT);
+            if (hp_num("G90") && hp_num(up)) s_hp.at_bed = false;
+        }
         bool lifted = hp_num("G91") && hp_num("G1 Z10 F600");  /* Raise nozzle 10mm */
         bool absolute = hp_num("G90");                          /* Absolute positioning */
         /* Ender Smart: an absolute XY move is only safe after homing. Cancelling
          * during the initial heat-up (before G28) used to drive the head to
-         * X0 Y200 from an unknown position. Lote 6: and only after the lift. */
-        if (s_hp.homed && lifted && absolute)
+         * X0 Y200 from an unknown position. Lote 6: and only after the lift.
+         * Lote 7: and never while the nozzle may still be low at the purge strip. */
+        if (s_hp.homed && lifted && absolute && !s_hp.at_bed)
             hp_num("G1 X0 Y200 F3000");                         /* Park head at rear-left */
     }
 
@@ -755,6 +863,12 @@ void hp_cmd_start(const char *filename)
     s_hp.layer = 0;
     s_hp.has_layer_comments = false;
     s_hp.expect_layers = scan.has_layer_markers;
+    s_hp.has_part_area = scan.has_part_area;                  /* lote 7 */
+    s_hp.part_x0 = scan.part_x0; s_hp.part_x1 = scan.part_x1;
+    s_hp.part_y0 = scan.part_y0; s_hp.part_y1 = scan.part_y1;
+    s_hp.purge_count = 0;
+    s_hp.park_purge = false;
+    s_hp.at_bed = false;
     s_hp.pos_known = false;
     s_hp.park_lifted = false;
     s_hp.park_retracted = 0.0f;

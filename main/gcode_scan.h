@@ -17,6 +17,12 @@ typedef struct {
     float first_layer_height; /* from slicer comment or first Z */
     int32_t total_layers;     /* from ;LAYER: comments */
     bool has_layer_markers;   /* Ender Smart (lote 6): ;LAYER: or ;LAYER_CHANGE seen */
+    /* Ender Smart (lote 7): XY extent of the extrusion moves of the part (after the first
+     * layer marker, so the start G-code purge lines are left out; without markers, all
+     * extrusion moves). Relative XY moves are added to the position; has_part_area is false
+     * if something is extruded from an unknown position (e.g. right after G28). */
+    bool has_part_area;
+    float part_x0, part_x1, part_y0, part_y1;
 } gcode_scan_t;
 
 /**

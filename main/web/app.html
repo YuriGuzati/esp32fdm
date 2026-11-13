@@ -1368,14 +1368,16 @@ function Config() {
       /* pausa da impressão pela ESP32 (lote 6) */
       const pr = h('input', { type: 'number', min: 0, max: 10, step: 0.5, value: s.pause_retract != null ? s.pause_retract : 6.5 });
       const pt = h('input', { type: 'number', min: 0, max: 260, step: 5, value: s.pause_temp != null ? s.pause_temp : 170 });
+      const pw = h('input', { type: 'checkbox', checked: s.pause_wipe !== false });
       el.append(sec('Marlin',
         h('span', { class: 'small muted' }, 'Pausa de impressão feita pelo cartão da própria Ender:'),
         h('label', { class: 'chk' }, p25, 'M25: pausa (pode retomar)'), h('label', { class: 'chk' }, p524, 'M524: aborta (se o M25 travar o firmware)'),
-        h('span', { class: 'small muted' }, 'Pausa de impressão enviada pela ESP32 (a cabeça sobe 5 mm e vai para o canto X0 Y0):'),
+        h('span', { class: 'small muted' }, 'Pausa de impressão enviada pela ESP32 (a cabeça sobe 5 mm acima da peça e vai para a borda esquerda ou para o canto X0 Y0):'),
         h('div', { class: 'grid2' },
           h('label', { class: 'f' }, 'Recolher o filamento (mm, 0 a 10)', pr),
           h('label', { class: 'f' }, 'Bico durante a pausa (°C, 0 = manter)', pt)),
         h('span', { class: 'tiny faint' }, 'Bowden (Ender-3 Max Neo): 6,5 mm, como o perfil do Cura. Com o bico mais frio, o plástico não escorre; ao retomar, a ESP32 espera voltar à temperatura da impressão.'),
+        h('label', { class: 'chk' }, pw, 'Ao retomar, fazer uma linha de limpeza na borda esquerda da mesa (onde fica a linha de purga do início), para o que escorreu não ir para a peça. Só quando a peça está a mais de 40 mm dessa borda'),
         h('label', { class: 'chk' }, fc, 'Consultar o sensor de filamento (M119) durante a impressão e pausar se acabar'),
         h('label', { class: 'chk' }, at, 'Temperatura enviada pela Ender a cada 2 s (M155 S2), em vez de a ESP32 perguntar com M105. Atualiza a temperatura também durante a impressão'),
         h('label', { class: 'f' }, 'Comandos que precisam de "ping" (ajuste avançado)', ep),
@@ -1383,7 +1385,7 @@ function Config() {
           const rv = parseFloat(pr.value), tv = parseInt(pt.value, 10);
           if (!(rv >= 0 && rv <= 10)) { toast('Recolher: use de 0 a 10 mm', true); return; }
           if (!(tv === 0 || (tv >= 100 && tv <= 260))) { toast('Bico na pausa: 0 (manter) ou de 100 a 260 °C', true); return; }
-          const d = { pause_cmd: p524.checked ? 'm524' : 'm25', echo_ping: ep.value, autotemp: at.checked ? 1 : 0, pause_retract: rv, pause_temp: tv }; if (fc.checked) d.filament_chk = 1;
+          const d = { pause_cmd: p524.checked ? 'm524' : 'm25', echo_ping: ep.value, autotemp: at.checked ? 1 : 0, pause_retract: rv, pause_temp: tv, pause_wipe: pw.checked ? 1 : 0 }; if (fc.checked) d.filament_chk = 1;
           try { await post('/printer/config/marlin', d); toast('Salvo'); loadSettings(); } catch (e) { toast(e.message, true); }
         } }, 'Salvar')));
     }

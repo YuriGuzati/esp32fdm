@@ -6,6 +6,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -13,6 +14,34 @@
 static const char *TAG = "gcode_scan";
 
 /* ---- Quick scan (used by host print start) ---- */
+
+/** Ender Smart (lote 7): value of one axis word ("X12.5") of a G-code line, comments ignored. */
+static bool gc_axis(const char *line, char axis, float *out)
+{
+    /* the letter starts a word when it follows a space, a tab or the previous word's number
+     * ("G1X10Y20E1" is valid G-code too) */
+    for (const char *p = line; *p && *p != ';'; p++) {
+        if ((*p == axis || *p == axis + 32) && (p == line || !isalpha((unsigned char)p[-1]))) {
+            char *end;
+            float v = strtof(p + 1, &end);
+            if (end == p + 1) return false;
+            *out = v;
+            return true;
+        }
+    }
+    return false;
+}
+
+typedef struct { float x0, x1, y0, y1; bool any; } gc_box_t;
+
+static void gc_box_add(gc_box_t *b, float x, float y)
+{
+    if (!b->any) { b->x0 = b->x1 = x; b->y0 = b->y1 = y; b->any = true; return; }
+    if (x < b->x0) b->x0 = x;
+    if (x > b->x1) b->x1 = x;
+    if (y < b->y0) b->y0 = y;
+    if (y > b->y1) b->y1 = y;
+}
 
 void gcode_scan_file(FILE *f, gcode_scan_t *out)
 {
@@ -24,6 +53,10 @@ void gcode_scan_file(FILE *f, gcode_scan_t *out)
     int32_t layer_change_count = 0;
     float first_z = 0, prev_z = 0;
     bool seen_z = false;
+    /* lote 7: part extent */
+    gc_box_t all = {0}, part = {0};
+    float cur_x = 0, cur_y = 0;
+    bool x_known = false, y_known = false, rel_xy = false, after_marker = false, area_bad = false;
 
     rewind(f);
     while (fgets(buf, sizeof(buf), f)) {
@@ -50,10 +83,12 @@ void gcode_scan_file(FILE *f, gcode_scan_t *out)
             if (strncmp(buf, ";LAYER:", 7) == 0) {
                 int32_t n = atoi(buf + 7);
                 if (n > max_layer) max_layer = n;
+                after_marker = true;
             }
             /* OrcaSlicer: ;LAYER_CHANGE */
             if (strncmp(buf, ";LAYER_CHANGE", 13) == 0) {
                 layer_change_count++;
+                after_marker = true;
             }
             /* Cura: ;Layer height: 0.2 */
             const char *clh = strstr(buf, ";Layer height:");
@@ -62,6 +97,51 @@ void gcode_scan_file(FILE *f, gcode_scan_t *out)
                 if (v > 0.01f && v < 1.0f) out->layer_height = v;
             }
             continue;
+        }
+
+        /* lote 7: XY extent of the extrusion moves (absolute XY only) */
+        if (buf[0] == 'G' || buf[0] == 'g') {
+            int gc = atoi(buf + 1);
+            float v;
+            if (gc == 91) {
+                rel_xy = true;
+            } else if (gc == 90) {
+                rel_xy = false;
+            } else if (gc == 28) {
+                x_known = y_known = false;          /* at the endstops: coordinates unknown */
+            } else if (gc == 92) {
+                /* G92 X/Y shifts the coordinates: the area would no longer be in the bed's
+                 * frame, and "X1.5" would not be the physical left edge */
+                if (gc_axis(buf, 'X', &v) || gc_axis(buf, 'Y', &v)) area_bad = true;
+            } else if (gc == 2 || gc == 3) {
+                /* arcs (arc fitting, ArcWelder) bulge beyond their end points: not tracked */
+                if (gc_axis(buf, 'E', &v) || gc_axis(buf, 'X', &v) || gc_axis(buf, 'Y', &v))
+                    area_bad = true;
+            } else if (gc == 0 || gc == 1) {
+                float vx = 0, vy = 0, e = 0;
+                bool hx = gc_axis(buf, 'X', &vx), hy = gc_axis(buf, 'Y', &vy);
+                bool he = gc_axis(buf, 'E', &e);
+                if (hx || hy) {
+                    /* Relative XY (G91) adds to the current position: Cura's end G-code
+                     * does "G91 / G1 X5 Y5". An unknown position stays unknown. */
+                    float nx = hx ? (rel_xy ? cur_x + vx : vx) : cur_x;
+                    float ny = hy ? (rel_xy ? cur_y + vy : vy) : cur_y;
+                    bool nx_known = rel_xy ? x_known : (x_known || hx);
+                    bool ny_known = rel_xy ? y_known : (y_known || hy);
+                    if (he && e > 0.0f && nx_known && ny_known) {
+                        gc_box_add(&all, nx, ny);
+                        if (after_marker) gc_box_add(&part, nx, ny);
+                        if (x_known && y_known) {
+                            gc_box_add(&all, cur_x, cur_y);
+                            if (after_marker) gc_box_add(&part, cur_x, cur_y);
+                        }
+                    } else if (he && e > 0.0f) {
+                        area_bad = true;            /* extrusion from an unknown position */
+                    }
+                    cur_x = nx; cur_y = ny;
+                    x_known = nx_known; y_known = ny_known;
+                }
+            }
         }
 
         /* Track Z from G0/G1 moves */
@@ -108,6 +188,19 @@ void gcode_scan_file(FILE *f, gcode_scan_t *out)
     ESP_LOGI(TAG, "GCode scan: %ld lines, maxZ=%.2f, layers=%ld, lh=%.2f, flh=%.2f",
              (long)out->total_lines, out->max_z, (long)out->total_layers,
              out->layer_height, out->first_layer_height);
+
+    /* lote 7: part extent. With layer markers, only the moves after the first one (the start
+     * purge lines come before it); without markers, every extrusion (purge lines included,
+     * which only makes the area bigger). Never with relative XY. */
+    const gc_box_t *b = out->has_layer_markers ? &part : &all;
+    if (!area_bad && b->any) {
+        out->has_part_area = true;
+        out->part_x0 = b->x0; out->part_x1 = b->x1;
+        out->part_y0 = b->y0; out->part_y1 = b->y1;
+        ESP_LOGI(TAG, "Part area: X%.1f..%.1f Y%.1f..%.1f", b->x0, b->x1, b->y0, b->y1);
+    } else {
+        ESP_LOGI(TAG, "Part area unknown (%s)", area_bad ? "extrusion from an unknown position" : "no extrusion moves");
+    }
 }
 
 /* ---- GCode scan cache (/cache/gcode/) ---- */

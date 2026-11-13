@@ -206,6 +206,9 @@ float printer_comm_pause_retract_mm(void);
 /** Ender Smart (lote 6): nozzle temperature while paused, in C (0 = keep, default 170). */
 int printer_comm_pause_temp_c(void);
 
+/** Ender Smart (lote 7): draw a purge line at the left edge before resuming (default on). */
+bool printer_comm_pause_wipe(void);
+
 /** Ender Smart (F2-02): last M115 answer as a JSON object (firmware line, age, capabilities). */
 void printer_comm_info_json(char *out, size_t out_size);
 
