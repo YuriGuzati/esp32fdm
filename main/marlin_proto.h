@@ -39,6 +39,9 @@ typedef enum {
 #define PCMD_HOST_PAUSE  101
 #define PCMD_HOST_RESUME 102
 #define PCMD_HOST_CANCEL 103
+/* lote 9: a cancel queued by a safety error line; with the job already stopped it must not
+ * clear the error the stop left on the screen (a user cancel acknowledges it) */
+#define PCMD_HOST_SAFETY_CANCEL 104
 
 /* Host print command timeout: must be longer than the M113 keepalive
  * interval (2s) so Marlin has a chance to send "busy: processing"
@@ -86,6 +89,8 @@ bool marlin_send_cmd(const char *gcode, query_type_t qtype);
 
 /** Host print variant: shorter timeout (3s), with CDC stall ping retries. */
 bool marlin_send_cmd_hp(const char *gcode, query_type_t qtype);
+bool marlin_send_cmd_quiet(const char *gcode, query_type_t qtype);   /* lote 9 */
+bool printer_comm_cmd_waiting(void);                                 /* lote 9 */
 
 /** Process any buffered RX data (auto-reports, etc.) */
 void marlin_drain_rx(void);
@@ -115,10 +120,13 @@ void hp_cmd_start(const char *filename);
 void hp_cmd_pause(void);
 void hp_cmd_resume(void);
 void hp_cmd_cancel(void);
+void hp_cmd_safety_cancel(const char *why);   /* lote 9: why = the Ender's line */
 
 /** Run one iteration of the host print streaming loop.
- *  Sends up to 4 GCode lines per call. */
-void hp_tick(void);
+ *  Ender Smart (lote 9): sends up to HP_ROUND_LINES lines or for HP_ROUND_US at most.
+ *  Returns true when it stopped at one of those limits (more lines are ready now), false
+ *  otherwise (no job, paused, end of file, busy cooldown, error). */
+bool hp_tick(void);
 
 /** Notifications from process_line() RX parsing */
 void hp_notify_resend(int32_t line_num);

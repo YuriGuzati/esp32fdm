@@ -21,6 +21,11 @@ static const char *TAG = "host_print";
 
 #define HOST_RESEND_MAX_RETRIES 5
 #define HOST_LINE_HISTORY_SIZE  5
+/* Ender Smart (lote 9 / F2-05): one round of hp_tick sends at most this many lines or runs
+ * this long, then printer_comm handles its queue (pause, cancel, API) and calls again after
+ * one tick. Before: 4 lines, then 20 ms. A round of comment lines also ends at the time limit. */
+#define HP_ROUND_LINES          16
+#define HP_ROUND_US             (50 * 1000LL)
 
 /* Park position and retract settings */
 #define PARK_X       0.0f
@@ -455,6 +460,9 @@ static bool send_query_numbered(const char *gcode)
      * normal lines use short HP timeout with CDC stall ping retries. */
     bool (*sender)(const char *, query_type_t) =
         is_long_running_cmd(gcode) ? marlin_send_cmd : marlin_send_cmd_hp;
+    /* lote 9: a G4 of the job keeps the standard timeout, but logs at DEBUG */
+    if ((gcode[0] == 'G' || gcode[0] == 'g') && atoi(gcode + 1) == 4)
+        sender = marlin_send_cmd_quiet;
 
     s_hp.resend_line = -1;
     s_hp.resend_retries = 0;
@@ -1174,6 +1182,55 @@ void hp_cmd_resume(void)
     hp_journal_save();             /* lote 8 */
 }
 
+/** Copy of the error on screen ("" if none) */
+static void hp_get_error(char *out, size_t len)
+{
+    xSemaphoreTake(g_state_mutex, portMAX_DELAY);
+    strlcpy(out, g_state.error_msg, len);
+    xSemaphoreGive(g_state_mutex);
+}
+
+/** Ender Smart (lote 9): cancel queued by a safety error line of the Ender (thermal runaway,
+ *  cold extrusion...); why = that line. The screen says why the job stopped:
+ *  - job still running: normal cancel; with no other error, "a Ender acusou: <line>";
+ *  - job already stopped (a halted Ender stops answering, so the job was interrupted with an
+ *    error): keep that error (only a user cancel clears it) and add the line if it fits. */
+void hp_cmd_safety_cancel(const char *why)
+{
+    char cur[sizeof(g_state.error_msg)];
+    char msg[sizeof(g_state.error_msg)];
+    const char *add = " A Ender acusou: ";
+    char reason[64];
+    strlcpy(reason, why ? why : "", sizeof(reason));
+    /* /api/status puts error_msg into JSON unescaped: keep plain ASCII, no quote/backslash
+     * (a lost byte on the link can put anything in the Ender's line) */
+    for (char *c = reason; *c; c++) {
+        unsigned char u = (unsigned char)*c;
+        if (u < 0x20 || u > 0x7E || u == '"' || u == '\\') *c = '?';
+    }
+
+    if (!s_hp.printing) {
+        ESP_LOGW(TAG, "Safety cancel: the job had already stopped; the error stays on screen");
+        hp_get_error(cur, sizeof(cur));
+        if (reason[0] && strlen(cur) + strlen(add) + strlen(reason) < sizeof(msg)) {
+            strlcpy(msg, cur[0] ? cur : "Impressão interrompida.", sizeof(msg));
+            strlcat(msg, add, sizeof(msg));
+            strlcat(msg, reason, sizeof(msg));
+            hp_set_error(msg);
+        }
+        return;
+    }
+    hp_cmd_cancel();
+    hp_get_error(cur, sizeof(cur));
+    if (cur[0] == '\0') {
+        /* the cancel confirmed the heaters off (else it left its own error) */
+        strlcpy(msg, "Impressão cancelada: a Ender acusou um erro (", sizeof(msg));
+        strlcat(msg, reason, sizeof(msg));
+        strlcat(msg, "). Aquecedores desligados.", sizeof(msg));
+        hp_set_error(msg);
+    }
+}
+
 /** Cancel host print. With no job running it acknowledges a shown error. */
 void hp_cmd_cancel(void)
 {
@@ -1198,29 +1255,29 @@ void hp_cmd_cancel(void)
 
 /* ---- Host print streaming loop ---- */
 
-void hp_tick(void)
+bool hp_tick(void)
 {
     /* lote 8: a job was running when the ESP32 went down: deal with it first */
     if (s_orphan_pending && !s_hp.printing) {
         if (marlin_is_connected()) hp_handle_orphan();
-        return;
+        return false;
     }
-    if (!s_hp.printing) return;
+    if (!s_hp.printing) return false;
     if (!s_hp.paused && esp_timer_get_time() - s_journal_saved_us >= JOURNAL_EVERY_US)
         hp_journal_save();         /* lote 8: progress for the history if the ESP32 dies */
 
     /* Ender Smart (F15-06 / C4): never resume by itself after the printer restarted
      * or the USB link dropped. Wait for the link, turn the heaters off, report. */
     if (s_hp.printer_reset || s_hp.usb_lost || s_hp.desync) {
-        if (!marlin_is_connected()) return;
+        if (!marlin_is_connected()) return false;
         host_print_interrupt(s_hp.printer_reset ? "a Ender reiniciou"
                              : s_hp.desync ? "a impressora pediu uma linha antiga"
                                            : "a conexão USB caiu");
-        return;
+        return false;
     }
 
-    if (s_hp.paused) return;
-    if (!marlin_is_connected()) return;
+    if (s_hp.paused) return false;
+    if (!marlin_is_connected()) return false;
 
     /* lote 6: a failed sequence command left the printer's line number unknown */
     if (s_hp.counter_unsure) {
@@ -1229,7 +1286,7 @@ void hp_tick(void)
         if (!hp_seq(m110)) {
             if (++s_hp.resync_fails >= 3)
                 host_print_interrupt("a impressora parou de responder");
-            return;
+            return false;
         }
         s_hp.counter_unsure = false;
     }
@@ -1237,8 +1294,18 @@ void hp_tick(void)
 
     int lines_this_batch = 0;
     char line[256];
+    const int64_t round_start_us = esp_timer_get_time();
+    bool at_limit = false;          /* lote 9: stopped by the round limits, more is ready */
 
-    while (lines_this_batch < 4 && s_hp.file) {
+    while (s_hp.file) {
+        /* lote 9: also end the round at once when a command (pause, cancel, a safety
+         * cancel, the API) is waiting, so it is not 15 lines late */
+        if (lines_this_batch >= HP_ROUND_LINES ||
+            esp_timer_get_time() - round_start_us >= HP_ROUND_US ||
+            (lines_this_batch > 0 && printer_comm_cmd_waiting())) {
+            at_limit = true;
+            break;
+        }
         if (esp_timer_get_time() < s_cmd_cooldown_until_us) break;
 
         /* Use pending line from previous failed send, or read new */
@@ -1437,6 +1504,8 @@ void hp_tick(void)
         }
         xSemaphoreGive(g_state_mutex);
     }
+    /* a pause, cancel or error inside the round ends the job's streaming for now */
+    return at_limit && s_hp.printing && !s_hp.paused;
 }
 
 /* ---- Query functions ---- */

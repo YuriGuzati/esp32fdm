@@ -138,6 +138,14 @@ static bool s_busy_for_user;
 /* ... and how many such lines came: a pause/resume/cancel command that sees one was only
  * queued by the Ender, not done, so the sequence treats it as a failure */
 volatile uint32_t s_busy_user_seq;
+/* Ender Smart (lote 9): every ping (M118 E1 ping) gets its own "echo:ping" and "ok". These
+ * count the echoes, the "ok" lines, and the "ok" count when the last echo came, so a command
+ * that sent pings can read on until the last ping's "ok" (see settle_pings). */
+static volatile uint32_t s_ping_echo_seq;
+static volatile uint32_t s_ok_seq;
+static volatile uint32_t s_ok_seq_at_echo;
+#define PING_SETTLE_US        (300 * 1000LL)  /* M118 is instant: its reply follows at once */
+#define PARTIAL_LINE_WAIT_US  (20 * 1000LL)   /* a 96-char line takes ~8.3 ms at 115200 */
 static char s_echo_ping_cmds[128] = "";  /* Comma-separated GCode prefixes that need CDC flush ping */
 
 /* ---- Temperature history circular buffer ---- */
@@ -414,6 +422,14 @@ static void process_line(const char *line)
     /* Skip empty lines */
     if (line[0] == '\0') return;
 
+    /* lote 9: a ping's echo; strstr because a lost byte gave "4echo:ping" (T-13) */
+    if (strstr(line, "echo:ping")) {
+        s_ping_echo_seq++;
+        /* an "ok" glued in front ("okecho:ping", a lost newline) is counted below and is
+         * not the ping's: the ping's own "ok" is still to come */
+        s_ok_seq_at_echo = s_ok_seq + (strncmp(line, "ok", 2) == 0 ? 1u : 0u);
+    }
+
     /* Ender Smart (F15-23): the Creality firmware prints debug garbage on the serial
      * port while the Z offset is adjusted on its screen ("d:babystep",
      * "b:%d2,dis:%d", hundreds of lines per adjustment). Drop it. */
@@ -581,7 +597,8 @@ static void process_line(const char *line)
         if (safety_err) {
             if (hp_is_active()) {
                 ESP_LOGE(TAG, "Safety error — aborting host print: %s", line);
-                printer_cmd_t cmd = { .type = PCMD_HOST_CANCEL };
+                printer_cmd_t cmd = { .type = PCMD_HOST_SAFETY_CANCEL };   /* lote 9 */
+                strncpy(cmd.gcode, line, sizeof(cmd.gcode) - 1);   /* the reason, for the screen */
                 xQueueSend(s_cmd_queue, &cmd, 0);
             } else if (g_state.opstate == PRINTER_PRINTING) {
                 ESP_LOGE(TAG, "Safety error — cancelling SD print: %s", line);
@@ -652,6 +669,7 @@ static void process_line(const char *line)
     /* "ok" signals end of response for current query.
      * Marlin often sends "ok T:205.3 /210.0 B:60.1 /60.0" — temp data on the ok line. */
     if (strncmp(line, "ok", 2) == 0) {
+        s_ok_seq++;                /* lote 9: see settle_pings */
         if (strstr(line, "T:")) {
             parse_m105(line);
         }
@@ -683,6 +701,28 @@ void marlin_drain_rx(void)
     uint8_t rx_byte;
     while (xStreamBufferReceive(s_rx_stream, &rx_byte, 1, 0) > 0)
         rx_feed_byte(rx_byte);
+}
+
+/** Ender Smart (lote 9): read on until the echo of ping number target_echo and an "ok"
+ *  after it, for PING_SETTLE_US at most.
+ *  When a command's "ok" was only late (not lost), the ping sent meanwhile adds a second
+ *  "ok". Before, the 10 ms after the next line's TX usually let that line's own "ok" arrive
+ *  and the drain before the line after dropped it. Without the delay the extra "ok" would
+ *  answer the next line, and every later line, one line early (found in review). */
+static void settle_pings(uint32_t target_echo)
+{
+    int64_t give_up = esp_timer_get_time() + PING_SETTLE_US;
+    uint8_t b;
+    while (esp_timer_get_time() < give_up) {
+        if ((int32_t)(s_ping_echo_seq - target_echo) >= 0 && s_ok_seq != s_ok_seq_at_echo)
+            return;
+        if (!usb_serial_is_connected())
+            return;
+        if (xStreamBufferReceive(s_rx_stream, &b, 1, pdMS_TO_TICKS(10)) > 0)
+            rx_feed_byte(b);
+    }
+    ESP_LOGW(TAG, "Ping replies incomplete after %lld ms (echo %lu of %lu)",
+             PING_SETTLE_US / 1000, (unsigned long)s_ping_echo_seq, (unsigned long)target_echo);
 }
 
 /** Check if a GCode line is a long-running command that blocks until done.
@@ -760,6 +800,19 @@ static bool marlin_send_cmd_ex(const char *gcode, query_type_t qtype,
     /* Process any buffered unsolicited data before sending */
     s_pending_query = QUERY_NONE;
     marlin_drain_rx();
+    /* Ender Smart (lote 9): a line the Ender started right after the last "ok" (the M155
+     * temperature report comes from its idle loop, i.e. just after an "ok") may still be
+     * arriving. The 10 ms after each TX used to give it time; without them it would be cut
+     * by the reset below and the report lost (found in review). Let it finish first. */
+    if (s_line_len > 0) {
+        int64_t until = esp_timer_get_time() + PARTIAL_LINE_WAIT_US;
+        uint8_t pb;
+        while (s_line_len > 0 && esp_timer_get_time() < until) {
+            if (!usb_serial_is_connected()) break;
+            if (xStreamBufferReceive(s_rx_stream, &pb, 1, pdMS_TO_TICKS(2)) > 0)
+                rx_feed_byte(pb);
+        }
+    }
 
     /* Abort if drain_rx saw busy: and set cooldown.
      * Ender Smart (lote 6): this silently lost commands for callers that ignore the result.
@@ -790,6 +843,8 @@ static bool marlin_send_cmd_ex(const char *gcode, query_type_t qtype,
 
     s_pending_query = qtype;
     s_line_len = 0;
+    const uint32_t echo_base = s_ping_echo_seq;   /* lote 9 */
+    int pings = 0;
 
     /* Send command with newline */
     char buf[MARLIN_MAX_LINE + 2];
@@ -807,15 +862,22 @@ static bool marlin_send_cmd_ex(const char *gcode, query_type_t qtype,
     }
 
     /* Brief pause after TX — gives STM32 CDC time to process the USB
-     * OUT packet before we start polling for the response. */
-    vTaskDelay(pdMS_TO_TICKS(10));
+     * OUT packet before we start polling for the response.
+     * Ender Smart (lote 9 / F2-05): only for a native CDC-ACM device. A USB-UART bridge
+     * (the Ender's CH340) buffers the reply itself; on 2026-11-13 these 10 ms were 60% of
+     * each line's time (F2-04: 58-60 lines/s in all). The wait loop below blocks until
+     * the reply arrives, so nothing is lost without it. */
+    if (!usb_serial_is_uart_bridge())
+        vTaskDelay(pdMS_TO_TICKS(10));
 
     /* Echo ping: some STM32 CDC implementations hold TX data until the
      * next OUT transaction.  Send a harmless M118 to flush the response.
      * The "echo:ping" reply is ignored by process_line. */
-    if (needs_echo_ping(gcode)) {
+    /* lote 9: not for a USB-UART bridge, which never holds the reply back */
+    if (needs_echo_ping(gcode) && !usb_serial_is_uart_bridge()) {
         const char *ping = "M118 E1 ping\n";
         usb_serial_send((const uint8_t *)ping, strlen(ping));
+        pings++;
     }
 
     /* Wait for "ok" or timeout, processing lines as they arrive. */
@@ -862,6 +924,7 @@ static bool marlin_send_cmd_ex(const char *gcode, query_type_t qtype,
                          gcode, stall_pings, max_stall_pings);
                 const char *ping = "M118 E1 ping\n";
                 usb_serial_send((const uint8_t *)ping, strlen(ping));
+                pings++;
                 deadline = esp_timer_get_time() + timeout_ms * 1000LL;
                 continue;
             }
@@ -914,6 +977,10 @@ static bool marlin_send_cmd_ex(const char *gcode, query_type_t qtype,
         }
     }
 
+    /* lote 9: only without the 10 ms delay; a native CDC device that holds replies would
+     * just cost 300 ms here, and keeps the old behaviour */
+    if (pings > 0 && usb_serial_is_uart_bridge())
+        settle_pings(echo_base + (uint32_t)pings);
     return true;
 }
 
@@ -928,6 +995,22 @@ bool marlin_send_cmd_hp(const char *gcode, query_type_t qtype)
 {
     s_tx_quiet = true;
     bool ok = marlin_send_cmd_ex(gcode, qtype, HOST_CMD_TIMEOUT_MS, HOST_STALL_PING_RETRIES);
+    s_tx_quiet = false;
+    return ok;
+}
+
+/** Ender Smart (lote 9): a command (pause, cancel, API) is waiting in the queue */
+bool printer_comm_cmd_waiting(void)
+{
+    return s_cmd_queue && uxQueueMessagesWaiting(s_cmd_queue) > 0;
+}
+
+/** Ender Smart (lote 9): standard timeout, but logged at DEBUG like the other stream
+ *  lines (a job's G4 lines filled the log at INFO in the F2-04 test). */
+bool marlin_send_cmd_quiet(const char *gcode, query_type_t qtype)
+{
+    s_tx_quiet = true;
+    bool ok = marlin_send_cmd_ex(gcode, qtype, 0, 0);
     s_tx_quiet = false;
     return ok;
 }
@@ -1012,6 +1095,8 @@ static void printer_comm_task(void *arg)
                 hp_cmd_resume(); continue;
             } else if (cmd.type == PCMD_HOST_CANCEL) {
                 hp_cmd_cancel(); continue;
+            } else if (cmd.type == PCMD_HOST_SAFETY_CANCEL) {
+                hp_cmd_safety_cancel(cmd.gcode); continue;
             }
 
             /* Route pause/resume/cancel to host print if active */
@@ -1057,7 +1142,7 @@ static void printer_comm_task(void *arg)
         }
 
         /* ---- Host print: stream GCode lines ---- */
-        hp_tick();
+        bool hp_more = hp_tick();   /* lote 9: true = stopped at the round limit, more ready */
 
         /* Macro: skip remaining polls if cooldown active (set by busy: handler) */
 #define CHECK_COOLDOWN() \
@@ -1174,8 +1259,13 @@ poll_done:
                      (unsigned)uxTaskGetStackHighWaterMark(NULL));  /* lote 6: bytes never used */
         }
 
-        /* Shorter delay during host print for throughput, normal otherwise */
-        vTaskDelay(pdMS_TO_TICKS(hp_is_active() && !hp_is_paused() ? 20 : 100));
+        /* Shorter delay during host print for throughput, normal otherwise.
+         * Ender Smart (lote 9 / F2-05): while the job has lines ready, only yield one tick:
+         * the 20 ms after every round of 4 lines were 30% of each line's time (F2-04). */
+        if (hp_more)
+            vTaskDelay(1);
+        else
+            vTaskDelay(pdMS_TO_TICKS(hp_is_active() && !hp_is_paused() ? 20 : 100));
     }
 }
 

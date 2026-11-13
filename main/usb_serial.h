@@ -42,6 +42,12 @@ esp_err_t usb_serial_set_control_lines(bool dtr, bool rts);
  */
 bool usb_serial_is_connected(void);
 
+/**
+ * Ender Smart (lote 9): true when the open device is a USB-UART bridge (CH34x, CP210x,
+ * FTDI), false for a native CDC-ACM device or when nothing is open.
+ */
+bool usb_serial_is_uart_bridge(void);
+
 #ifdef __cplusplus
 }
 #endif

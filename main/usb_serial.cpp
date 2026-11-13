@@ -24,6 +24,7 @@ static SemaphoreHandle_t s_device_mutex = nullptr;
 static cdc_acm_dev_hdl_t s_cdc_dev = nullptr;
 static std::unique_ptr<CdcAcmDevice> s_vcp_dev;
 static volatile bool s_device_connected = false;
+static volatile bool s_is_uart_bridge = false;   /* lote 9: VCP (CH34x/CP210x/FTDI) open */
 
 /* Semaphore given when USB Host lib detects a new device */
 static SemaphoreHandle_t s_new_device_sem = nullptr;
@@ -55,6 +56,7 @@ static void handle_device_event(const cdc_acm_host_dev_event_data_t *event,
         }
         s_cdc_dev = nullptr;
         s_device_connected = false;
+        s_is_uart_bridge = false;
         xSemaphoreGive(s_device_mutex);
         break;
     default:
@@ -88,6 +90,7 @@ static bool try_open_device(void)
         };
         s_vcp_dev->line_coding_set(&coding);
         s_vcp_dev->set_control_line_state(true, true);  /* DTR + RTS */
+        s_is_uart_bridge = true;
         s_device_connected = true;
         return true;
     }
@@ -104,6 +107,7 @@ static bool try_open_device(void)
         };
         cdc_acm_host_line_coding_set(s_cdc_dev, &coding);
         cdc_acm_host_set_control_line_state(s_cdc_dev, true, true);
+        s_is_uart_bridge = false;
         s_device_connected = true;
         return true;
     }
@@ -202,6 +206,11 @@ extern "C" esp_err_t usb_serial_init(usb_serial_rx_cb_t rx_cb, void *rx_cb_ctx)
                             nullptr, 15, nullptr, 1);
 
     return ESP_OK;
+}
+
+extern "C" bool usb_serial_is_uart_bridge(void)
+{
+    return s_device_connected && s_is_uart_bridge;
 }
 
 extern "C" esp_err_t usb_serial_send(const uint8_t *data, size_t len)
