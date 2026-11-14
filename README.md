@@ -197,7 +197,7 @@ For WebRTC streaming (optional), run the Janus proxy sidecar on a Linux machine 
 | `/capture` | GET | Single JPEG snapshot |
 | `/terminal` | GET | GCode terminal |
 | `/terminal/send` | POST | Send GCode command |
-| `/terminal/poll` | GET | Poll for new printer output |
+| `/terminal/poll` | GET | Poll for new printer output: `?seq=N` → `seq`, `lost` (bytes missed), `more`, `data` |
 | `/sd` | GET | SD card file manager |
 | `/sd/files` | GET | JSON file listing |
 | `/sd/upload` | POST | Upload file to SD |

@@ -3,79 +3,103 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "esp_random.h"
 #include "printer_comm.h"
 #include "layout.h"
 #include "url_util.h"
 
 static const char *TAG = "terminal";
 
-/* ---- Ring buffer ---- */
+/* ---- Ring buffer ----
+ * Ender Smart (lote 10): 64 KB instead of 4 KB. During a fast host print the echo of the job
+ * lines ("> N.. G1 ..*cs" and "ok") passes 7 KB/s, and 4 KB held less than 0.6 s: a page that
+ * polls once a second lost lines, and the first line of each answer came cut.
+ *
+ * The writers (USB RX callback, printer task, HTTP send) take a spinlock only for the copy, so
+ * they never drop bytes; before, they dropped them whenever a poll held the mutex. A poll copies
+ * without the lock and checks afterwards that no writer reached what it copied (seqlock style). */
 
-#define TERM_RING_SIZE 4096
+#define TERM_RING_SIZE  (64 * 1024)                       /* power of two */
+#define TERM_POLL_MAX   (16 * 1024)                       /* most bytes in one poll answer */
+#define TERM_SAFE_SPAN  (TERM_RING_SIZE - 16 * 1024)      /* a poll never starts older than this */
 
-static char *s_ring;               /* allocated in PSRAM */
-static int  s_ring_head = 0;       /* write position in ring */
-static uint32_t s_seq = 0;         /* monotonic total bytes written */
-static SemaphoreHandle_t s_mutex;
+static char *s_ring;                /* allocated in PSRAM */
+static uint64_t s_seq = 0;          /* monotonic total bytes written; ring index = seq % size */
+static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
+static bool s_ready;
+static uint32_t s_boot_id;           /* random per boot, made at the first poll (Wi-Fi is up) */
 
 void terminal_init(void)
 {
     s_ring = heap_caps_calloc(1, TERM_RING_SIZE, MALLOC_CAP_SPIRAM);
-    s_mutex = xSemaphoreCreateMutex();
-    ESP_LOGI(TAG, "Terminal initialized (ring %d bytes, PSRAM)", TERM_RING_SIZE);
+    s_ready = (s_ring != NULL);
+    if (s_ready)
+        ESP_LOGI(TAG, "Terminal initialized (ring %d bytes, PSRAM)", TERM_RING_SIZE);
+    else
+        ESP_LOGE(TAG, "Terminal ring allocation failed: the terminal stays empty");
 }
 
-static void ring_write(const char *data, size_t len)
+/* call with s_lock held */
+static void ring_put_locked(const char *d, size_t len)
 {
-    xSemaphoreTake(s_mutex, portMAX_DELAY);
-    for (size_t i = 0; i < len; i++) {
-        s_ring[s_ring_head] = data[i];
-        s_ring_head = (s_ring_head + 1) % TERM_RING_SIZE;
+    if (len > TERM_RING_SIZE) {             /* only the last ring's worth can stay */
+        s_seq += len - TERM_RING_SIZE;
+        d += len - TERM_RING_SIZE;
+        len = TERM_RING_SIZE;
     }
+    size_t pos = (size_t)(s_seq & (TERM_RING_SIZE - 1));
+    size_t first = TERM_RING_SIZE - pos;
+    if (first > len) first = len;
+    memcpy(s_ring + pos, d, first);
+    if (len > first) memcpy(s_ring, d + first, len - first);
     s_seq += len;
-    xSemaphoreGive(s_mutex);
+}
+
+/* Up to three pieces, kept together (a "> cmd\n" line is never split by RX bytes) */
+static void ring_write3(const char *a, size_t al, const char *b, size_t bl, const char *c, size_t cl)
+{
+    if (!s_ready) return;
+    portENTER_CRITICAL_SAFE(&s_lock);
+    if (al) ring_put_locked(a, al);
+    if (bl) ring_put_locked(b, bl);
+    if (cl) ring_put_locked(c, cl);
+    portEXIT_CRITICAL_SAFE(&s_lock);
+}
+
+static uint64_t ring_seq(void)
+{
+    portENTER_CRITICAL_SAFE(&s_lock);
+    uint64_t v = s_seq;
+    portEXIT_CRITICAL_SAFE(&s_lock);
+    return v;
+}
+
+/* Without the lock: the caller checks ring_seq() afterwards (see terminal_poll_handler) */
+static void ring_copy(uint64_t from, char *out, size_t n)
+{
+    size_t pos = (size_t)(from & (TERM_RING_SIZE - 1));
+    size_t first = TERM_RING_SIZE - pos;
+    if (first > n) first = n;
+    memcpy(out, s_ring + pos, first);
+    if (n > first) memcpy(out + first, s_ring, n - first);
 }
 
 void terminal_feed_rx(const uint8_t *data, size_t len)
 {
-    if (len == 0 || !s_mutex) return;
-    /* Non-blocking: called from USB Host callback context —
-     * blocking here stalls ALL USB transfers until the mutex
-     * is released.  If the mutex is held (HTTP reading terminal),
-     * just drop these bytes rather than stalling USB. */
-    if (xSemaphoreTake(s_mutex, 0) != pdTRUE) return;
-    for (size_t i = 0; i < len; i++) {
-        s_ring[s_ring_head] = (char)data[i];
-        s_ring_head = (s_ring_head + 1) % TERM_RING_SIZE;
-    }
-    s_seq += len;
-    xSemaphoreGive(s_mutex);
+    /* Called from the USB Host callback: the spinlock is held only for the memcpy */
+    if (!data || len == 0) return;
+    ring_write3((const char *)data, len, NULL, 0, NULL, 0);
 }
 
 void terminal_feed_tx(const char *cmd)
 {
-    if (!cmd || !s_mutex) return;
-    /* Non-blocking — same reason as terminal_feed_rx: the caller
-     * (printer_comm task) must not stall on terminal I/O. */
-    if (xSemaphoreTake(s_mutex, 0) != pdTRUE) return;
-    const char *prefix = "> ";
-    for (int i = 0; prefix[i]; i++) {
-        s_ring[s_ring_head] = prefix[i];
-        s_ring_head = (s_ring_head + 1) % TERM_RING_SIZE;
-    }
-    size_t len = strlen(cmd);
-    for (size_t i = 0; i < len; i++) {
-        s_ring[s_ring_head] = cmd[i];
-        s_ring_head = (s_ring_head + 1) % TERM_RING_SIZE;
-    }
-    s_ring[s_ring_head] = '\n';
-    s_ring_head = (s_ring_head + 1) % TERM_RING_SIZE;
-    s_seq += 2 + len + 1;
-    xSemaphoreGive(s_mutex);
+    if (!cmd) return;
+    ring_write3("> ", 2, cmd, strlen(cmd), "\n", 1);
 }
 
 /* ---- Send command ---- */
@@ -88,9 +112,7 @@ static esp_err_t terminal_send_cmd(const char *cmd)
         return ESP_ERR_INVALID_STATE;
 
     /* Echo to ring buffer */
-    ring_write("> ", 2);
-    ring_write(cmd, strlen(cmd));
-    ring_write("\n", 1);
+    terminal_feed_tx(cmd);
 
     /* Queue via printer_comm */
     printer_cmd_t pcmd = { .type = PCMD_RAW };
@@ -148,56 +170,96 @@ static esp_err_t terminal_send_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/** GET /terminal/poll?seq=N → {"seq":M,"lost":L,"more":B,"boot":K,"data":"..."}
+ *  Ender Smart (lote 10):
+ *  - seq 0 (a page that just opened), or a seq larger than ours (the page still has the count
+ *    from before a reboot of the ESP32): the last TERM_POLL_MAX bytes, from the start of a line;
+ *  - a seq older than the ring keeps: "lost" says how many bytes the page missed (the cut line
+ *    included) and the answer starts at a line;
+ *  - at most TERM_POLL_MAX bytes per answer, cut after a newline: "more" asks the page to
+ *    poll again right away (a cut in the middle of a UTF-8 character broke the JSON);
+ *  - "boot" changes at every boot: a page that sees a new value asks again from seq 0;
+ *  - the next poll sends back "seq" as it came. */
 static esp_err_t terminal_poll_handler(httpd_req_t *req)
 {
-    /* Parse seq from query string */
-    char qbuf[32] = {0};
-    uint32_t client_seq = 0;
-    if (httpd_req_get_url_query_str(req, qbuf, sizeof(qbuf)) == ESP_OK) {
-        char val[16];
-        if (httpd_query_key_value(qbuf, "seq", val, sizeof(val)) == ESP_OK) {
-            client_seq = (uint32_t)strtoul(val, NULL, 10);
+    char qbuf[96] = {0};
+    uint64_t client_seq = 0;
+    esp_err_t qerr = httpd_req_get_url_query_str(req, qbuf, sizeof(qbuf));
+    if (qerr == ESP_OK || qerr == ESP_ERR_HTTPD_RESULT_TRUNC) {   /* a long query keeps seq= */
+        char val[24];
+        if (httpd_query_key_value(qbuf, "seq", val, sizeof(val)) == ESP_OK)
+            client_seq = strtoull(val, NULL, 10);
+    }
+
+    char *raw = NULL;
+    size_t n = 0, skip = 0;
+    uint64_t start = 0, head = 0, lost = 0;
+    bool align = false;
+    for (int attempt = 0; s_ready && attempt < 3; attempt++) {
+        head = ring_seq();
+        uint64_t oldest = head > TERM_SAFE_SPAN ? head - TERM_SAFE_SPAN : 0;
+        lost = 0;
+        align = false;
+        if (client_seq == 0 || client_seq > head) {
+            start = head > TERM_POLL_MAX ? head - TERM_POLL_MAX : 0;
+            align = start > 0;
+        } else if (client_seq < oldest) {
+            lost = oldest - client_seq;
+            start = oldest;
+            align = true;
+        } else {
+            start = client_seq;
         }
+        n = (size_t)(head - start);
+        if (n > TERM_POLL_MAX) n = TERM_POLL_MAX;
+        if (n == 0) break;
+        if (!raw) {
+            raw = malloc(TERM_POLL_MAX);
+            if (!raw) {
+                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+                return ESP_FAIL;
+            }
+        }
+        ring_copy(start, raw, n);
+        /* a writer overwrites seq x - TERM_RING_SIZE when it writes seq x */
+        if (ring_seq() - start <= TERM_RING_SIZE) break;
+        n = 0;   /* lapped during the copy (16 KB written in a few ms): copy again */
+    }
+    if (!s_ready) head = 0;
+    if (n == 0) lost = 0;   /* nothing was sent: the next poll counts the loss once */
+    if (n == TERM_POLL_MAX && start + n < head) {
+        /* cut by the size limit: end after the last newline, so no line and no UTF-8
+         * character is split between two answers (kept as is if 16 KB have no newline) */
+        size_t k = n;
+        while (k > 0 && raw[k - 1] != '\n') k--;
+        if (k > 0) n = k;
+    }
+    if (s_boot_id == 0) {
+        s_boot_id = esp_random();
+        if (s_boot_id == 0) s_boot_id = 1;
     }
 
-    char *json = NULL;
-    xSemaphoreTake(s_mutex, portMAX_DELAY);
-
-    uint32_t avail;
-    if (client_seq >= s_seq) {
-        /* No new data */
-        avail = 0;
-    } else if (s_seq - client_seq > TERM_RING_SIZE) {
-        /* Client fell behind — send everything in buffer */
-        avail = TERM_RING_SIZE;
-    } else {
-        avail = s_seq - client_seq;
+    if (align && n > 0) {
+        const char *nl = memchr(raw, '\n', n);
+        if (nl) skip = (size_t)(nl - raw) + 1;
+        if (lost) lost += skip;   /* the cut line was missed too */
     }
+    uint64_t resp_seq = n > 0 ? start + n : (client_seq > head || client_seq == 0 ? head : client_seq);
+    bool more = resp_seq < head;
 
-    if (avail == 0) {
-        xSemaphoreGive(s_mutex);
-        /* Empty response */
-        char resp[32];
-        snprintf(resp, sizeof(resp), "{\"seq\":%lu,\"data\":\"\"}", (unsigned long)s_seq);
-        httpd_resp_set_type(req, "application/json");
-        return httpd_resp_send(req, resp, strlen(resp));
-    }
-
-    /* Allocate buffer for JSON: {"seq":N,"data":"..."} with escaping headroom */
-    size_t json_cap = 32 + avail * 2;  /* worst case: every byte needs escaping */
-    json = malloc(json_cap);
+    /* {"seq":..,"lost":..,"more":false,"boot":..,"data":"..."}: every byte escapes to 2 at most */
+    size_t json_cap = 112 + (n - skip) * 2;
+    char *json = malloc(json_cap);
     if (!json) {
-        xSemaphoreGive(s_mutex);
+        free(raw);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
         return ESP_FAIL;
     }
-
-    int pos = snprintf(json, json_cap, "{\"seq\":%lu,\"data\":\"", (unsigned long)s_seq);
-
-    /* Read from ring buffer, JSON-escape as we go */
-    int start = (s_ring_head - (int)avail + TERM_RING_SIZE) % TERM_RING_SIZE;
-    for (uint32_t i = 0; i < avail && pos < (int)json_cap - 8; i++) {
-        char c = s_ring[(start + i) % TERM_RING_SIZE];
+    int pos = snprintf(json, json_cap, "{\"seq\":%llu,\"lost\":%llu,\"more\":%s,\"boot\":%lu,\"data\":\"",
+                       (unsigned long long)resp_seq, (unsigned long long)lost, more ? "true" : "false",
+                       (unsigned long)s_boot_id);
+    for (size_t i = skip; i < n && pos < (int)json_cap - 8; i++) {
+        char c = raw[i];
         if (c == '"') { json[pos++] = '\\'; json[pos++] = '"'; }
         else if (c == '\\') { json[pos++] = '\\'; json[pos++] = '\\'; }
         else if (c == '\n') { json[pos++] = '\\'; json[pos++] = 'n'; }
@@ -209,8 +271,7 @@ static esp_err_t terminal_poll_handler(httpd_req_t *req)
     json[pos++] = '"';
     json[pos++] = '}';
     json[pos] = '\0';
-
-    xSemaphoreGive(s_mutex);
+    free(raw);
 
     httpd_resp_set_type(req, "application/json");
     esp_err_t ret = httpd_resp_send(req, json, pos);

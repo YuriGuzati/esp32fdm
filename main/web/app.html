@@ -1257,7 +1257,7 @@ function Camera() {
 
 /* ---------- Terminal ---------- */
 function Terminal() {
-  let seq = 0, timer = null, histI = -1;
+  let seq = 0, timer = null, histI = -1, alive = true, busy = false, again = false, boot = null, rebooted = false;
   const histK = 'es-term-hist';
   const hist = (() => { try { return JSON.parse(localStorage.getItem(histK) || '[]'); } catch (e) { return []; } })();
   const out = h('div', { class: 'term', role: 'log', 'aria-live': 'polite' });
@@ -1280,15 +1280,45 @@ function Terminal() {
     try { await post('/terminal/send', { cmd: c }); hist.push(c); if (hist.length > 50) hist.shift(); try { localStorage.setItem(histK, JSON.stringify(hist)); } catch (e) { } histI = -1; inp.value = ''; setTimeout(poll, 300); }
     catch (e) { toast(e.message.includes('Printing') ? 'Bloqueado durante a impressão' : e.message, true); }
   }
+  /* uma consulta por vez (duas com o mesmo seq repetiam as linhas), com limite de 6 s: uma
+     consulta presa (a ESP32 reiniciou, o Wi-Fi caiu) não pode deixar o terminal mudo */
   async function poll() {
+    if (!alive) return;
+    if (busy) { again = true; return; }
+    busy = true; let more = false;
+    const ctl = new AbortController(), tmo = setTimeout(() => ctl.abort(), 6000);
     try {
-      const r = await getJSON('/terminal/poll?seq=' + seq);
-      if (r.data) { const atEnd = out.scrollTop + out.clientHeight >= out.scrollHeight - 30; out.append(r.data); if (out.textContent.length > 60000) out.textContent = out.textContent.slice(-40000); if (atEnd) out.scrollTop = out.scrollHeight; }
-      seq = r.seq;
+      const resp = await fetch('/terminal/poll?seq=' + seq, { cache: 'no-store', signal: ctl.signal });
+      if (!resp.ok) throw new Error('HTTP ' + resp.status);
+      const r = await resp.json();
+      /* "boot" muda a cada reinício da ESP32: o seq de antes não vale mais */
+      const newBoot = r.boot !== undefined && boot !== null && r.boot !== boot;
+      if (r.boot !== undefined) boot = r.boot;
+      if (newBoot) rebooted = true;
+      if (newBoot && seq > 0) { seq = 0; more = true; }   /* pede de novo as últimas linhas */
+      else {
+        let txt = r.data || '';
+        if (rebooted || (seq > 0 && r.seq < seq)) { txt = '\n— A ESP32 reiniciou. Abaixo, as últimas linhas —\n' + txt; rebooted = false; }
+        else if (r.lost > 0) txt = '\n[… ' + r.lost + ' bytes não mostrados: o terminal ficou para trás …]\n' + txt;
+        if (txt) {
+          const atEnd = out.scrollTop + out.clientHeight >= out.scrollHeight - 30;
+          out.append(txt);
+          /* guarda ~100 KB (~14 s de um job rápido) e corta numa quebra de linha; quem está lendo
+             mais acima não vê a tela pular: aí o corte espera até 400 KB */
+          const len = out.textContent.length;
+          if (len > 150000 && (atEnd || len > 400000)) { const t = out.textContent.slice(-100000); out.textContent = t.slice(t.indexOf('\n') + 1); }
+          if (atEnd) out.scrollTop = out.scrollHeight;
+        }
+        seq = r.seq; more = !!r.more;
+      }
     } catch (e) { }
+    clearTimeout(tmo);
+    busy = false;
+    if (!alive) return;
+    clearTimeout(timer); timer = setTimeout(poll, again || more ? 50 : 1000); again = false;
   }
-  timer = setInterval(poll, 1000); poll();
-  return { el, update() { }, unmount() { clearInterval(timer); if (supp.checked) post('/terminal/polling', { suppress: 0 }).catch(() => { }); } };
+  poll();
+  return { el, update() { }, unmount() { alive = false; clearTimeout(timer); if (supp.checked) post('/terminal/polling', { suppress: 0 }).catch(() => { }); } };
 }
 
 /* ---------- Logs ---------- */
