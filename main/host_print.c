@@ -846,6 +846,8 @@ static bool host_print_unpark(char *failed, size_t failed_len)
  *  unknown — it only turns the heaters off (a safe action) and reports why. */
 static void host_print_interrupt(const char *why)
 {
+    /* lote 12: a sequence that failed because of an emergency stop ends here first */
+    if (printer_comm_halted()) why = "parada de emergência (M112)";
     hp_record("interrupted", why);
     if (s_hp.file) {
         fclose(s_hp.file);
@@ -1016,6 +1018,7 @@ typedef struct {
     gcode_scan_t scan;
     FILE *f;                      /* only used by the HTTP task, between begin and run */
     void *vbuf;
+    size_t vsize;
 } hp_prep_t;
 static hp_prep_t s_prep;
 static portMUX_TYPE s_prep_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -1043,11 +1046,14 @@ static void hp_prepare_release(void)
     portEXIT_CRITICAL(&s_prep_lock);
 }
 
-/** fopen + a bigger stdio buffer in internal DMA-capable RAM (SDMMC cannot DMA into PSRAM: with
- *  a PSRAM buffer it copies one sector at a time). *vbuf must be freed after fclose. */
-static FILE *hp_open_for_scan(const char *path, void **vbuf)
+/** fopen + a block buffer in internal DMA-capable RAM (SDMMC cannot DMA into PSRAM: with a
+ *  PSRAM buffer it copies one sector at a time). lote 12: the scan reads the file in blocks of
+ *  *vsize bytes into it (gcode_scan_opts_t.blk); without it, the scan falls back to fgets().
+ *  *vbuf must be freed after fclose. */
+static FILE *hp_open_for_scan(const char *path, void **vbuf, size_t *vsize)
 {
     *vbuf = NULL;
+    *vsize = 0;
     FILE *f = fopen(path, "r");
     if (!f) return NULL;
     for (size_t sz = 16384; sz >= 2048; sz /= 2) {
@@ -1056,8 +1062,8 @@ static FILE *hp_open_for_scan(const char *path, void **vbuf)
             continue;
         void *b = heap_caps_malloc(sz, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
         if (!b) continue;
-        if (setvbuf(f, b, _IOFBF, sz) == 0) *vbuf = b;
-        else free(b);
+        *vbuf = b;
+        *vsize = sz;
         break;
     }
     return f;
@@ -1161,6 +1167,11 @@ esp_err_t hp_prepare_begin(const char *filename, const char **why)
     }
     uint32_t usb_gen = usb_serial_connect_gen();   /* before the check: a reconnection after it
                                                     * is then seen by hp_cmd_start() */
+    if (printer_comm_halted()) {
+        hp_prepare_release();
+        *why = "A Ender está travada pela parada de emergência: tire o USB da ESP32, desligue e religue a Ender";
+        return ESP_ERR_INVALID_STATE;
+    }
     if (!marlin_is_connected()) {
         /* the start would wait in the queue until the Ender comes back: never start by itself */
         hp_prepare_release();
@@ -1176,7 +1187,8 @@ esp_err_t hp_prepare_begin(const char *filename, const char **why)
     char path[128];
     snprintf(path, sizeof(path), "/sdcard/%s", filename);
     void *vb = NULL;
-    FILE *f = hp_open_for_scan(path, &vb);
+    size_t vsz = 0;
+    FILE *f = hp_open_for_scan(path, &vb, &vsz);
     struct stat sb;
     /* stat(), not fstat(): the FAT VFS fstat() always gives st_mtime 0, and hp_cmd_start()
      * compares with a stat() */
@@ -1189,6 +1201,7 @@ esp_err_t hp_prepare_begin(const char *filename, const char **why)
     }
     s_prep.f = f;
     s_prep.vbuf = vb;
+    s_prep.vsize = vsz;
     s_prep.size = (long)sb.st_size;
     s_prep.mtime = sb.st_mtime;
     s_prep.usb_gen = usb_gen;
@@ -1196,8 +1209,8 @@ esp_err_t hp_prepare_begin(const char *filename, const char **why)
     portENTER_CRITICAL(&s_prep_lock);
     s_prep.total = (uint32_t)sb.st_size;
     portEXIT_CRITICAL(&s_prep_lock);
-    ESP_LOGI(TAG, "Preparing %s (%ld bytes, %s stdio buffer)", filename, (long)sb.st_size,
-             vb ? "DMA" : "default");
+    ESP_LOGI(TAG, "Preparing %s (%ld bytes, %s)", filename, (long)sb.st_size,
+             vb ? "blocks in DMA RAM" : "no DMA buffer: fgets");
     return ESP_OK;
 }
 
@@ -1207,17 +1220,21 @@ void hp_prepare_run(void)
     strlcpy(name, s_prep.name, sizeof(name));   /* only this task changes it until the START */
     FILE *f = s_prep.f;
     void *vb = s_prep.vbuf;
+    size_t vsz = s_prep.vsize;
     s_prep.f = NULL;
     s_prep.vbuf = NULL;
+    s_prep.vsize = 0;
     if (!f) {
         hp_prepare_release();
         return;
     }
 
     gcode_scan_t scan;
-    gcode_scan_opts_t o = { .bytes_done = &s_prep.done, .cancel = &s_prep.cancel, .yield = true };
+    bool blk_err = false;
+    gcode_scan_opts_t o = { .bytes_done = &s_prep.done, .cancel = &s_prep.cancel, .yield = true,
+                            .blk = vb, .blk_size = vsz, .read_error = &blk_err };
     bool ok = gcode_scan_file_ex(f, &scan, &o);
-    bool rd_err = ferror(f) != 0;
+    bool rd_err = ferror(f) != 0 || blk_err;
     fclose(f);
     free(vb);
     long ms = (long)((esp_timer_get_time() - s_prep.t0) / 1000);
@@ -1604,6 +1621,7 @@ bool hp_tick(void)
         return false;
     }
     if (!s_hp.printing) return false;
+    if (printer_comm_estop_requested()) return false;   /* lote 12: the printer task ends it */
     if (!s_hp.paused && esp_timer_get_time() - s_journal_saved_us >= JOURNAL_EVERY_US)
         hp_journal_save();         /* lote 8: progress for the history if the ESP32 dies */
 
@@ -1639,6 +1657,7 @@ bool hp_tick(void)
     bool at_limit = false;          /* lote 9: stopped by the round limits, more is ready */
 
     while (s_hp.file) {
+        if (printer_comm_estop_requested()) break;     /* lote 12: not one more line */
         /* lote 9: also end the round at once when a command (pause, cancel, a safety
          * cancel, the API) is waiting, so it is not 15 lines late */
         if (lines_this_batch >= HP_ROUND_LINES ||
@@ -1862,11 +1881,70 @@ bool hp_is_active(void)
     return s_hp.printing;
 }
 
+/** lote 12 (F3-07): the printer task, after an emergency stop. With M112 the Ender is halted
+ *  (motors and heaters off, it answers nothing): the job ends here without any command. In the
+ *  remote test (no M112) the job is interrupted as on a USB drop: heaters off, no motion. */
+void hp_cmd_estop(int mode)
+{
+    if (mode == 2) {
+        /* the M112 did not go out: the Ender is still running. With the USB down the job is
+         * left to hp_notify_usb_lost()/hp_tick(), which turn the heaters off when it is back. */
+        if (s_hp.printing && marlin_is_connected())
+            host_print_interrupt("parada de emergência: o M112 não saiu pela USB");
+        hp_set_error("Parada de emergência: o M112 NÃO saiu pela USB e a Ender pode continuar. Desligue a Ender "
+                     "pelo botão de energia agora.");
+        return;
+    }
+    if (mode == 0) {
+        if (s_hp.printing)
+            host_print_interrupt("parada de emergência de TESTE (sem M112)");
+        else
+            hp_set_error("Parada de emergência de TESTE (sem M112): não havia impressão e nada foi enviado à Ender.");
+        return;
+    }
+    if (s_hp.printing) {
+        hp_record("interrupted", "parada de emergência (M112)");
+        if (s_hp.file) {
+            fclose(s_hp.file);
+            s_hp.file = NULL;
+        }
+        s_hp.printing = false;
+        s_hp.paused = false;
+        s_hp.has_pending = false;
+        s_hp.resend_line = -1;
+        s_hp.user_wait = false;
+        xSemaphoreTake(g_state_mutex, portMAX_DELAY);
+        g_state.progress_pct = -1;
+        g_state.print_time_left_s = -1;
+        g_state.host_printing = false;
+        g_state.total_layers = -1;
+        xSemaphoreGive(g_state_mutex);
+        hp_set_notice("");
+        hp_journal_clear();
+    }
+    /* only what is known: without EMERGENCY_PARSER the Ender reads M112 when the current
+     * command ends; hp_estop_confirmed() replaces this when it answers "kill() called"
+     * (which may already have arrived, inside a wait that was in flight) */
+    if (printer_comm_kill_seen()) {
+        hp_estop_confirmed();
+        return;
+    }
+    hp_set_error("Parada de emergência: M112 enviado, sem confirmação da Ender ainda. Se ela não parar, "
+                 "use o botão de energia. Para voltar: tire o USB da ESP32, desligue e religue a Ender.");
+}
+
+void hp_estop_confirmed(void)
+{
+    hp_set_error("Parada de emergência confirmada pela Ender (kill): motores e aquecedores desligados, ela "
+                 "fica travada. Para voltar: tire o USB da ESP32, desligue e religue a Ender.");
+}
+
 void hp_ack_error(void)
 {
     /* lote 11: the "OK" of the error banner. Never cancels: a job that has just started (and
      * cleared the error) under a banner that was not refreshed yet keeps running. */
-    if (!s_hp.printing) hp_clear_error();
+    /* lote 12: while the Ender is halted the stop's message stays (it says how to recover) */
+    if (!s_hp.printing && !printer_comm_halted()) hp_clear_error();
 }
 
 bool hp_has_pending(void)

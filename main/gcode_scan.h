@@ -37,6 +37,13 @@ typedef struct {
     volatile bool *cancel;           /* set by another task: the scan stops early */
     bool yield;                      /* sleep 1 tick every 100 ms (a long scan in a low-priority
                                         task must not starve the idle task / task watchdog) */
+    /* lote 12: block mode. With blk, the file is read with read() on fileno(f), blk_size bytes
+     * at a time (internal DMA-capable RAM: SDMMC reads straight into it), and the lines are
+     * split here with fgets() semantics, without stdio's per-call lock. The FILE must not have
+     * been read through stdio before (it is rewound with lseek too). */
+    uint8_t *blk;
+    size_t blk_size;
+    bool *read_error;                /* lote 12: set to true if read() failed (block mode) */
 } gcode_scan_opts_t;
 
 /** Same as gcode_scan_file(); returns false if *o->cancel stopped it (out is then partial). */

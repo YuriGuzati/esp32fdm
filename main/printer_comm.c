@@ -173,6 +173,16 @@ static bool s_simulate = false;
 /* Ender Smart (F15-05): simulation compiled out; the branches below are dead code. */
 static const bool s_simulate = false;
 #endif
+
+/* lote 12 (F3-07): emergency stop, set from the HTTP task, handled by the printer task.
+ * s_halted latches after a real M112: nothing is written to the USB until the link is opened
+ * again (usb_serial_connect_gen() changes: the Ender was power-cycled or replugged). */
+static volatile bool s_estop;
+static volatile bool s_estop_m112;
+static volatile bool s_halted;
+static volatile uint32_t s_halt_gen;
+static volatile bool s_kill_seen;
+static volatile int  s_estop_mode;     /* for hp_cmd_estop(): 0 test, 1 M112 written, 2 failed */
 static int64_t s_sim_start_us;
 static printer_opstate_t s_sim_opstate;
 static int64_t s_sim_pause_elapsed_us;  /* accumulated elapsed time before pause */
@@ -573,6 +583,13 @@ static void process_line(const char *line)
      *   "echo: cold extrusion prevented"
      *   "echo: too long extrusion prevented"
      */
+    /* lote 12: the Ender's answer to M112 (only kill() prints this) */
+    if (s_halted && !s_kill_seen && (strstr(line, "Printer halted") || strstr(line, "kill() called"))) {
+        s_kill_seen = true;
+        ESP_LOGE(TAG, "Emergency stop confirmed by the Ender: %s", line);
+        hp_estop_confirmed();
+    }
+
     {
         bool fatal = false;
         bool safety_err = false;
@@ -716,7 +733,7 @@ static void settle_pings(uint32_t target_echo)
     while (esp_timer_get_time() < give_up) {
         if ((int32_t)(s_ping_echo_seq - target_echo) >= 0 && s_ok_seq != s_ok_seq_at_echo)
             return;
-        if (!usb_serial_is_connected())
+        if (!usb_serial_is_connected() || s_halted)
             return;
         if (xStreamBufferReceive(s_rx_stream, &b, 1, pdMS_TO_TICKS(10)) > 0)
             rx_feed_byte(b);
@@ -796,6 +813,7 @@ static bool marlin_send_cmd_ex(const char *gcode, query_type_t qtype,
                                 int timeout_override_ms, int max_stall_pings)
 {
     if (!usb_serial_is_connected()) return false;
+    if (s_halted) return false;        /* lote 12: after M112 nothing more goes out */
 
     /* Process any buffered unsolicited data before sending */
     s_pending_query = QUERY_NONE;
@@ -913,6 +931,13 @@ static bool marlin_send_cmd_ex(const char *gcode, query_type_t qtype,
             s_pending_query = QUERY_NONE;
             return false;
         }
+        /* lote 12: an emergency stop does not wait for this "ok" (G28/G29/M109 can take
+         * minutes), and nothing of the sequence this command belongs to goes out after it */
+        if (s_halted) {
+            ESP_LOGW(TAG, "Emergency stop while waiting for %s: not waiting", gcode);
+            s_pending_query = QUERY_NONE;
+            return false;
+        }
 
         int64_t remaining_us = deadline - esp_timer_get_time();
         if (remaining_us <= 0) {
@@ -936,6 +961,7 @@ static bool marlin_send_cmd_ex(const char *gcode, query_type_t qtype,
 
         TickType_t ticks = pdMS_TO_TICKS(remaining_us / 1000);
         if (ticks == 0) ticks = 1;
+        if (ticks > pdMS_TO_TICKS(100)) ticks = pdMS_TO_TICKS(100);   /* lote 12: see s_halted soon */
 
         size_t n = xStreamBufferReceive(s_rx_stream, &rx_byte, 1, ticks);
         if (n == 0) continue;
@@ -1060,6 +1086,46 @@ static void printer_comm_task(void *arg)
     s_last_m114_us = 0;
 
     while (true) {
+        /* lote 12 (F3-07): emergency stop requested by the HTTP task. Nothing queued runs; the
+         * job ends without commands (after M112 the Ender is halted and would not answer). */
+        if (s_estop) {
+            int mode = s_estop_mode;
+            printer_cmd_t stale;
+            while (xQueueReceive(s_cmd_queue, &stale, 0) == pdTRUE) {
+                if (stale.type == PCMD_HOST_START)
+                    hp_cmd_start(stale.gcode);   /* the preparation was cancelled: only cleans up */
+                else
+                    ESP_LOGW(TAG, "Emergency stop: dropped queued command (type %d) %.40s",
+                             stale.type, stale.type == PCMD_RAW ? stale.gcode : "");
+            }
+            s_estop = false;                     /* before: the test mode sends heaters off */
+            hp_cmd_estop(mode);
+            continue;
+        }
+        if (s_halted) {
+            if (usb_serial_connect_gen() != s_halt_gen) {
+                /* the link was opened again: the Ender was power-cycled or replugged */
+                s_halted = false;
+                s_m290_queried = false;
+                s_pos_logged = false;
+                s_autotemp_sent = false;
+                ESP_LOGW(TAG, "Emergency stop released: the USB link was opened again");
+            } else {
+                printer_cmd_t stale;
+                while (xQueueReceive(s_cmd_queue, &stale, 0) == pdTRUE) {
+                    if (stale.type == PCMD_HOST_START)
+                        hp_cmd_start(stale.gcode);
+                    else
+                        ESP_LOGW(TAG, "Ender halted (emergency stop): dropped queued command (type %d) %.40s",
+                                 stale.type, stale.type == PCMD_RAW ? stale.gcode : "");
+                }
+                if (usb_serial_is_connected())
+                    marlin_drain_rx();           /* reads the Ender's "kill() called" */
+                vTaskDelay(pdMS_TO_TICKS(100));
+                continue;
+            }
+        }
+
         /* Wait for USB device to connect */
         if (!usb_serial_is_connected()) {
             xSemaphoreTake(g_state_mutex, portMAX_DELAY);
@@ -1109,7 +1175,7 @@ static void printer_comm_task(void *arg)
 
         /* Drain command queue first */
         printer_cmd_t cmd;
-        while (xQueueReceive(s_cmd_queue, &cmd, 0) == pdTRUE) {
+        while (!s_estop && !s_halted && xQueueReceive(s_cmd_queue, &cmd, 0) == pdTRUE) {
             const char *gcode = NULL;
 
             /* Host print commands */
@@ -1553,6 +1619,10 @@ bool printer_comm_job_active(void)
 
 bool printer_comm_cmd_allowed(const char *gcode, char *reason, size_t reason_len)
 {
+    if (s_halted) {
+        snprintf(reason, reason_len, "%s", "A Ender está travada pela parada de emergência: tire o USB da ESP32, desligue e religue a Ender");
+        return false;
+    }
     printer_state_t st;
     printer_comm_get_state(&st);
     bool active = st.opstate == PRINTER_PRINTING || st.opstate == PRINTER_PAUSED ||
@@ -1676,8 +1746,9 @@ esp_err_t printer_comm_init(void)
     hp_init();
 
     /* lote 6: 6144 -> 8192; printer_state_t grew (error_msg/notice) and is copied on the
-     * stack here and in the mesh parser, which runs inside process_line */
-    xTaskCreatePinnedToCore(printer_comm_task, "printer_comm", 8192,
+     * stack here and in the mesh parser, which runs inside process_line.
+     * lote 12: 8192 -> 10240; the lowest seen was 3624 B free (lote 11, fast send) */
+    xTaskCreatePinnedToCore(printer_comm_task, "printer_comm", 10240,
                             NULL, 8, NULL, 1);  /* Core 1: with USB host, isolated from WiFi/HTTP */
 
     ESP_LOGI(TAG, "Printer comm initialized (Marlin backend)");
@@ -1705,6 +1776,55 @@ bool printer_comm_preparing(char *name, size_t name_len, int *pct)
     return hp_preparing(name, name_len, pct);
 }
 bool printer_comm_prepare_cancel(void) { return s_backend == PRINTER_BACKEND_MARLIN && hp_prepare_cancel(); }
+
+/* ---- lote 12 (F3-07): emergency stop ---- */
+bool printer_comm_estop_requested(void) { return s_estop || s_halted; }
+bool printer_comm_halted(void) { return s_halted; }
+bool printer_comm_kill_seen(void) { return s_kill_seen; }
+
+esp_err_t printer_comm_emergency_stop(bool test_no_m112)
+{
+    if (s_backend != PRINTER_BACKEND_MARLIN) return ESP_ERR_NOT_SUPPORTED;
+    if (!usb_serial_is_connected()) return ESP_ERR_INVALID_STATE;
+    if (test_no_m112) {
+        if (s_halted) return ESP_ERR_INVALID_STATE;   /* the real stop's message stays */
+        s_estop_m112 = false;
+        s_estop_mode = 0;
+        s_estop = true;                /* no more job lines */
+        hp_prepare_cancel();
+        ESP_LOGW(TAG, "EMERGENCY STOP (TEST): M112 not sent; the job is interrupted, heaters off, no motion");
+        return ESP_OK;
+    }
+    /* Real stop. Latch first: from here marlin_send_cmd_ex() writes nothing and stops waiting,
+     * and hp_tick() sends no job line (printer_comm_estop_requested() includes s_halted). The
+     * printer task is told (s_estop) only after the write, with its result known (review).
+     * A 2nd M112 keeps s_kill_seen: a halted Ender does not print kill() again. */
+    if (!s_halted) s_kill_seen = false;
+    s_halt_gen = usb_serial_connect_gen();
+    s_halted = true;
+    hp_prepare_cancel();               /* a preparation stops; the stop's message says why */
+    /* the leading newline ends a partial line in the Ender's buffer, if a byte was lost */
+    static const char m112[] = "\nM112\n";
+    esp_err_t err = ESP_FAIL;
+    for (int i = 0; i < 3 && err != ESP_OK; i++)
+        err = usb_serial_send((const uint8_t *)m112, sizeof(m112) - 1);
+    terminal_feed_tx("M112");
+    if (err != ESP_OK) {
+        /* the Ender did not get it and is still running: no latch, so the job can at least
+         * be interrupted with the heaters off; the screen says to use the power button */
+        ESP_LOGE(TAG, "EMERGENCY STOP: M112 could NOT be written to the USB (%s)", esp_err_to_name(err));
+        s_estop_m112 = false;
+        s_estop_mode = 2;
+        s_estop = true;                /* before releasing the latch: no gap for hp_tick() */
+        s_halted = false;
+        return ESP_FAIL;
+    }
+    ESP_LOGE(TAG, "EMERGENCY STOP: M112 written to the USB");
+    s_estop_m112 = true;
+    s_estop_mode = 1;
+    s_estop = true;
+    return ESP_OK;
+}
 void printer_comm_ack_error(void)
 {
     if (s_backend == PRINTER_BACKEND_MARLIN) {

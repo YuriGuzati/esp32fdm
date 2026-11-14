@@ -261,7 +261,7 @@ static esp_err_t api_status_handler(httpd_req_t *req)
         "{\"state\":\"%s\",\"backend\":\"%s\",\"hotend\":[%.1f,%.1f],\"bed\":[%.1f,%.1f],"
         "\"progress\":%.1f,\"filename\":\"%s\",\"elapsed\":%ld,\"remaining\":%ld,"
         "\"layer\":\"%ld/%ld\",\"z\":%.1f,\"baby_z\":%.2f,\"usb\":%s,\"error\":\"%s\","
-        "\"notice\":\"%s\",\"preparing\":\"%s\",\"prep_pct\":%d}",
+        "\"notice\":\"%s\",\"preparing\":\"%s\",\"prep_pct\":%d,\"halted\":%s}",
         state_str, printer_comm_backend_name(),
         st.hotend_actual, st.hotend_target,
         st.bed_actual, st.bed_target,
@@ -274,7 +274,7 @@ static esp_err_t api_status_handler(httpd_req_t *req)
         st.z, s_baby_z,
         usb ? "true" : "false",
         st.opstate == PRINTER_ERROR ? st.error_msg : "",
-        st.notice, prep, prep_pct);
+        st.notice, prep, prep_pct, printer_comm_halted() ? "true" : "false");
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
@@ -335,8 +335,10 @@ static esp_err_t api_stats_handler(httpd_req_t *req)
         if (dt > 0) {
             uint32_t idle0_delta = idle_now[0] - s_prev_idle[0];
             uint32_t idle1_delta = idle_now[1] - s_prev_idle[1];
-            cpu0_pct = 100 - (int)(idle0_delta * 100 / dt);
-            cpu1_pct = 100 - (int)(idle1_delta * 100 / dt);
+            /* lote 12: 64-bit, idle*100 overflowed 32 bits after ~43 s between two calls
+             * (the first call after a long gap showed ~99 %) */
+            cpu0_pct = 100 - (int)((uint64_t)idle0_delta * 100 / dt);
+            cpu1_pct = 100 - (int)((uint64_t)idle1_delta * 100 / dt);
             if (cpu0_pct < 0) cpu0_pct = 0;
             if (cpu1_pct < 0) cpu1_pct = 0;
             if (cpu0_pct > 100) cpu0_pct = 100;
@@ -524,6 +526,37 @@ static esp_err_t api_printer_info_refresh_handler(httpd_req_t *req)
     httpd_resp_set_status(req, "409 Conflict");
     return httpd_resp_sendstr(req, err == ESP_ERR_NOT_SUPPORTED ? "{\"ok\":false,\"err\":\"Only for Marlin\"}"
                                    : "{\"ok\":false,\"err\":\"Printer not connected or a print is running\"}");
+}
+
+/* ---- POST /api/emergency_stop (lote 12 / F3-07) ---- */
+
+static esp_err_t api_emergency_stop_handler(httpd_req_t *req)
+{
+    char body[96] = {0};
+    int len = httpd_req_recv(req, body, sizeof(body) - 1);
+    if (len < 0) len = 0;
+    body[len] = '\0';
+    char confirm[16] = {0}, teste[16] = {0};
+    parse_form_field(body, "confirm", confirm, sizeof(confirm));
+    parse_form_field(body, "teste", teste, sizeof(teste));
+    httpd_resp_set_type(req, "application/json");
+    if (strcmp(confirm, "PARAR") != 0) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "{\"ok\":false,\"err\":\"Confirmação necessária (confirm=PARAR)\"}");
+    }
+    bool test = strcmp(teste, "sem_m112") == 0;
+    esp_err_t err = printer_comm_emergency_stop(test);
+    if (err == ESP_ERR_NOT_SUPPORTED || err == ESP_ERR_INVALID_STATE) {
+        httpd_resp_set_status(req, "409 Conflict");
+        return httpd_resp_sendstr(req, err == ESP_ERR_NOT_SUPPORTED ? "{\"ok\":false,\"err\":\"Só no modo Marlin\"}"
+                                     : printer_comm_halted() ? "{\"ok\":false,\"err\":\"A Ender já está travada pela parada de emergência\"}"
+                                                             : "{\"ok\":false,\"err\":\"A Ender não está conectada\"}");
+    }
+    if (err != ESP_OK) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_sendstr(req, "{\"ok\":false,\"err\":\"O M112 não saiu pela USB. Desligue a Ender pelo botão de energia.\"}");
+    }
+    return httpd_resp_sendstr(req, test ? "{\"ok\":true,\"m112\":false,\"test\":true}" : "{\"ok\":true,\"m112\":true}");
 }
 
 /* ---- GET /api/temp_history — temperature history for chart ---- */
@@ -964,6 +997,13 @@ esp_err_t httpd_start_server(void)
         .handler  = api_temp_history_handler,
     };
     HTTPD_REGISTER(server, &api_temp_history);
+
+    httpd_uri_t api_estop = {
+        .uri      = "/api/emergency_stop",
+        .method   = HTTP_POST,
+        .handler  = api_emergency_stop_handler,
+    };
+    HTTPD_REGISTER(server, &api_estop);
 
     httpd_uri_t api_command = {
         .uri      = "/api/command",

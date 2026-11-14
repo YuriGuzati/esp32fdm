@@ -10,6 +10,7 @@
 #include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <sys/stat.h>
 
 static const char *TAG = "gcode_scan";
@@ -49,6 +50,50 @@ void gcode_scan_file(FILE *f, gcode_scan_t *out)
     gcode_scan_file_ex(f, out, NULL);
 }
 
+/* ---- lote 12: line source for the block mode ----
+ * Same contract as fgets(out, n, f): copies at most n-1 bytes, stops after a '\n' (kept), adds
+ * the '\0', returns NULL at end of file with nothing copied. A line longer than n-1 bytes comes
+ * back in pieces, as with fgets, so total_lines is the same as before. */
+typedef struct {
+    int fd;
+    uint8_t *blk;
+    size_t size, pos, len;
+    uint32_t consumed;            /* bytes handed out so far (progress) */
+    bool eof, err;
+} blk_reader_t;
+
+static char *blk_gets(blk_reader_t *r, char *out, size_t n)
+{
+    size_t o = 0;
+    while (o + 1 < n) {
+        if (r->pos == r->len) {
+            if (r->eof) break;
+            ssize_t k = read(r->fd, r->blk, r->size);
+            if (k <= 0) {
+                r->eof = true;
+                if (k < 0) r->err = true;
+                break;
+            }
+            r->pos = 0;
+            r->len = (size_t)k;
+        }
+        size_t avail = r->len - r->pos, room = n - 1 - o;
+        size_t take = avail < room ? avail : room;
+        const uint8_t *src = r->blk + r->pos;
+        const uint8_t *nl = memchr(src, '\n', take);
+        if (nl) take = (size_t)(nl - src) + 1;
+        memcpy(out + o, src, take);
+        o += take;
+        r->pos += take;
+        r->consumed += take;
+        if (nl) break;
+    }
+    if (o == 0) return NULL;
+    out[o] = '\0';
+    return out;
+}
+
+
 bool gcode_scan_file_ex(FILE *f, gcode_scan_t *out, const gcode_scan_opts_t *o)
 {
     memset(out, 0, sizeof(*out));
@@ -69,10 +114,21 @@ bool gcode_scan_file_ex(FILE *f, gcode_scan_t *out, const gcode_scan_opts_t *o)
     int64_t last_yield = esp_timer_get_time();
     bool cancelled = false;
 
+    /* lote 12: block mode (see gcode_scan_opts_t) */
+    blk_reader_t rd = { .fd = -1 };
+    bool blk_mode = o && o->blk && o->blk_size >= 512;
+    if (o && o->read_error) *o->read_error = false;
+
     rewind(f);
-    while (fgets(buf, sizeof(buf), f)) {
+    if (blk_mode) {
+        rd.fd = fileno(f);
+        rd.blk = o->blk;
+        rd.size = o->blk_size;
+        if (rd.fd < 0 || lseek(rd.fd, 0, SEEK_SET) != 0) blk_mode = false;
+    }
+    while (blk_mode ? blk_gets(&rd, buf, sizeof(buf)) != NULL : fgets(buf, sizeof(buf), f) != NULL) {
         out->total_lines++;
-        done += strlen(buf);
+        done = blk_mode ? rd.consumed : done + (uint32_t)strlen(buf);
         if (o && (out->total_lines & 1023) == 0) {
             if (o->bytes_done) *o->bytes_done = done;
             if (o->cancel && *o->cancel) { cancelled = true; break; }
@@ -179,6 +235,10 @@ bool gcode_scan_file_ex(FILE *f, gcode_scan_t *out, const gcode_scan_opts_t *o)
                 }
             }
         }
+    }
+    if (blk_mode) {
+        if (o->read_error) *o->read_error = rd.err;
+        lseek(rd.fd, 0, SEEK_SET);
     }
     rewind(f);
     if (o && o->bytes_done) *o->bytes_done = done;

@@ -175,6 +175,22 @@ bool printer_comm_prepare_cancel(void);
 void printer_comm_ack_error(void);
 
 /**
+ * Ender Smart (lote 12 / F3-07): emergency stop. The Ender has no EMERGENCY_PARSER, so an M112
+ * behind queued lines would wait for them: first no more job lines go out (the printer task
+ * checks the flag before each one), a preparation is aborted, then "M112" is written straight
+ * to the USB (not through the queue, which may be waiting for an "ok"). The printer task then
+ * drops its queue and ends the job without sending anything (the halted Ender would not answer).
+ * test_no_m112 (remote test of the path): instead of M112, the job is interrupted as on a USB
+ * drop (heaters off, no motion). Marlin only; ESP_ERR_INVALID_STATE if the Ender is not
+ * connected.
+ */
+esp_err_t printer_comm_emergency_stop(bool test_no_m112);
+
+/** lote 12: true after a real emergency stop (M112), until the USB link is opened again (the
+ *  Ender power-cycled or replugged). Nothing is written to the Ender meanwhile. */
+bool printer_comm_halted(void);
+
+/**
  * Pause host print (stops sending lines, heaters stay on).
  */
 esp_err_t printer_comm_host_print_pause(void);

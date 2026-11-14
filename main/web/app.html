@@ -266,6 +266,19 @@ const job = () => { const s = S.status && S.status.state; return s === 'printing
 /* lote 11: a ESP32 lê o arquivo inteiro antes de a impressão começar (pode levar segundos num arquivo grande) */
 const prep = () => !!(S.status && S.status.preparing) && !job();
 const busyJob = () => job() || prep();
+/* lote 12 (F3-07): parada de emergência. A Ender não tem EMERGENCY_PARSER: a ESP32 para de enviar,
+   esvazia a fila e escreve M112 direto na USB. A Ender trava e só volta desligando e religando. */
+function estopBtn(extraClass) {
+  return h('button', { class: 'btn danger ' + (extraClass || ''), style: 'font-weight:700', onclick: async () => {
+    if (!(await confirmBox('Parada de emergência?',
+      'A ESP32 para de enviar e manda M112. A Ender não tem parada imediata (EMERGENCY_PARSER): ela obedece quando termina o comando atual. ' +
+      'Num movimento normal é quase na hora; durante origem, sondagem ou aquecimento com espera pode demorar, e aí use o botão de energia da Ender. ' +
+      'Depois do M112 a Ender para os motores, desliga os aquecedores e fica travada; a peça é perdida. Para voltar: tire o cabo USB da ESP32 ' +
+      '(o VBUS ainda não está bloqueado), desligue e religue a Ender. Para terminar uma impressão normalmente, use Cancelar.', 'PARAR AGORA', true))) return;
+    try { await post('/api/emergency_stop', { confirm: 'PARAR' }); toast('M112 enviado. Confira se a Ender parou; se não, use o botão de energia.'); setTimeout(pollStatus, 300); }
+    catch (e) { toast(e.message + ' Use o botão de energia da Ender.', true); }
+  } }, 'Parada de emergência (M112)');
+}
 
 /* ---------- confirmação ---------- */
 function confirmBox(title, body, okLabel, danger) {
@@ -313,6 +326,7 @@ function stateInfo() {
   if (!S.online) return ['Sem resposta da ESP32', 'var(--red)'];
   if (!st) return ['Carregando…', 'var(--faint)'];
   if (!st.usb && st.state !== 'error') return ['Ender desconectada', 'var(--faint)'];
+  if (st.halted) return ['Travada (parada de emergência)', 'var(--red)'];   /* lote 12 */
   if (prep() && st.state !== 'error') return ['Preparando', 'var(--yellow)'];
   return ({ printing: ['Imprimindo', 'var(--green)'], paused: ['Pausada', 'var(--yellow)'], error: ['Erro', 'var(--red)'],
     operational: ['Pronta', 'var(--blue)'], disconnected: ['Ender desconectada', 'var(--faint)'] })[st.state] || [st.state, 'var(--faint)'];
@@ -446,6 +460,7 @@ function Inicio() {
   const pauseBtn = h('button', { class: 'btn', onclick: () => act(S.status && S.status.state === 'paused' ? 'resume' : 'pause') }, 'Pausar');
   const actions = h('section', { class: 'grid2 o4 hide', 'aria-label': 'Ações' }, pauseBtn,
     h('button', { class: 'btn danger', onclick: () => act('cancel') }, 'Cancelar'));
+  const estopSec = h('section', { class: 'col o4 hide', 'aria-label': 'Parada de emergência' }, estopBtn('blk'));
 
   const babyVal = h('span', { class: 'tiny faint' });
   const step = d => h('button', { class: 'btn sm', 'aria-label': (d > 0 ? 'Subir ' : 'Descer ') + Math.abs(d) + ' mm', onclick: () => gcode('M290 Z' + d) }, (d > 0 ? '+' : '−') + num(Math.abs(d), 2));
@@ -457,7 +472,7 @@ function Inicio() {
       h('div', { class: 'col', style: 'gap:2px' }, h('b', null, 'Ajuste fino do Z'), babyVal),
       h('div', { class: 'row', style: 'gap:6px' }, step(-0.05), step(-0.01), step(0.01), step(0.05))),
     saveBtn);
-  right.append(stCard, temps, actions, baby);
+  right.append(stCard, temps, actions, estopSec, baby);
 
   function update() {
     const st = S.status || {};
@@ -486,6 +501,7 @@ function Inicio() {
     }
     tH.set(st.hotend || [0, 0]); tB.set(st.bed || [0, 0]);
     actions.classList.toggle('hide', !active);
+    estopSec.classList.toggle('hide', !(S.online && st.usb));
     pauseBtn.textContent = paused ? 'Retomar' : 'Pausar';
     babyVal.textContent = 'Z offset atual ' + num(st.baby_z, 2) + ' mm. Ajustar pela tela da Ender trava a impressora ~3 s.';
     saveBtn.disabled = active; saveBtn.title = active ? 'Disponível com a impressora parada' : '';
@@ -742,10 +758,12 @@ function Controles() {
     h('div', { class: 'row wrap', style: 'gap:6px' }, h('span', { class: 'small muted' }, 'Extrusora:'), eSel, eb('Retrair 10 mm', -10), eb('Extrudar 10 mm', 10)),
     eHint);
 
-  const el = h('div', { class: 'col', style: 'gap:12px' }, h('h1', null, 'Controles'), lock, heat, move, ext);
+  const estopC = estopBtn('blk');
+  const el = h('div', { class: 'col', style: 'gap:12px' }, h('h1', null, 'Controles'), estopC, lock, heat, move, ext);
   function update() {
     const st = S.status || {}, active = busyJob(), he = st.hotend || [0, 0], bd = st.bed || [0, 0];   /* lote 11: a preparação também */
     lock.classList.toggle('hide', !active);
+    estopC.classList.toggle('hide', !(S.online && st.usb));
     lock.textContent = (prep() ? 'Preparando um arquivo para imprimir' : 'Impressão em andamento') + LOCK_TXT;
     const inf = p => 'agora ' + num(p[0], 0) + ' °C · alvo ' + (p[1] > 0 ? num(p[1], 0) + ' °C' : 'desligado');
     hB.info.textContent = inf(he); hM.info.textContent = inf(bd);

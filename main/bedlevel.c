@@ -451,6 +451,8 @@ static esp_err_t bedlevel_read_handler(httpd_req_t *req)
     httpd_resp_set_type(req, "application/json");
     if (printer_comm_job_active())
         return httpd_resp_sendstr(req, "{\"ok\":false,\"err\":\"Cannot read while printing\"}");
+    if (printer_comm_halted())   /* lote 12 */
+        return httpd_resp_sendstr(req, "{\"ok\":false,\"err\":\"A Ender está travada pela parada de emergência: tire o USB da ESP32, desligue e religue a Ender\"}");
     if (__atomic_test_and_set(&s_probe_busy, __ATOMIC_ACQ_REL))
         return httpd_resp_sendstr(req, "{\"ok\":false,\"err\":\"Probing or reading already in progress\"}");
     s_error_msg[0] = '\0';
@@ -498,6 +500,9 @@ static esp_err_t bedlevel_probe_handler(httpd_req_t *req)
 
     if (printer_comm_job_active()) {
         return httpd_resp_sendstr(req, "{\"ok\":false,\"err\":\"Cannot probe while printing\"}");
+    }
+    if (printer_comm_halted()) {   /* lote 12 */
+        return httpd_resp_sendstr(req, "{\"ok\":false,\"err\":\"A Ender está travada pela parada de emergência: tire o USB da ESP32, desligue e religue a Ender\"}");
     }
 
     /* One probe at a time: atomic test-and-set closes the double-click race

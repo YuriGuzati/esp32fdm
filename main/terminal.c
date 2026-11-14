@@ -106,8 +106,9 @@ void terminal_feed_tx(const char *cmd)
 
 static esp_err_t terminal_send_cmd(const char *cmd)
 {
-    /* lote 11: also while a file is being prepared for printing */
-    if (printer_comm_job_active())
+    /* lote 11: also while a file is being prepared for printing; lote 12: and while the Ender
+     * is halted by an emergency stop */
+    if (printer_comm_job_active() || printer_comm_halted())
         return ESP_ERR_INVALID_STATE;
 
     /* Echo to ring buffer */
@@ -157,7 +158,9 @@ static esp_err_t terminal_send_handler(httpd_req_t *req)
     esp_err_t err = terminal_send_cmd(cmd);
     if (err == ESP_ERR_INVALID_STATE) {
         httpd_resp_set_status(req, "409 Conflict");
-        httpd_resp_sendstr(req, "Printing in progress");
+        httpd_resp_sendstr(req, printer_comm_halted()
+            ? "A Ender está travada pela parada de emergência: tire o USB da ESP32, desligue e religue a Ender"
+            : "Printing in progress (or a file is being prepared)");
         return ESP_OK;
     }
     if (err != ESP_OK) {

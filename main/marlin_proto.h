@@ -149,6 +149,12 @@ bool hp_preparing(char *name, size_t name_len, int *pct);
 bool hp_prepare_cancel(void);
 void hp_prepare_abort(const char *why);   /* by the firmware (Ender disconnected): shown as an error */
 void hp_ack_error(void);                  /* clears the error on screen, never cancels a job */
+/* lote 12: printer task, after an emergency stop. mode: 0 = test (no M112), 1 = M112 written,
+ * 2 = M112 could not be written to the USB */
+void hp_cmd_estop(int mode);
+bool printer_comm_kill_seen(void);        /* lote 12: the Ender answered M112 with kill() */
+void hp_estop_confirmed(void);            /* lote 12: the Ender said "Printer halted / kill()" */
+bool printer_comm_estop_requested(void);  /* lote 12: no job line may go out */
 
 /** Public API pass-throughs */
 esp_err_t hp_pause(void);

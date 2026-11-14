@@ -212,7 +212,8 @@ For WebRTC streaming (optional), run the Janus proxy sidecar on a Linux machine 
 | `/bedlevel/probe` | POST | Start G28+G29 probing |
 | `/bedlevel/status` | GET | Probing state + mesh JSON |
 | `/bedlevel/config` | GET/POST | Bed config (size, screws, origin) |
-| `/api/status` | GET | JSON printer status (`preparing`: file being read before the start, `prep_pct`) |
+| `/api/status` | GET | JSON printer status (`preparing`: file being read before the start, `prep_pct`; `halted`: Ender halted by an emergency stop) |
+| `/api/emergency_stop` | POST | Emergency stop (`confirm=PARAR` required): stops sending, writes M112 straight to the USB, then writes nothing until the USB link is opened again. Without EMERGENCY_PARSER the Ender obeys when the current command ends. `teste=sem_m112`: remote test, interrupts the job with heaters off instead |
 | `/api/temp_history` | GET | Temperature history (1h, 4s intervals) |
 | `/settings` | GET | Settings page |
 | `/printer/config` | GET/POST | Printer backend config |
