@@ -147,6 +147,29 @@ static volatile uint32_t s_ok_seq_at_echo;
 #define PING_SETTLE_US        (300 * 1000LL)  /* M118 is instant: its reply follows at once */
 #define PARTIAL_LINE_WAIT_US  (20 * 1000LL)   /* a 96-char line takes ~8.3 ms at 115200 */
 static char s_echo_ping_cmds[128] = "";  /* Comma-separated GCode prefixes that need CDC flush ping */
+/* Ender Smart (lote 13): replies the Ender still owes. A command whose "ok" did not come in
+ * time stays in the Ender's queue (a poll sent while it was busy with something started on its
+ * own screen, e.g. the leveling), and its late answer would be taken as the answer to a later
+ * command: on 2026-11-14 eight late "Not SD printing" came right after a job had started and
+ * wiped the job from the screen. Every reply that comes before the echo of a marker
+ * (M118 E1 essync <n>) sent after the last command belongs to older commands; the "ok" after
+ * the echo is the marker's own. Until then the polls are not sent and a job does not start.
+ * Printer task only. */
+static bool s_need_sync;          /* a command was given up: replies may still come */
+static bool s_mk_sent;          /* a marker is out, sent after the last command */
+static bool s_mk_echo;          /* ... and its echo came */
+static uint32_t s_mk_id;
+static uint32_t s_mk_ok_at_echo;
+static int64_t s_mk_sent_us;
+static int64_t s_mk_echo_us;      /* when the marker's echo came */
+static int64_t s_last_ok_us;      /* when the last "ok" came */
+static uint32_t s_restart_seq;    /* bumped when the Ender is seen restarting */
+/* A marker is sent again when the Ender answered something after it and then stayed quiet for
+ * MK_QUIET_US without the marker's echo and "ok" (lost, e.g. in an RX overflow), and anyway
+ * after MK_RESEND_US. Not on a timer while the Ender answers nothing (busy with its screen,
+ * waiting on M600): each marker takes room in its small serial buffer (review). */
+#define MK_QUIET_US  (2 * 1000000LL)
+#define MK_RESEND_US (300 * 1000000LL)
 
 /* ---- Temperature history circular buffer ---- */
 
@@ -308,6 +331,11 @@ static void parse_m105(const char *line)
 /** Parse M27 response: "SD printing byte 12345/67890" or "Not SD printing" */
 static void parse_m27(const char *line)
 {
+    /* Ender Smart (lote 13): during a job sent by the ESP32 the Ender is not printing from
+     * its own card, so an M27 answer is a late one. On 2026-11-14 eight of them ("Not SD
+     * printing") came right after a job had started and wiped it from the screen. */
+    if (hp_is_active()) return;
+
     xSemaphoreTake(g_state_mutex, portMAX_DELAY);
 
     const char *sd = strstr(line, "SD printing byte");
@@ -375,6 +403,7 @@ static void parse_m27c(const char *line)
     const char *prefix = "Current file: ";
     const char *p = strstr(line, prefix);
     if (!p) return;
+    if (hp_is_active()) return;   /* lote 13: a late answer; the job's name stays */
 
     p += strlen(prefix);
     xSemaphoreTake(g_state_mutex, portMAX_DELAY);
@@ -440,6 +469,18 @@ static void process_line(const char *line)
         s_ok_seq_at_echo = s_ok_seq + (strncmp(line, "ok", 2) == 0 ? 1u : 0u);
     }
 
+    /* lote 13: the marker's echo ("echo:essync 7"). An Ender without M118 would answer
+     * 'echo:Unknown command: "M118 E1 essync 7"', which also comes after every older reply.
+     * A glued "ok" in front is the previous command's, as for the ping above. */
+    if (s_mk_sent && !s_mk_echo) {
+        const char *mk = strstr(line, "essync ");
+        if (mk && strtoul(mk + 7, NULL, 10) == s_mk_id) {
+            s_mk_echo = true;
+            s_mk_echo_us = esp_timer_get_time();
+            s_mk_ok_at_echo = s_ok_seq + (strncmp(line, "ok", 2) == 0 ? 1u : 0u);
+        }
+    }
+
     /* Ender Smart (F15-23): the Creality firmware prints debug garbage on the serial
      * port while the Z offset is adjusted on its screen ("d:babystep",
      * "b:%d2,dis:%d", hundreds of lines per adjustment). Drop it. */
@@ -500,6 +541,11 @@ static void process_line(const char *line)
         ESP_LOGW(TAG, "Printer restart detected (\"%s\")", line);
         hp_notify_printer_reset();
         s_autotemp_sent = false;   /* F2-03: M155 is not kept across a restart */
+        /* lote 13: a restarted Ender owes nothing (its queue is gone) */
+        s_restart_seq++;
+        s_need_sync = false;
+        s_mk_sent = false;
+        s_mk_echo = false;
     }
 
     /* Content-based matching — handles unsolicited auto-reports too */
@@ -687,6 +733,15 @@ static void process_line(const char *line)
      * Marlin often sends "ok T:205.3 /210.0 B:60.1 /60.0" — temp data on the ok line. */
     if (strncmp(line, "ok", 2) == 0) {
         s_ok_seq++;                /* lote 9: see settle_pings */
+        s_last_ok_us = esp_timer_get_time();   /* lote 13: see mk_send_if_needed */
+        /* lote 13: the marker's own "ok": every older command is answered */
+        if (s_mk_echo && s_ok_seq != s_mk_ok_at_echo) {
+            s_need_sync = false;
+            s_mk_sent = false;
+            s_mk_echo = false;
+            ESP_LOGI(TAG, "The Ender answered every older command (marker %lu)",
+                     (unsigned long)s_mk_id);
+        }
         if (strstr(line, "T:")) {
             parse_m105(line);
         }
@@ -740,6 +795,76 @@ static void settle_pings(uint32_t target_echo)
     }
     ESP_LOGW(TAG, "Ping replies incomplete after %lld ms (echo %lu of %lu)",
              PING_SETTLE_US / 1000, (unsigned long)s_ping_echo_seq, (unsigned long)target_echo);
+    s_need_sync = true;            /* lote 13: the missing replies may still come */
+}
+
+/** Ender Smart (lote 13): sends the marker when none is out after the last command, when the
+ *  one out was lost (see MK_QUIET_US), or after MK_RESEND_US. False if the USB write failed. */
+static bool mk_send_if_needed(void)
+{
+    if (!s_need_sync) return true;    /* nothing owed: no marker (2nd review) */
+    int64_t now = esp_timer_get_time();
+    /* lost: the Ender answered something after the marker and then stayed quiet, or the
+     * echo came and its "ok" did not ("echo:essync 7ok" with the newline lost) */
+    bool lost = s_mk_sent &&
+                ((s_last_ok_us > s_mk_sent_us && now - s_last_ok_us > MK_QUIET_US) ||
+                 (s_mk_echo && now - s_mk_echo_us > MK_QUIET_US));
+    if (s_mk_sent && !lost && now - s_mk_sent_us <= MK_RESEND_US)
+        return true;
+    /* the leading newline ends a line the Ender may have got only in part (a lost byte), so
+     * the marker is not glued to it, nor the next command to the marker (review) */
+    char mk[40];
+    uint32_t id = s_mk_id + 1;
+    int n = snprintf(mk, sizeof(mk), "\nM118 E1 essync %lu\n", (unsigned long)id);
+    if (usb_serial_send((const uint8_t *)mk, (size_t)n) != ESP_OK)
+        return false;
+    s_mk_id = id;
+    s_mk_sent = true;
+    s_mk_echo = false;
+    s_mk_sent_us = now;
+    mk[n - 1] = '\0';
+    terminal_feed_tx(mk + 1);
+    ESP_LOGI(TAG, "The Ender may still owe replies: marker sent (%s)%s", mk + 1,
+             lost ? "; the previous one was lost" : "");
+    return true;
+}
+
+/** Ender Smart (lote 13): while replies are owed, sends the marker if needed and reads until
+ *  it is answered or wait_us passes (0: only what is already here). Returns true when nothing
+ *  is owed. Printer task only, with no command waiting. */
+static bool sync_wait(int64_t wait_us)
+{
+    if (!s_need_sync) return true;
+    int64_t until = esp_timer_get_time() + wait_us;
+    s_pending_query = QUERY_NONE;
+    uint8_t b;
+    for (;;) {
+        /* first: the byte read at the end of the last round may have ended the sync, and then
+         * no new marker may go out (2nd review) */
+        if (!s_need_sync) return true;
+        if (!usb_serial_is_connected() || s_halted || s_estop) return false;
+        if (!mk_send_if_needed()) return false;
+        marlin_drain_rx();
+        if (!s_need_sync) return true;
+        if (esp_timer_get_time() >= until) return false;
+        if (xStreamBufferReceive(s_rx_stream, &b, 1, pdMS_TO_TICKS(10)) > 0)
+            rx_feed_byte(b);
+    }
+}
+
+uint32_t marlin_restart_seq(void)
+{
+    return s_restart_seq;
+}
+
+bool marlin_replies_owed(void)
+{
+    return s_need_sync;
+}
+
+bool marlin_sync_wait(int64_t wait_us)
+{
+    return sync_wait(wait_us);
 }
 
 /** Check if a GCode line is a long-running command that blocks until done.
@@ -878,6 +1003,11 @@ static bool marlin_send_cmd_ex(const char *gcode, query_type_t qtype,
         s_pending_query = QUERY_NONE;
         return false;
     }
+    /* lote 13: a marker out before this command would be answered before it: it no longer
+     * tells when everything is answered, so the next sync_wait() sends a new one (always,
+     * not only while replies are owed: 2nd review) */
+    s_mk_sent = false;
+    s_mk_echo = false;
 
     /* Brief pause after TX — gives STM32 CDC time to process the USB
      * OUT packet before we start polling for the response.
@@ -956,6 +1086,10 @@ static bool marlin_send_cmd_ex(const char *gcode, query_type_t qtype,
             ESP_LOGW(TAG, "CDC TX stall on %s — no response after %d pings, giving up",
                      gcode, stall_pings);
             s_pending_query = QUERY_NONE;
+            /* lote 13: the command was sent; its answer (and the pings') may still come */
+            s_need_sync = true;
+            s_mk_sent = false;
+            s_mk_echo = false;
             return false;
         }
 
@@ -996,6 +1130,13 @@ static bool marlin_send_cmd_ex(const char *gcode, query_type_t qtype,
                     int ext_ms = wait_silent ? timeout_ms : CMD_RESPONSE_TIMEOUT_MS;
                     int64_t nd = esp_timer_get_time() + (int64_t)ext_ms * 1000LL;
                     if (nd > deadline) deadline = nd;
+                }
+                /* lote 13: "paused for user" ends this wait (the old behaviour, above), but
+                 * this command's "ok" is still to come, after the person at the printer */
+                if (s_pending_query == QUERY_NONE && s_busy_for_user) {
+                    s_need_sync = true;
+                    s_mk_sent = false;
+                    s_mk_echo = false;
                 }
             }
         } else if (s_line_len < RX_LINE_BUF_SIZE - 1) {
@@ -1109,6 +1250,9 @@ static void printer_comm_task(void *arg)
                 s_m290_queried = false;
                 s_pos_logged = false;
                 s_autotemp_sent = false;
+                s_need_sync = false;    /* lote 13 */
+                s_mk_sent = false;
+                s_mk_echo = false;
                 ESP_LOGW(TAG, "Emergency stop released: the USB link was opened again");
             } else {
                 printer_cmd_t stale;
@@ -1167,6 +1311,9 @@ static void printer_comm_task(void *arg)
             s_m290_queried = false;
             s_pos_logged = false;
             s_autotemp_sent = false;
+            s_need_sync = false;    /* lote 13: a new connection starts with nothing owed */
+            s_mk_sent = false;
+            s_mk_echo = false;
             vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
         }
@@ -1271,6 +1418,14 @@ static void printer_comm_task(void *arg)
                 }
             }
             goto poll_done;
+        }
+
+        /* Ender Smart (lote 13): while the Ender still owes replies (a poll given up while it
+         * was busy with its own screen), only the marker goes out. Before, a new M27/M114 went
+         * every 10/30 s and piled up in its queue; their late answers came after a job start. */
+        if (s_need_sync) {
+            sync_wait(0);
+            if (s_need_sync) goto poll_done;
         }
 
         /* Query M290 once on connect to get current probe Z offset */
@@ -1727,7 +1882,9 @@ esp_err_t printer_comm_init(void)
 
     /* Marlin backend */
 
-    s_rx_stream = xStreamBufferCreate(2048, 1);
+    /* lote 13: 8 KB (was 2 KB). The mesh the Ender prints after a leveling (5x5 plus the
+     * 21x21 subdivided grid, ~4.5 KB in a burst) overflowed it on 2026-11-14 (rx_dropped 279) */
+    s_rx_stream = xStreamBufferCreate(8192, 1);
     if (!s_rx_stream) return ESP_ERR_NO_MEM;
 
     s_cmd_queue = xQueueCreate(CMD_QUEUE_SIZE, sizeof(printer_cmd_t));

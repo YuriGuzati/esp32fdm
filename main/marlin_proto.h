@@ -95,6 +95,17 @@ bool printer_comm_cmd_waiting(void);                                 /* lote 9 *
 /** Process any buffered RX data (auto-reports, etc.) */
 void marlin_drain_rx(void);
 
+/** Ender Smart (lote 13): true while the Ender may still answer a command that was given up
+ *  (its late "ok" would answer a later command). */
+bool marlin_replies_owed(void);
+
+/** lote 13: sends a marker (M118 E1 essync <n>) and reads until its echo and "ok" came, for
+ *  wait_us at most. True when nothing is owed. Printer task only, with no command waiting. */
+bool marlin_sync_wait(int64_t wait_us);
+
+/** lote 13: bumped each time the Ender is seen restarting ("start" and the like) */
+uint32_t marlin_restart_seq(void);
+
 /** Check if USB serial is currently connected */
 static inline bool marlin_is_connected(void)
 {

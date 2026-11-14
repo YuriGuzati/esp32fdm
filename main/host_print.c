@@ -29,6 +29,10 @@ static const char *TAG = "host_print";
  * one tick. Before: 4 lines, then 20 ms. A round of comment lines also ends at the time limit. */
 #define HP_ROUND_LINES          16
 #define HP_ROUND_US             (50 * 1000LL)
+/* Ender Smart (lote 13): how long a start waits for replies the Ender still owes */
+#define START_SYNC_WAIT_US      (30 * 1000000LL)
+#define RESUME_SYNC_WAIT_US     (5 * 1000000LL)
+#define TICK_SYNC_WAIT_US       (5 * 1000000LL)
 
 /* Park position and retract settings */
 #define PARK_X       0.0f
@@ -1372,7 +1376,12 @@ static const char *hp_start_file(const char *filename, const gcode_scan_t *pre)
     s_hp.line_history_idx = 0;
     char sync[40];
     format_numbered_line(sync, sizeof(sync), 0, "M110 N0");
-    marlin_send_cmd(sync, QUERY_CMD);
+    /* lote 13 (2nd review): refused on a busy cooldown, or no answer in time, the Ender's line
+     * counter may be anything; its "Resend" for N1 would then look like "N1 already done" and
+     * the file's 1st line would be skipped. hp_tick() resyncs first (patient M110, and the job
+     * is interrupted if that fails). */
+    if (!marlin_send_cmd(sync, QUERY_CMD))
+        s_hp.counter_unsure = true;
     s_hp.marlin_line = 1;
 
     /* Enable host keepalive -- Marlin sends "busy: processing" every 2s
@@ -1386,6 +1395,11 @@ static const char *hp_start_file(const char *filename, const gcode_scan_t *pre)
     char lcd_msg[128];
     snprintf(lcd_msg, sizeof(lcd_msg), "M117 %s", filename);
     marlin_send_cmd(lcd_msg, QUERY_CMD);
+
+    /* lote 13 (3rd review): M113/M75/M117 without an answer in time leave replies owed; then
+     * hp_tick() waits for them and resyncs the line counter before the file's 1st line */
+    if (marlin_replies_owed())
+        s_hp.counter_unsure = true;
 
     xSemaphoreTake(g_state_mutex, portMAX_DELAY);
     g_state.opstate = PRINTER_PRINTING;
@@ -1406,8 +1420,68 @@ static const char *hp_start_file(const char *filename, const gcode_scan_t *pre)
     return NULL;
 }
 
+/** Ender Smart (lote 13): before a start, the replies the Ender still owes (polls sent while it
+ *  was busy with its own screen) come first. Their late "ok" would answer the job's first
+ *  commands, and late "Not SD printing" wiped the job from the screen on 2026-11-14. Runs
+ *  before the preparation is taken, so "Desistir", "Cancelar" and the emergency stop (which
+ *  cancel the preparation) still end it. Returns why the job must not start, or NULL (also
+ *  when the preparation was cancelled or the USB dropped: hp_cmd_start handles those). */
+static const char *hp_wait_owed_replies(const char *filename)
+{
+    uint32_t restarts = marlin_restart_seq();
+    ESP_LOGW(TAG, "The Ender may still owe replies: waiting before starting %s", filename);
+    hp_set_notice("Esperando a Ender responder a comandos anteriores antes de começar");
+    int64_t until = esp_timer_get_time() + START_SYNC_WAIT_US;
+    bool synced = false, stop = false;
+    while (!synced && !stop) {
+        synced = marlin_sync_wait(200 * 1000LL);
+        portENTER_CRITICAL(&s_prep_lock);
+        bool cancel = s_prep.cancel;
+        portEXIT_CRITICAL(&s_prep_lock);
+        stop = cancel || !marlin_is_connected() || printer_comm_estop_requested() ||
+               esp_timer_get_time() >= until;
+    }
+    hp_set_notice("");
+    if (marlin_restart_seq() != restarts) {
+        ESP_LOGW(TAG, "Not starting %s: the Ender restarted while it was waited for", filename);
+        return "a Ender reiniciou enquanto a ESP32 esperava por ela; mande imprimir de novo";
+    }
+    if (!synced) {
+        portENTER_CRITICAL(&s_prep_lock);
+        bool cancel = s_prep.cancel;
+        portEXIT_CRITICAL(&s_prep_lock);
+        if (cancel || !marlin_is_connected()) return NULL;
+        ESP_LOGW(TAG, "Not starting %s: the Ender did not answer older commands in %lld s",
+                 filename, START_SYNC_WAIT_US / 1000000);
+        return "a Ender ainda não respondeu a comandos anteriores (ocupada pela tela?); "
+               "tente de novo";
+    }
+    /* the M27 answer can be trusted now (the poller sent none while replies were owed): is the
+     * Ender printing from its own card? hp_start_file() checks it (review) */
+    if (!marlin_send_cmd("M27", QUERY_M27) || marlin_replies_owed()) {
+        /* busy again: the M27 was refused (busy cooldown) or got no answer in time */
+        ESP_LOGW(TAG, "Not starting %s: the Ender is busy again", filename);
+        return "a Ender ainda não respondeu a comandos anteriores (ocupada pela tela?); "
+               "tente de novo";
+    }
+    ESP_LOGI(TAG, "The Ender answered every older command: starting %s", filename);
+    return NULL;
+}
+
 void hp_cmd_start(const char *filename)
 {
+    /* lote 13: first the replies the Ender still owes, while the preparation can be cancelled.
+     * Only for the start of the preparation that is ready (a stale one is ignored below). */
+    const char *sync_why = NULL;
+    if (marlin_replies_owed() && marlin_is_connected()) {
+        portENTER_CRITICAL(&s_prep_lock);
+        bool live = s_prep.busy && s_prep.ready && !s_prep.cancel && !s_prep.taken &&
+                    strcmp(s_prep.name, filename) == 0;
+        portEXIT_CRITICAL(&s_prep_lock);
+        if (live)
+            sync_why = hp_wait_owed_replies(filename);
+    }
+
     /* lote 11: the preparation of this file (if any) is handed over here */
     gcode_scan_t pre;
     bool mine = false, have = false, cancelled = false;
@@ -1455,6 +1529,8 @@ void hp_cmd_start(const char *filename)
          * the person who asked may be gone */
         ESP_LOGW(TAG, "USB link dropped during the preparation of %s: not starting", filename);
         why = "a conexão com a Ender caiu durante a preparação; mande imprimir de novo";
+    } else if (sync_why) {
+        why = sync_why;                    /* lote 13 */
     } else {
         why = hp_start_file(filename, &pre);
     }
@@ -1516,6 +1592,15 @@ void hp_cmd_resume(void)
 {
     if (!s_hp.printing || !s_hp.paused) return;
     if (s_hp.usb_lost || s_hp.printer_reset || s_hp.desync) return;   /* never after a drop */
+    /* lote 13: an older "ok" still to come (e.g. the M600 solved on the Ender's screen) would
+     * confirm the resume's commands (M109, the moves back) too early (review). Wait a little;
+     * if it does not come, stay paused. Nothing here turns a heater off: no safety delay. */
+    if (marlin_replies_owed() && !marlin_sync_wait(RESUME_SYNC_WAIT_US)) {
+        hp_set_notice("A retomada não começou: a Ender ainda não respondeu a comandos anteriores. "
+                      "Continua pausado; tente Retomar de novo.");
+        return;
+    }
+    if (s_hp.usb_lost || s_hp.printer_reset || s_hp.desync) return;   /* seen during the wait */
     char failed[48];
     if (!host_print_unpark(failed, sizeof(failed))) {
         /* Ender Smart (lote 6): stay paused; a 2nd Resume repeats only what is missing */
@@ -1640,6 +1725,14 @@ bool hp_tick(void)
 
     /* lote 6: a failed sequence command left the printer's line number unknown */
     if (s_hp.counter_unsure) {
+        /* lote 13 (3rd review): an older "ok" still to come would confirm this M110, and its
+         * own "ok" would then answer the next line: the whole job one answer ahead. Wait for
+         * the owed replies first; not getting them counts as a failed resync. */
+        if (marlin_replies_owed() && !marlin_sync_wait(TICK_SYNC_WAIT_US)) {
+            if (++s_hp.resync_fails >= 3)
+                host_print_interrupt("a impressora parou de responder");
+            return false;
+        }
         char m110[24];
         snprintf(m110, sizeof(m110), "M110 N%ld", (long)(s_hp.marlin_line - 1));
         if (!hp_seq(m110)) {
