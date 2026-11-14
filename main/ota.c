@@ -78,6 +78,12 @@ typedef struct {
     httpd_req_t *req;
 } ota_upload_ctx_t;
 
+/* Ender Smart (lote 11): an upload is being written. /sd/print refuses meanwhile, and the image
+ * is not activated if a print started anyway (checked again before the reboot). */
+static volatile bool s_ota_busy;
+
+bool ota_in_progress(void) { return s_ota_busy; }
+
 static void ota_upload_task(void *arg)
 {
     ota_upload_ctx_t *ctx = (ota_upload_ctx_t *)arg;
@@ -180,6 +186,14 @@ static void ota_upload_task(void *arg)
         goto done;
     }
 
+    if (printer_comm_job_active()) {
+        ESP_LOGE(TAG, "A print started during the upload: the new image is NOT activated");
+        httpd_resp_set_status(req, "409 Conflict");
+        httpd_resp_set_type(req, "text/plain");
+        httpd_resp_sendstr(req, "A print started during the upload: the new firmware was not activated");
+        goto done;
+    }
+
     err = esp_ota_set_boot_partition(update);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_ota_set_boot_partition failed: %s", esp_err_to_name(err));
@@ -199,6 +213,7 @@ static void ota_upload_task(void *arg)
     return;  /* unreachable */
 
 done:
+    s_ota_busy = false;
     httpd_req_async_handler_complete(req);
     vTaskDelete(NULL);
 }
@@ -222,15 +237,23 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid firmware size");
         return ESP_FAIL;
     }
+    if (s_ota_busy) {
+        httpd_resp_set_status(req, "409 Conflict");
+        httpd_resp_set_type(req, "text/plain");
+        return httpd_resp_sendstr(req, "Another firmware upload is in progress");
+    }
+    s_ota_busy = true;
 
     httpd_req_t *async_req = NULL;
     if (httpd_req_async_handler_begin(req, &async_req) != ESP_OK) {
+        s_ota_busy = false;
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Async begin failed");
         return ESP_FAIL;
     }
 
     ota_upload_ctx_t *ctx = malloc(sizeof(*ctx));
     if (!ctx) {
+        s_ota_busy = false;
         httpd_req_async_handler_complete(async_req);
         return ESP_FAIL;
     }
@@ -238,6 +261,7 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
 
     if (xTaskCreatePinnedToCore(ota_upload_task, "ota_up", 8192, ctx,
                                  5, NULL, 0) != pdPASS) {
+        s_ota_busy = false;
         free(ctx);
         httpd_req_async_handler_complete(async_req);
         return ESP_FAIL;

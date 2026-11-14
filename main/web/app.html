@@ -263,6 +263,9 @@ async function pollHist() { try { S.hist = (await getJSON('/api/temp_history')).
 async function loadSettings() { try { S.settings = await getJSON('/api/settings'); } catch (e) { } refreshView(); }
 function every(fn, ms) { fn(); return setInterval(() => { if (!document.hidden) fn(); }, ms); }
 const job = () => { const s = S.status && S.status.state; return s === 'printing' || s === 'paused'; };
+/* lote 11: a ESP32 lê o arquivo inteiro antes de a impressão começar (pode levar segundos num arquivo grande) */
+const prep = () => !!(S.status && S.status.preparing) && !job();
+const busyJob = () => job() || prep();
 
 /* ---------- confirmação ---------- */
 function confirmBox(title, body, okLabel, danger) {
@@ -310,6 +313,7 @@ function stateInfo() {
   if (!S.online) return ['Sem resposta da ESP32', 'var(--red)'];
   if (!st) return ['Carregando…', 'var(--faint)'];
   if (!st.usb && st.state !== 'error') return ['Ender desconectada', 'var(--faint)'];
+  if (prep() && st.state !== 'error') return ['Preparando', 'var(--yellow)'];
   return ({ printing: ['Imprimindo', 'var(--green)'], paused: ['Pausada', 'var(--yellow)'], error: ['Erro', 'var(--red)'],
     operational: ['Pronta', 'var(--blue)'], disconnected: ['Ender desconectada', 'var(--faint)'] })[st.state] || [st.state, 'var(--faint)'];
 }
@@ -327,7 +331,7 @@ function renderChrome() {
   if (S.status && S.status.state === 'error') {
     b.append(h('div', { class: 'err', role: 'alert' },
       h('span', null, S.status.error || 'A impressora informou um erro.'),
-      h('button', { class: 'btn sm danger', onclick: async () => { try { await post('/sd/cancel'); toast('Erro reconhecido'); pollStatus(); } catch (e) { toast(e.message, true); } } }, 'OK')));
+      h('button', { class: 'btn sm danger', onclick: async () => { try { await post('/sd/ack-error'); toast('Erro reconhecido'); pollStatus(); } catch (e) { toast(e.message, true); } } }, 'OK')));
   }
   /* aviso com a impressão ainda ativa (lote 6): ex. uma pausa que não estacionou */
   if (S.status && S.status.notice && S.status.state !== 'error') {
@@ -407,10 +411,19 @@ function Inicio() {
     h('div', { class: 'metric' }, h('span', { class: 'small muted' }, 'Progresso'), mPct, h('span', { class: 'tiny faint' }, 'pelo arquivo')),
     h('div', { class: 'metric' }, h('span', { class: 'small muted' }, 'Camada'), mLay, mZ),
     h('div', { class: 'metric' }, mTk, mT, mTs)));
+  /* lote 11: preparando o arquivo (ainda nada se moveu) */
+  const pFn = h('div', { style: 'font-size:20px;font-weight:650;overflow-wrap:anywhere' });
+  const pBarIn = h('div'), pBar = h('div', { class: 'bar', role: 'progressbar', 'aria-valuemin': 0, 'aria-valuemax': 100, 'aria-label': 'Leitura do arquivo' }, pBarIn);
+  const pTxt = h('span', { class: 'small muted' });
+  const pCancel = h('button', { class: 'btn', onclick: async () => {
+    if (!(await confirmBox('Desistir desta impressão?', 'A ESP32 para de ler o arquivo e a impressão não começa. Nada foi enviado à Ender ainda.', 'Desistir'))) return;
+    try { await post('/sd/prepare/cancel'); toast('Impressão não iniciada'); setTimeout(pollStatus, 300); } catch (e) { toast(e.message, true); }
+  } }, 'Desistir');
+  const prepBox = h('div', { class: 'col', style: 'gap:10px' }, pFn, pBar, pTxt, pCancel);
   const idleTxt = h('p', { class: 'muted', style: 'margin:0' });
   const idleBox = h('div', { class: 'col', style: 'gap:10px' }, idleTxt, h('a', { class: 'btn primary', href: '#arquivos' }, icon('files'), 'Escolher um arquivo'));
   const stCard = h('section', { class: 'card o1', 'aria-label': 'Impressão atual' },
-    h('div', { class: 'row between' }, h('div', { class: 'row', style: 'gap:8px' }, dot, lbl), be), jobBox, idleBox);
+    h('div', { class: 'row between' }, h('div', { class: 'row', style: 'gap:8px' }, dot, lbl), be), jobBox, prepBox, idleBox);
 
   function mkTile(label, color, idx) {
     const v = h('span', { class: 'big', style: 'color:' + color }, '—'), t = h('span', { class: 'tiny faint' }), sp = h('div');
@@ -449,9 +462,16 @@ function Inicio() {
   function update() {
     const st = S.status || {};
     const [l, col] = stateInfo();
-    const paused = st.state === 'paused', active = job();
+    const paused = st.state === 'paused', active = job(), preparing = prep();
     dot.style.background = col; lbl.textContent = l; be.textContent = st.backend || '';
-    jobBox.classList.toggle('hide', !active); idleBox.classList.toggle('hide', active);
+    jobBox.classList.toggle('hide', !active); prepBox.classList.toggle('hide', !preparing); idleBox.classList.toggle('hide', active || preparing);
+    if (preparing) {
+      const pp = Math.max(0, Math.min(100, st.prep_pct || 0));
+      pFn.textContent = st.preparing;
+      pBarIn.style.width = pp + '%'; pBar.setAttribute('aria-valuenow', pp);
+      pTxt.textContent = (pp < 100 ? 'Lendo o arquivo para contar as linhas e as camadas: ' + pp + '%. ' : 'Arquivo lido. ') +
+        'A impressão começa sozinha em seguida.';
+    }
     if (active) {
       const pct = Math.max(0, Math.min(100, st.progress || 0));
       const [lay, tot] = String(st.layer || '0/0').split('/');
@@ -581,27 +601,27 @@ function Arquivos() {
   async function openFile(f) {
     const meta = h('div', { class: 'grid2' }, h('span', { class: 'muted small' }, 'Lendo o arquivo…'));
     const thumb = h('div', { style: 'min-height:100px;border-radius:12px;border:1px dashed var(--border2);display:flex;align-items:center;justify-content:center;color:var(--faint);font-size:12px;text-align:center;padding:10px' }, 'Carregando…');
-    const busy = job() || !(S.status && S.status.usb);
+    const busy = busyJob() || !(S.status && S.status.usb);
     const shaOut = h('div', { class: 'small muted', style: 'overflow-wrap:anywhere' });
-    const shaBtn = h('button', { class: 'btn sm', disabled: job(), onclick: async () => {
+    const shaBtn = h('button', { class: 'btn sm', disabled: busyJob(), onclick: async () => {
       shaBtn.disabled = true; shaOut.textContent = 'Lendo o arquivo inteiro no cartão… (uns segundos por MB)';
       try { const r = await getJSON('/sd/sha256?filename=' + encodeURIComponent(f.name)); shaOut.textContent = ''; shaOut.append('SHA-256: ', h('code', { style: 'font-size:12px;user-select:all' }, r.sha256), ' · ' + fmtSize(r.size) + ' lidos em ' + num(r.ms / 1000, 1) + ' s'); }
       catch (e) { shaOut.textContent = 'Não consegui calcular: ' + e.message; }
-      shaBtn.disabled = job();
+      shaBtn.disabled = busyJob();
     } }, 'Conferir integridade (SHA-256)');
-    const dl = job() ? h('button', { class: 'btn sm', disabled: true }, 'Baixar')
+    const dl = busyJob() ? h('button', { class: 'btn sm', disabled: true }, 'Baixar')
       : h('a', { class: 'btn sm', href: '/sd/download?filename=' + encodeURIComponent(f.name), download: f.name }, 'Baixar');
     const s = sheet(f.name, h('div', { class: 'col', style: 'gap:12px' }, thumb, meta,
       h('div', { class: 'row wrap', style: 'gap:6px' }, shaBtn, dl), shaOut,
-      busy ? h('p', { class: 'note', style: 'margin:0' }, job() ? 'Há uma impressão em andamento.' : 'A Ender não está conectada.') : null,
+      busy ? h('p', { class: 'note', style: 'margin:0' }, job() ? 'Há uma impressão em andamento.' : prep() ? 'Há um arquivo sendo preparado para imprimir.' : 'A Ender não está conectada.') : null,
       h('div', { class: 'grid2' },
-        h('button', { class: 'btn danger', disabled: job(), onclick: async () => {
+        h('button', { class: 'btn danger', disabled: busyJob(), onclick: async () => {
           if (!(await confirmBox('Apagar ' + f.name + '?', 'O arquivo sai do cartão da ESP32. Não dá para desfazer.', 'Apagar', true))) return;
           try { await post('/sd/delete', { filename: f.name }); toast('Apagado'); s.remove(); load(); } catch (e) { toast(e.message, true); }
         } }, 'Apagar'),
         h('button', { class: 'btn primary', disabled: busy, onclick: async () => {
           if (!(await confirmBox('Imprimir ' + f.name + '?', 'Confira: mesa limpa, filamento carregado e nada perto do bico. A Ender vai aquecer, fazer a origem e começar. Fique por perto.', 'Começar a impressão'))) return;
-          try { await post('/sd/print', { filename: f.name }); toast('Impressão iniciada'); s.remove(); location.hash = '#inicio'; setTimeout(pollStatus, 1000); } catch (e) { toast(e.message, true); }
+          try { await post('/sd/print', { filename: f.name }); toast('Preparando o arquivo…'); s.remove(); location.hash = '#inicio'; setTimeout(pollStatus, 300); } catch (e) { toast(e.message, true); }
         } }, 'Imprimir'))));
     try {
       const d = await getJSON('/sd/info?filename=' + encodeURIComponent(f.name));
@@ -639,7 +659,8 @@ function Arquivos() {
 function Controles() {
   let stepXY = 10, stepZ = 1, eSpeed = 300;
   const moveBtns = [], eBtns = [];
-  const lock = h('p', { class: 'note hide', style: 'margin:0' }, 'Impressão em andamento: a ESP32 só aceita ajustes finos (ventilador, velocidade, fluxo, Z fino e temperatura de aquecedor já ligado). Movimento, origem e ligar um aquecedor desligado são recusados.');
+  const LOCK_TXT = ': a ESP32 só aceita ajustes finos (ventilador, velocidade, fluxo, Z fino e temperatura de aquecedor já ligado). Movimento, origem e ligar um aquecedor desligado são recusados.';
+  const lock = h('p', { class: 'note hide', style: 'margin:0' }, 'Impressão em andamento' + LOCK_TXT);
 
   async function setTemp(kind, v) {
     const st = S.status || {}, cur = kind === 'M104' ? (st.hotend || [0, 0])[1] : (st.bed || [0, 0])[1];
@@ -723,8 +744,9 @@ function Controles() {
 
   const el = h('div', { class: 'col', style: 'gap:12px' }, h('h1', null, 'Controles'), lock, heat, move, ext);
   function update() {
-    const st = S.status || {}, active = job(), he = st.hotend || [0, 0], bd = st.bed || [0, 0];
+    const st = S.status || {}, active = busyJob(), he = st.hotend || [0, 0], bd = st.bed || [0, 0];   /* lote 11: a preparação também */
     lock.classList.toggle('hide', !active);
+    lock.textContent = (prep() ? 'Preparando um arquivo para imprimir' : 'Impressão em andamento') + LOCK_TXT;
     const inf = p => 'agora ' + num(p[0], 0) + ' °C · alvo ' + (p[1] > 0 ? num(p[1], 0) + ' °C' : 'desligado');
     hB.info.textContent = inf(he); hM.info.textContent = inf(bd);
     moveBtns.forEach(b => b.disabled = active);
@@ -1135,15 +1157,15 @@ function Mesa() {
   function renderProbe(state, err, op) {
     probeBtns.textContent = '';
     const running = state === 'homing' || state === 'probing' || state === 'reading';
-    probeBtns.append(h('button', { class: 'btn primary blk', disabled: running || job(), onclick: async () => {
+    probeBtns.append(h('button', { class: 'btn primary blk', disabled: running || busyJob(), onclick: async () => {
       if (!(await confirmBox('Medir a mesa agora?', 'A Ender faz a origem (G28) e mede todos os pontos (G29), cerca de 2 a 3 minutos. O bico encosta na mesa várias vezes: fique por perto. A malha nova fica ativa até a Ender desligar; para guardar, salve (M500) depois.', 'Medir'))) return;
       try { const r = JSON.parse(await post('/bedlevel/probe', { confirm: 1 }) || '{}'); if (!r.ok) throw new Error(r.err || 'recusado'); toast('Medição iniciada'); renderProbe('homing'); startPoll(); } catch (e) { toast(e.message, true); }
     } }, state === 'homing' ? 'Fazendo a origem…' : state === 'probing' ? 'Medindo…' : 'Medir de novo (G28 + G29)'),
-      h('button', { class: 'btn blk', disabled: running || job(), onclick: async () => {
+      h('button', { class: 'btn blk', disabled: running || busyJob(), onclick: async () => {
         try { const r = JSON.parse(await post('/bedlevel/read', {}) || '{}'); if (!r.ok) throw new Error(r.err || 'recusado'); renderProbe('reading', null, 'read'); startPoll(); } catch (e) { toast(e.message, true); }
       } }, state === 'reading' ? 'Lendo…' : 'Ler a malha guardada na Ender (sem mover)'),
       h('span', { class: 'tiny faint' }, '"Ler" pede à Ender a malha que ela está usando (M420 V): não faz a origem, não mede e não aquece.'));
-    if (state === 'done' && op === 'probe') probeBtns.append(h('button', { class: 'btn blk', disabled: job(), onclick: async () => {
+    if (state === 'done' && op === 'probe') probeBtns.append(h('button', { class: 'btn blk', disabled: busyJob(), onclick: async () => {
       if (await confirmBox('Guardar a malha na Ender?', 'Grava na memória da impressora (M500) a malha nova, o Z offset e as outras configurações atuais.', 'Salvar')) gcode('M500');
     } }, 'Salvar a malha na memória da Ender (M500)'));
     if (state === 'error' && err) probeBtns.append(h('p', { class: 'note', style: 'margin:0' }, (op === 'read' ? 'A última leitura falhou: ' : 'A última medição falhou: ') + err));
@@ -1472,7 +1494,7 @@ function Sistema() {
   function renderInfo(d, err) {
     info.textContent = '';
     info.append(h('div', { class: 'row between wrap' }, h('h2', null, 'Impressora (M115)'),
-      h('button', { class: 'btn sm', disabled: job(), onclick: async () => {
+      h('button', { class: 'btn sm', disabled: busyJob(), onclick: async () => {
         try { const r = JSON.parse(await post('/api/printer_info/refresh') || '{}'); if (!r.ok) throw new Error(r.err || 'recusado'); toast('Pedido enviado à Ender (M115, só leitura)'); setTimeout(loadInfo, 2500); }
         catch (e) { toast(e.message, true); }
       } }, 'Ler da Ender')));

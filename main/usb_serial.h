@@ -43,6 +43,12 @@ esp_err_t usb_serial_set_control_lines(bool dtr, bool rts);
 bool usb_serial_is_connected(void);
 
 /**
+ * Ender Smart (lote 11): counts the openings of a USB serial device (+1 at each connection).
+ * A different value means the link dropped and came back in between (the Ender may have reset).
+ */
+uint32_t usb_serial_connect_gen(void);
+
+/**
  * Ender Smart (lote 9): true when the open device is a USB-UART bridge (CH34x, CP210x,
  * FTDI), false for a native CDC-ACM device or when nothing is open.
  */

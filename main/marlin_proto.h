@@ -141,8 +141,16 @@ void hp_notify_usb_lost(void);
  *  Called while g_state_mutex is held. */
 void hp_fill_state(printer_state_t *out);
 
+/** Ender Smart (lote 11): file preparation outside the printer task (see host_print.c) */
+esp_err_t hp_prepare_begin(const char *filename, const char **why);
+void hp_prepare_run(void);
+bool hp_prepare_busy(void);
+bool hp_preparing(char *name, size_t name_len, int *pct);
+bool hp_prepare_cancel(void);
+void hp_prepare_abort(const char *why);   /* by the firmware (Ender disconnected): shown as an error */
+void hp_ack_error(void);                  /* clears the error on screen, never cancels a job */
+
 /** Public API pass-throughs */
-esp_err_t hp_start(const char *filename);
 esp_err_t hp_pause(void);
 esp_err_t hp_resume(void);
 esp_err_t hp_cancel(void);

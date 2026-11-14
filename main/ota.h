@@ -28,6 +28,9 @@ void ota_schedule_boot_confirm(uint32_t delay_s);
  */
 void ota_register_httpd(httpd_handle_t server);
 
+/** Ender Smart (lote 11): true while a firmware upload is being written (no print may start). */
+bool ota_in_progress(void);
+
 /**
  * Render the firmware update section for the settings page.
  */

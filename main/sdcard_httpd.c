@@ -196,6 +196,8 @@ static void sd_writer_task(void *arg)
     vTaskDelete(NULL);
 }
 
+static bool sd_name_in_use(const char *filename);   /* lote 11, below */
+
 static void sd_upload_task(void *arg)
 {
     sd_upload_ctx_t *ctx = (sd_upload_ctx_t *)arg;
@@ -322,6 +324,15 @@ static void sd_upload_task(void *arg)
         ESP_LOGW(TAG, "Upload %s: SHA-256 mismatch (got %s, expected %s), discarded", ctx->filename, hex, ctx->want_sha);
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "SHA-256 mismatch: file discarded");
     } else {
+        /* lote 11: a print or a preparation of this name may have started during the upload;
+         * unlink() of an open file frees clusters the print is still reading */
+        if (sd_name_in_use(ctx->filename)) {
+            unlink(path);
+            ESP_LOGW(TAG, "Upload %s discarded: the file is being printed or prepared", ctx->filename);
+            httpd_resp_set_status(req, "409 Conflict");
+            httpd_resp_sendstr(req, "This file is being printed");
+            goto done;
+        }
         /* FAT rename() does not replace an existing file */
         unlink(final_path);
         if (rename(path, final_path) != 0) {
@@ -344,6 +355,18 @@ done:
     httpd_req_async_handler_complete(req);
     free(ctx);
     vTaskDelete(NULL);
+}
+
+/** Ender Smart (lote 11): the file of the print running/paused, or being prepared for it.
+ *  Overwriting or deleting it would make the print read changed or freed clusters. */
+static bool sd_name_in_use(const char *filename)
+{
+    if (!printer_comm_job_active()) return false;
+    printer_state_t ps;
+    printer_comm_get_state(&ps);
+    if (ps.filename[0] && strcmp(ps.filename, filename) == 0) return true;
+    char prep[64];
+    return printer_comm_preparing(prep, sizeof(prep), NULL) && strcmp(prep, filename) == 0;
 }
 
 static esp_err_t sd_upload_handler(httpd_req_t *req)
@@ -381,13 +404,9 @@ static esp_err_t sd_upload_handler(httpd_req_t *req)
         httpd_resp_set_status(req, "507 Insufficient Storage");
         return httpd_resp_sendstr(req, "Not enough free space on the SD card");
     }
-    if (printer_comm_job_active()) {
-        printer_state_t ps;
-        printer_comm_get_state(&ps);
-        if (strcmp(ps.filename, filename) == 0) {
-            httpd_resp_set_status(req, "409 Conflict");
-            return httpd_resp_sendstr(req, "This file is being printed");
-        }
+    if (sd_name_in_use(filename)) {
+        httpd_resp_set_status(req, "409 Conflict");
+        return httpd_resp_sendstr(req, "This file is being printed");
     }
     char want_sha[80] = "";
     if (httpd_req_get_hdr_value_str(req, "X-SHA256", want_sha, sizeof(want_sha)) == ESP_OK) {
@@ -456,6 +475,13 @@ static esp_err_t sd_delete_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
+    /* lote 11: the old UI disabled the button, but the route deleted it anyway */
+    if (sd_name_in_use(fn)) {
+        httpd_resp_set_status(req, "409 Conflict");
+        httpd_resp_set_type(req, "text/plain");
+        return httpd_resp_sendstr(req, "Este arquivo está sendo impresso ou preparado para imprimir");
+    }
+
     char path[300];
     snprintf(path, sizeof(path), MOUNT_POINT "/%s", fn);
 
@@ -487,20 +513,43 @@ static void sd_print_task(void *arg)
     esp_err_t err;
     if (printer_comm_get_backend() == PRINTER_BACKEND_KLIPPER) {
         err = klipper_backend_print_file(ctx->filename);
-    } else {
-        err = printer_comm_host_print_start(ctx->filename);
+        if (err != ESP_OK) {
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to start print");
+        } else {
+            httpd_resp_set_status(req, "303 See Other");
+            httpd_resp_set_hdr(req, "Location", "/sd");
+            httpd_resp_send(req, NULL, 0);
+        }
+        httpd_req_async_handler_complete(req);
+        free(ctx);
+        vTaskDelete(NULL);
+        return;
     }
 
+    /* Ender Smart (lote 11): answer at once, then read the file here (not in the printer task)
+     * while the screen shows "Preparando"; the start is queued at the end. */
+    const char *why = "";
+    err = printer_comm_prepare_begin(ctx->filename, &why);
     if (err != ESP_OK) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to start print");
-    } else {
-        httpd_resp_set_status(req, "303 See Other");
-        httpd_resp_set_hdr(req, "Location", "/sd");
-        httpd_resp_send(req, NULL, 0);
+        httpd_resp_set_status(req, err == ESP_ERR_NOT_FOUND ? "404 Not Found"
+                                 : err == ESP_ERR_INVALID_ARG ? "400 Bad Request" : "409 Conflict");
+        httpd_resp_set_type(req, "text/plain");
+        httpd_resp_sendstr(req, why);
+        httpd_req_async_handler_complete(req);
+        free(ctx);
+        vTaskDelete(NULL);
+        return;
     }
-
+    httpd_resp_set_status(req, "303 See Other");
+    httpd_resp_set_hdr(req, "Location", "/sd");
+    httpd_resp_send(req, NULL, 0);
     httpd_req_async_handler_complete(req);
     free(ctx);
+
+    /* lowest priority above idle: a big file keeps this task busy for seconds */
+    vTaskPrioritySet(NULL, tskIDLE_PRIORITY + 1);
+    printer_comm_prepare_run();
+    ESP_LOGI(TAG, "sd_print stack free: %u of 6144 B", (unsigned)uxTaskGetStackHighWaterMark(NULL));
     vTaskDelete(NULL);
 }
 
@@ -543,7 +592,8 @@ static esp_err_t sd_print_handler(httpd_req_t *req)
     ctx->req = async_req;
     strlcpy(ctx->filename, fn, sizeof(ctx->filename));
 
-    if (xTaskCreatePinnedToCore(sd_print_task, "sd_print", 4096, ctx,
+    /* lote 11: 4096 -> 6144, the file scan (strtof, logs with floats) now runs in this task */
+    if (xTaskCreatePinnedToCore(sd_print_task, "sd_print", 6144, ctx,
                                  5, NULL, 0) != pdPASS) {
         httpd_req_async_handler_complete(async_req);
         free(ctx);
@@ -583,8 +633,34 @@ static esp_err_t sd_cancel_handler(httpd_req_t *req)
         printer_cmd_t cmd = { .type = PCMD_CANCEL };
         printer_comm_send_cmd(&cmd);
     } else {
+        /* lote 11: with no job yet, "Cancelar" stops the preparation (nothing has moved).
+         * The "OK" of an error also posts here: then it only acknowledges the error. */
+        printer_state_t st;
+        printer_comm_get_state(&st);
+        if (st.opstate != PRINTER_ERROR && !printer_comm_is_host_printing() &&
+            printer_comm_prepare_cancel())
+            return httpd_resp_send(req, "OK", 2);
         printer_comm_host_print_cancel();
     }
+    return httpd_resp_send(req, "OK", 2);
+}
+
+/* ---- POST /sd/prepare/cancel (lote 11): only a preparation, never a running print ---- */
+
+static esp_err_t sd_prepare_cancel_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "text/plain");
+    if (printer_comm_prepare_cancel())
+        return httpd_resp_sendstr(req, "OK");
+    httpd_resp_set_status(req, "409 Conflict");
+    return httpd_resp_sendstr(req, "Nenhum arquivo está sendo preparado (a impressão pode já ter começado: use Cancelar)");
+}
+
+/* ---- POST /sd/ack-error (lote 11): the "OK" of the error banner, never cancels a print ---- */
+
+static esp_err_t sd_ack_error_handler(httpd_req_t *req)
+{
+    printer_comm_ack_error();
     return httpd_resp_send(req, "OK", 2);
 }
 
@@ -913,6 +989,8 @@ esp_err_t sdcard_httpd_register(httpd_handle_t server)
         { .uri = "/sd/pause",  .method = HTTP_POST, .handler = sd_pause_handler },
         { .uri = "/sd/resume", .method = HTTP_POST, .handler = sd_resume_handler },
         { .uri = "/sd/cancel", .method = HTTP_POST, .handler = sd_cancel_handler },
+        { .uri = "/sd/prepare/cancel", .method = HTTP_POST, .handler = sd_prepare_cancel_handler },
+        { .uri = "/sd/ack-error", .method = HTTP_POST, .handler = sd_ack_error_handler },
         { .uri = "/sd/info",   .method = HTTP_GET,  .handler = sd_info_handler },
         { .uri = "/sd/status", .method = HTTP_GET,  .handler = sd_status_handler },
         { .uri = "/sd/sha256", .method = HTTP_GET,  .handler = sd_sha256_handler },

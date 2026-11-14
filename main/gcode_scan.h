@@ -31,6 +31,17 @@ typedef struct {
  */
 void gcode_scan_file(FILE *f, gcode_scan_t *out);
 
+/** Ender Smart (lote 11): options of gcode_scan_file_ex(), all optional. */
+typedef struct {
+    volatile uint32_t *bytes_done;   /* bytes read so far, updated every 1024 lines */
+    volatile bool *cancel;           /* set by another task: the scan stops early */
+    bool yield;                      /* sleep 1 tick every 100 ms (a long scan in a low-priority
+                                        task must not starve the idle task / task watchdog) */
+} gcode_scan_opts_t;
+
+/** Same as gcode_scan_file(); returns false if *o->cancel stopped it (out is then partial). */
+bool gcode_scan_file_ex(FILE *f, gcode_scan_t *out, const gcode_scan_opts_t *o);
+
 /* ---- Public file info scan (head + tail, cached) ---- */
 
 typedef struct {

@@ -1072,6 +1072,32 @@ static void printer_comm_task(void *arg)
             if (hp_is_active()) {
                 hp_notify_usb_lost();
             }
+            /* Ender Smart (lote 11): nothing queued while the Ender is away may run when it comes
+             * back (it may have reset, and nobody is asking any more). A preparation is aborted,
+             * and its start is dropped with an error on screen. */
+            hp_prepare_abort("a Ender desconectou durante a preparação");
+            printer_cmd_t stale;
+            while (xQueueReceive(s_cmd_queue, &stale, 0) == pdTRUE) {
+                if (stale.type == PCMD_HOST_START) {
+                    hp_cmd_start(stale.gcode);          /* cancelled above: only cleans up */
+                } else if ((stale.type == PCMD_HOST_CANCEL || stale.type == PCMD_HOST_SAFETY_CANCEL) &&
+                           hp_is_active()) {
+                    /* A job is on: hp_notify_usb_lost() marked it, and hp_tick() interrupts it
+                     * with the heaters off when the Ender is back. Ending it here would leave
+                     * nobody to turn them off. */
+                    ESP_LOGW(TAG, "Ender disconnected: cancel dropped, the job is interrupted "
+                             "(heaters off) when the Ender is back%s%.60s",
+                             stale.type == PCMD_HOST_SAFETY_CANCEL ? "; the Ender had said: " : "",
+                             stale.type == PCMD_HOST_SAFETY_CANCEL ? stale.gcode : "");
+                } else if (stale.type == PCMD_HOST_CANCEL) {
+                    hp_cmd_cancel();                    /* no job: only clears the error */
+                } else if (stale.type == PCMD_HOST_SAFETY_CANCEL) {
+                    hp_cmd_safety_cancel(stale.gcode);  /* no job: only adds to the error */
+                } else {
+                    ESP_LOGW(TAG, "Ender disconnected: dropped queued command (type %d) %.40s",
+                             stale.type, stale.type == PCMD_RAW ? stale.gcode : "");
+                }
+            }
             s_m290_queried = false;
             s_pos_logged = false;
             s_autotemp_sent = false;
@@ -1522,7 +1548,7 @@ bool printer_comm_job_active(void)
     printer_state_t st;
     printer_comm_get_state(&st);
     return st.opstate == PRINTER_PRINTING || st.opstate == PRINTER_PAUSED ||
-           (s_backend == PRINTER_BACKEND_MARLIN && hp_is_active());
+           (s_backend == PRINTER_BACKEND_MARLIN && (hp_is_active() || hp_prepare_busy()));
 }
 
 bool printer_comm_cmd_allowed(const char *gcode, char *reason, size_t reason_len)
@@ -1530,7 +1556,7 @@ bool printer_comm_cmd_allowed(const char *gcode, char *reason, size_t reason_len
     printer_state_t st;
     printer_comm_get_state(&st);
     bool active = st.opstate == PRINTER_PRINTING || st.opstate == PRINTER_PAUSED ||
-                  (s_backend == PRINTER_BACKEND_MARLIN && hp_is_active());
+                  (s_backend == PRINTER_BACKEND_MARLIN && (hp_is_active() || hp_prepare_busy()));
     if (!active)
         return true;
 
@@ -1660,7 +1686,34 @@ esp_err_t printer_comm_init(void)
 
 /* ---- Host print public API ---- */
 
-esp_err_t printer_comm_host_print_start(const char *filename) { return hp_start(filename); }
+esp_err_t printer_comm_prepare_begin(const char *filename, const char **why)
+{
+    if (s_backend != PRINTER_BACKEND_MARLIN) {
+        if (why) *why = "Só no modo Marlin";
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    return hp_prepare_begin(filename, why);
+}
+void printer_comm_prepare_run(void) { hp_prepare_run(); }
+bool printer_comm_preparing(char *name, size_t name_len, int *pct)
+{
+    if (s_backend != PRINTER_BACKEND_MARLIN) {
+        if (name && name_len) name[0] = '\0';
+        if (pct) *pct = 0;
+        return false;
+    }
+    return hp_preparing(name, name_len, pct);
+}
+bool printer_comm_prepare_cancel(void) { return s_backend == PRINTER_BACKEND_MARLIN && hp_prepare_cancel(); }
+void printer_comm_ack_error(void)
+{
+    if (s_backend == PRINTER_BACKEND_MARLIN) {
+        hp_ack_error();
+        return;
+    }
+    printer_cmd_t cmd = { .type = PCMD_CANCEL };   /* Klipper: as before */
+    printer_comm_send_cmd(&cmd);
+}
 esp_err_t printer_comm_host_print_pause(void)  { return hp_pause(); }
 esp_err_t printer_comm_host_print_resume(void) { return hp_resume(); }
 esp_err_t printer_comm_host_print_cancel(void) { return hp_cancel(); }

@@ -201,16 +201,18 @@ For WebRTC streaming (optional), run the Janus proxy sidecar on a Linux machine 
 | `/sd` | GET | SD card file manager |
 | `/sd/files` | GET | JSON file listing |
 | `/sd/upload` | POST | Upload file to SD |
-| `/sd/print` | POST | Start host print |
+| `/sd/print` | POST | Start host print: answers 303 at once, reads the file (progress in `/api/status` `preparing`/`prep_pct`), then starts. 409 if a print runs or another file is being prepared |
 | `/sd/pause` | POST | Pause print |
 | `/sd/resume` | POST | Resume print |
-| `/sd/cancel` | POST | Cancel print |
+| `/sd/cancel` | POST | Cancel print (with no print yet, stops a preparation) |
+| `/sd/prepare/cancel` | POST | Stop the preparation of a file: the print does not start, nothing is sent (409 if none) |
+| `/sd/ack-error` | POST | Clear the error shown on screen ("OK"); never cancels a print |
 | `/utils` | GET | Utilities index page |
 | `/bedlevel` | GET | Bed leveling page |
 | `/bedlevel/probe` | POST | Start G28+G29 probing |
 | `/bedlevel/status` | GET | Probing state + mesh JSON |
 | `/bedlevel/config` | GET/POST | Bed config (size, screws, origin) |
-| `/api/status` | GET | JSON printer status |
+| `/api/status` | GET | JSON printer status (`preparing`: file being read before the start, `prep_pct`) |
 | `/api/temp_history` | GET | Temperature history (1h, 4s intervals) |
 | `/settings` | GET | Settings page |
 | `/printer/config` | GET/POST | Printer backend config |

@@ -251,12 +251,17 @@ static esp_err_t api_status_handler(httpd_req_t *req)
         s_baby_z_seeded = true;
     }
 
-    char json[896];
+    /* lote 11: the file being prepared (read before the print starts) and how far */
+    char prep[64];
+    int prep_pct = 0;
+    printer_comm_preparing(prep, sizeof(prep), &prep_pct);
+
+    char json[1024];
     snprintf(json, sizeof(json),
         "{\"state\":\"%s\",\"backend\":\"%s\",\"hotend\":[%.1f,%.1f],\"bed\":[%.1f,%.1f],"
         "\"progress\":%.1f,\"filename\":\"%s\",\"elapsed\":%ld,\"remaining\":%ld,"
         "\"layer\":\"%ld/%ld\",\"z\":%.1f,\"baby_z\":%.2f,\"usb\":%s,\"error\":\"%s\","
-        "\"notice\":\"%s\"}",
+        "\"notice\":\"%s\",\"preparing\":\"%s\",\"prep_pct\":%d}",
         state_str, printer_comm_backend_name(),
         st.hotend_actual, st.hotend_target,
         st.bed_actual, st.bed_target,
@@ -269,7 +274,7 @@ static esp_err_t api_status_handler(httpd_req_t *req)
         st.z, s_baby_z,
         usb ? "true" : "false",
         st.opstate == PRINTER_ERROR ? st.error_msg : "",
-        st.notice);
+        st.notice, prep, prep_pct);
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");

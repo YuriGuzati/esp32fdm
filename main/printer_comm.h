@@ -155,10 +155,24 @@ void printer_config_render_marlin(html_buf_t *p);
 #include "gcode_scan.h"
 
 /**
- * Start host-based GCode printing from a file on /sdcard.
- * The file is streamed line-by-line to the printer via USB serial.
+ * Ender Smart (lote 11): start a host print in two steps, from the task of the HTTP request.
+ * prepare_begin() checks that nothing is running or being prepared and opens the file
+ * (ESP_ERR_INVALID_STATE / ESP_ERR_NOT_FOUND / ESP_ERR_INVALID_ARG, *why = a sentence for the
+ * screen). prepare_run() then reads the whole file in the calling task (slow for big files) and
+ * queues the start; the printer task keeps running meanwhile. Marlin only.
  */
-esp_err_t printer_comm_host_print_start(const char *filename);
+esp_err_t printer_comm_prepare_begin(const char *filename, const char **why);
+void printer_comm_prepare_run(void);
+
+/** lote 11: true while a file is being prepared; name and progress (0..100) for the screen. */
+bool printer_comm_preparing(char *name, size_t name_len, int *pct);
+
+/** lote 11: stop the preparation (the print does not start; nothing has moved). False if none,
+ *  or if the start has already been taken (then it is a print: use the normal cancel). */
+bool printer_comm_prepare_cancel(void);
+
+/** lote 11: the "OK" of the error banner: clears the error, never cancels a print. */
+void printer_comm_ack_error(void);
 
 /**
  * Pause host print (stops sending lines, heaters stay on).
@@ -191,6 +205,7 @@ bool printer_comm_cmd_allowed(const char *gcode, char *reason, size_t reason_len
 /**
  * Ender Smart (F15-13): true while a print is running or paused (host print or
  * printer SD). OTA, reboot, Wi-Fi reset, bed probing and RFC 2217 are refused then.
+ * lote 11: also while a file is being prepared for printing.
  */
 bool printer_comm_job_active(void);
 

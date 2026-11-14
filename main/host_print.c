@@ -1,10 +1,12 @@
 #include "marlin_proto.h"
 #include "gcode_scan.h"
 
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "nvs.h"
+#include <sys/stat.h>
 
 #include <ctype.h>
 #include <math.h>
@@ -13,6 +15,7 @@
 #include <string.h>
 
 #include "job_history.h"
+#include "ota.h"
 #include <time.h>
 
 static const char *TAG = "host_print";
@@ -986,12 +989,291 @@ static bool host_print_finish(bool cancelled)
     return heaters_off;
 }
 
-/** Start host print from within the task context */
-void hp_cmd_start(const char *filename)
+/* ---- Ender Smart (lote 11): file preparation outside the printer task ----
+ * Before, hp_cmd_start() read the whole file (gcode_scan_file) inside the printer task, with
+ * newlib's 128 B stdio buffer: ~75 s for 30 MB (2026-11-14), the printer task stopped and the
+ * screen still showing "operational". Now the HTTP task that received /sd/print reads it, with a
+ * 16 KB DMA-capable buffer and at low priority, the screen shows the progress ("preparing"),
+ * the preparation can be cancelled (nothing has moved yet), and the result is handed over in
+ * s_prep: PCMD_HOST_START with the same name uses it instead of reading the file again.
+ *
+ * s_prep.busy goes from hp_prepare_begin() until hp_cmd_start() has taken (and run) the start, or
+ * the preparation fails or is cancelled. While busy, printer_comm_job_active() is true (the locks
+ * of OTA, reboot, Wi-Fi, SD reads; and a 2nd /sd/print gets 409). */
+typedef struct {
+    bool busy;
+    bool ready;                   /* scan done, PCMD_HOST_START queued */
+    bool taken;                   /* hp_cmd_start() has it: too late to cancel, use Cancelar */
+    volatile bool cancel;
+    const char *abort_why;        /* why it was cancelled by the firmware (shown as an error) */
+    char name[64];
+    long size;                    /* to check that the file did not change before the start */
+    time_t mtime;
+    uint32_t usb_gen;             /* usb_serial_connect_gen() at the begin */
+    volatile uint32_t done;       /* bytes read (progress) */
+    uint32_t total;
+    int64_t t0;
+    gcode_scan_t scan;
+    FILE *f;                      /* only used by the HTTP task, between begin and run */
+    void *vbuf;
+} hp_prep_t;
+static hp_prep_t s_prep;
+static portMUX_TYPE s_prep_lock = portMUX_INITIALIZER_UNLOCKED;
+
+/** The printer's opstate, without copying the whole printer_state_t (~530 B) to the stack. */
+static printer_opstate_t hp_opstate(void)
+{
+    xSemaphoreTake(g_state_mutex, portMAX_DELAY);
+    printer_opstate_t o = g_state.opstate;
+    xSemaphoreGive(g_state_mutex);
+    return o;
+}
+
+static void hp_prepare_release(void)
+{
+    portENTER_CRITICAL(&s_prep_lock);
+    s_prep.busy = false;
+    s_prep.ready = false;
+    s_prep.taken = false;
+    s_prep.cancel = false;
+    s_prep.abort_why = NULL;
+    s_prep.name[0] = '\0';
+    s_prep.done = 0;
+    s_prep.total = 0;
+    portEXIT_CRITICAL(&s_prep_lock);
+}
+
+/** fopen + a bigger stdio buffer in internal DMA-capable RAM (SDMMC cannot DMA into PSRAM: with
+ *  a PSRAM buffer it copies one sector at a time). *vbuf must be freed after fclose. */
+static FILE *hp_open_for_scan(const char *path, void **vbuf)
+{
+    *vbuf = NULL;
+    FILE *f = fopen(path, "r");
+    if (!f) return NULL;
+    for (size_t sz = 16384; sz >= 2048; sz /= 2) {
+        /* the internal RAM is shared with Wi-Fi, USB and the camera: leave a margin */
+        if (heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL) < sz + 24576)
+            continue;
+        void *b = heap_caps_malloc(sz, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+        if (!b) continue;
+        if (setvbuf(f, b, _IOFBF, sz) == 0) *vbuf = b;
+        else free(b);
+        break;
+    }
+    return f;
+}
+
+bool hp_prepare_busy(void)
+{
+    portENTER_CRITICAL(&s_prep_lock);
+    bool b = s_prep.busy;
+    portEXIT_CRITICAL(&s_prep_lock);
+    return b;
+}
+
+bool hp_preparing(char *name, size_t name_len, int *pct)
+{
+    portENTER_CRITICAL(&s_prep_lock);
+    bool b = s_prep.busy;
+    uint32_t done = s_prep.done, total = s_prep.total;
+    bool ready = s_prep.ready;
+    if (name && name_len) {
+        if (b) strlcpy(name, s_prep.name, name_len);
+        else name[0] = '\0';
+    }
+    portEXIT_CRITICAL(&s_prep_lock);
+    if (pct) {
+        int p = ready ? 100 : total ? (int)((uint64_t)done * 100 / total) : 0;
+        *pct = b ? (p > 100 ? 100 : p) : 0;
+    }
+    return b;
+}
+
+bool hp_prepare_cancel(void)
+{
+    portENTER_CRITICAL(&s_prep_lock);
+    bool b = s_prep.busy && !s_prep.taken;
+    if (b) s_prep.cancel = true;
+    portEXIT_CRITICAL(&s_prep_lock);
+    if (b) ESP_LOGI(TAG, "Preparation: cancel requested");
+    return b;
+}
+
+void hp_prepare_abort(const char *why)
+{
+    portENTER_CRITICAL(&s_prep_lock);
+    bool b = s_prep.busy && !s_prep.taken && !s_prep.cancel;
+    if (b) {
+        s_prep.cancel = true;
+        s_prep.abort_why = why;
+    }
+    portEXIT_CRITICAL(&s_prep_lock);
+    if (b) ESP_LOGW(TAG, "Preparation aborted: %s", why);
+}
+
+/** The preparation ended without a print: a firmware abort is shown as an error. */
+static void hp_prepare_end_cancelled(const char *name)
+{
+    portENTER_CRITICAL(&s_prep_lock);
+    const char *why = s_prep.abort_why;
+    portEXIT_CRITICAL(&s_prep_lock);
+    hp_prepare_release();
+    if (why) {
+        char msg[160];
+        snprintf(msg, sizeof(msg), "A impressão de %.60s não começou: %s.", name, why);
+        hp_set_error(msg);
+    }
+}
+
+esp_err_t hp_prepare_begin(const char *filename, const char **why)
+{
+    static const char *unused;
+    if (!why) why = &unused;
+    *why = "";
+    /* defence in depth — the HTTP layer already validates */
+    if (filename[0] == '\0' || filename[0] == '.' || strchr(filename, '/') || strchr(filename, '\\') ||
+        strlen(filename) >= sizeof(s_prep.name)) {
+        *why = "Nome de arquivo inválido";
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    portENTER_CRITICAL(&s_prep_lock);
+    bool was_busy = s_prep.busy;
+    if (!was_busy) {
+        s_prep.busy = true;
+        s_prep.ready = false;
+        s_prep.cancel = false;
+        s_prep.done = 0;
+        s_prep.total = 0;
+        strlcpy(s_prep.name, filename, sizeof(s_prep.name));
+    }
+    portEXIT_CRITICAL(&s_prep_lock);
+    if (was_busy) {
+        *why = "Outro arquivo já está sendo preparado para imprimir";
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    printer_opstate_t op = hp_opstate();
+    if (s_hp.printing || op == PRINTER_PRINTING || op == PRINTER_PAUSED) {
+        hp_prepare_release();
+        *why = "Há uma impressão em andamento";
+        return ESP_ERR_INVALID_STATE;
+    }
+    uint32_t usb_gen = usb_serial_connect_gen();   /* before the check: a reconnection after it
+                                                    * is then seen by hp_cmd_start() */
+    if (!marlin_is_connected()) {
+        /* the start would wait in the queue until the Ender comes back: never start by itself */
+        hp_prepare_release();
+        *why = "A Ender não está conectada";
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (ota_in_progress()) {
+        hp_prepare_release();
+        *why = "Uma atualização de firmware está sendo gravada";
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    char path[128];
+    snprintf(path, sizeof(path), "/sdcard/%s", filename);
+    void *vb = NULL;
+    FILE *f = hp_open_for_scan(path, &vb);
+    struct stat sb;
+    /* stat(), not fstat(): the FAT VFS fstat() always gives st_mtime 0, and hp_cmd_start()
+     * compares with a stat() */
+    if (!f || stat(path, &sb) != 0) {
+        if (f) fclose(f);
+        free(vb);
+        hp_prepare_release();
+        *why = "Arquivo não encontrado";
+        return ESP_ERR_NOT_FOUND;
+    }
+    s_prep.f = f;
+    s_prep.vbuf = vb;
+    s_prep.size = (long)sb.st_size;
+    s_prep.mtime = sb.st_mtime;
+    s_prep.usb_gen = usb_gen;
+    s_prep.t0 = esp_timer_get_time();
+    portENTER_CRITICAL(&s_prep_lock);
+    s_prep.total = (uint32_t)sb.st_size;
+    portEXIT_CRITICAL(&s_prep_lock);
+    ESP_LOGI(TAG, "Preparing %s (%ld bytes, %s stdio buffer)", filename, (long)sb.st_size,
+             vb ? "DMA" : "default");
+    return ESP_OK;
+}
+
+void hp_prepare_run(void)
+{
+    char name[64];
+    strlcpy(name, s_prep.name, sizeof(name));   /* only this task changes it until the START */
+    FILE *f = s_prep.f;
+    void *vb = s_prep.vbuf;
+    s_prep.f = NULL;
+    s_prep.vbuf = NULL;
+    if (!f) {
+        hp_prepare_release();
+        return;
+    }
+
+    gcode_scan_t scan;
+    gcode_scan_opts_t o = { .bytes_done = &s_prep.done, .cancel = &s_prep.cancel, .yield = true };
+    bool ok = gcode_scan_file_ex(f, &scan, &o);
+    bool rd_err = ferror(f) != 0;
+    fclose(f);
+    free(vb);
+    long ms = (long)((esp_timer_get_time() - s_prep.t0) / 1000);
+
+    if (!ok) {
+        ESP_LOGI(TAG, "Preparation of %s cancelled after %ld ms: the print did not start", name, ms);
+        hp_prepare_end_cancelled(name);
+        return;
+    }
+    if (rd_err) {
+        hp_prepare_release();
+        char msg[160];
+        snprintf(msg, sizeof(msg), "Não consegui ler %.60s do cartão SD. A impressão não começou.", name);
+        hp_set_error(msg);
+        return;
+    }
+    ESP_LOGI(TAG, "Prepared %s: %ld bytes, %ld lines in %ld ms", name, (long)s_prep.size,
+             (long)scan.total_lines, ms);
+
+    portENTER_CRITICAL(&s_prep_lock);
+    s_prep.scan = scan;
+    s_prep.ready = true;
+    bool cancelled = s_prep.cancel;
+    portEXIT_CRITICAL(&s_prep_lock);
+    if (cancelled) {
+        ESP_LOGI(TAG, "Preparation of %s cancelled at the end: the print did not start", name);
+        hp_prepare_end_cancelled(name);
+        return;
+    }
+
+    printer_cmd_t cmd = { .type = PCMD_HOST_START };
+    strlcpy(cmd.gcode, name, sizeof(cmd.gcode));
+    if (printer_comm_send_cmd(&cmd) != ESP_OK) {
+        /* not queued: hp_cmd_start() will never release it */
+        hp_prepare_release();
+        hp_set_error("A impressão não começou: a fila de comandos da ESP32 estava cheia. Tente de novo.");
+    }
+    /* from here on, s_prep belongs to hp_cmd_start() (printer task) */
+}
+
+/** Start host print from within the task context.
+ *  lote 11: pre = the scan made by hp_prepare_run(). Returns NULL when the job started, or why
+ *  it did not (for the screen). */
+static const char *hp_start_file(const char *filename, const gcode_scan_t *pre)
 {
     if (s_hp.printing) {
         ESP_LOGW(TAG, "Host print already active");
-        return;
+        return "já há uma impressão em andamento";
+    }
+    {
+        /* lote 11: the Ender may have started a print from its own card during the preparation */
+        printer_opstate_t op = hp_opstate();
+        if (op == PRINTER_PRINTING || op == PRINTER_PAUSED) {
+            ESP_LOGW(TAG, "Not starting %s: the printer reports a print in progress", filename);
+            return "a Ender está imprimindo";
+        }
     }
     /* lote 8: a job interrupted by an ESP32 restart is recorded (and its heaters turned off)
      * before a new one starts; the new file heats again on its own */
@@ -999,7 +1281,7 @@ void hp_cmd_start(const char *filename)
         if (!marlin_is_connected()) {
             ESP_LOGW(TAG, "Not starting %s: the job interrupted by the restart is still to be "
                      "handled (waiting for the Ender)", filename);
-            return;
+            return "a impressão interrompida pelo reinício da ESP32 ainda não foi tratada";
         }
         s_orphan_tries = 5;
         hp_handle_orphan();
@@ -1008,7 +1290,7 @@ void hp_cmd_start(const char *filename)
     /* Ender Smart (F15-14): defence in depth — the HTTP layer already validates */
     if (filename[0] == '\0' || filename[0] == '.' || strchr(filename, '/') || strchr(filename, '\\')) {
         ESP_LOGE(TAG, "Refusing unsafe file name: %s", filename);
-        return;
+        return "nome de arquivo inválido";
     }
 
     char path[128];
@@ -1017,11 +1299,10 @@ void hp_cmd_start(const char *filename)
     FILE *f = fopen(path, "r");
     if (!f) {
         ESP_LOGE(TAG, "Failed to open %s", path);
-        return;
+        return "não consegui abrir o arquivo no cartão";
     }
 
-    gcode_scan_t scan;
-    gcode_scan_file(f, &scan);
+    gcode_scan_t scan = *pre;
 
     ESP_LOGI(TAG, "Host print starting: %s (%ld lines)", filename, (long)scan.total_lines);
 
@@ -1105,6 +1386,66 @@ void hp_cmd_start(const char *filename)
     xSemaphoreGive(g_state_mutex);
     hp_journal_save();             /* lote 8: survives an ESP32 restart */
     ESP_LOGI(TAG, "Job journal written");
+    return NULL;
+}
+
+void hp_cmd_start(const char *filename)
+{
+    /* lote 11: the preparation of this file (if any) is handed over here */
+    gcode_scan_t pre;
+    bool mine = false, have = false, cancelled = false;
+    long size = -1;
+    time_t mtime = 0;
+    uint32_t usb_gen = 0;
+    portENTER_CRITICAL(&s_prep_lock);
+    if (s_prep.busy && s_prep.ready && strcmp(s_prep.name, filename) == 0) {
+        mine = true;
+        cancelled = s_prep.cancel;
+        if (!cancelled) {
+            s_prep.taken = true;          /* from here, "Desistir" answers 409: use Cancelar */
+            pre = s_prep.scan;
+            have = true;
+            size = s_prep.size;
+            mtime = s_prep.mtime;
+            usb_gen = s_prep.usb_gen;
+        }
+    }
+    portEXIT_CRITICAL(&s_prep_lock);
+
+    if (!mine) {
+        /* every start goes through hp_prepare_begin/run: anything else is stale */
+        ESP_LOGW(TAG, "Start of %s without a matching preparation: ignored", filename);
+        return;
+    }
+    if (cancelled) {
+        ESP_LOGI(TAG, "Start of %s cancelled during the preparation", filename);
+        hp_prepare_end_cancelled(filename);
+        return;
+    }
+
+    /* static: only the printer task runs this, and its 8 KB stack is the tight one */
+    static char msg[192];
+    static char path[128];
+    static struct stat sb;
+    const char *why = NULL;
+    snprintf(path, sizeof(path), "/sdcard/%s", filename);
+    if (!have || stat(path, &sb) != 0 || (long)sb.st_size != size || sb.st_mtime != mtime) {
+        /* reading it again here would block the printer task again (the old ~75 s) */
+        ESP_LOGW(TAG, "%s changed after the preparation: not starting", filename);
+        why = "o arquivo mudou depois da preparação; mande imprimir de novo";
+    } else if (usb_serial_connect_gen() != usb_gen || !marlin_is_connected()) {
+        /* the link dropped and came back during the preparation: the Ender may have reset, and
+         * the person who asked may be gone */
+        ESP_LOGW(TAG, "USB link dropped during the preparation of %s: not starting", filename);
+        why = "a conexão com a Ender caiu durante a preparação; mande imprimir de novo";
+    } else {
+        why = hp_start_file(filename, &pre);
+    }
+    hp_prepare_release();   /* after the start: job_active() never has a gap */
+    if (why) {
+        snprintf(msg, sizeof(msg), "A impressão de %.60s não começou: %s.", filename, why);
+        hp_set_error(msg);
+    }
 }
 
 /** Pause host print: park head, stop timer */
@@ -1521,6 +1862,13 @@ bool hp_is_active(void)
     return s_hp.printing;
 }
 
+void hp_ack_error(void)
+{
+    /* lote 11: the "OK" of the error banner. Never cancels: a job that has just started (and
+     * cleared the error) under a banner that was not refreshed yet keeps running. */
+    if (!s_hp.printing) hp_clear_error();
+}
+
 bool hp_has_pending(void)
 {
     return s_hp.has_pending;
@@ -1563,14 +1911,6 @@ void hp_fill_state(printer_state_t *out)
 }
 
 /* ---- Public API pass-throughs ---- */
-
-esp_err_t hp_start(const char *filename)
-{
-    printer_cmd_t cmd = { .type = PCMD_HOST_START };
-    strncpy(cmd.gcode, filename, sizeof(cmd.gcode) - 1);
-    cmd.gcode[sizeof(cmd.gcode) - 1] = '\0';
-    return printer_comm_send_cmd(&cmd);
-}
 
 esp_err_t hp_pause(void)
 {

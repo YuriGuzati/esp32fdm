@@ -106,9 +106,8 @@ void terminal_feed_tx(const char *cmd)
 
 static esp_err_t terminal_send_cmd(const char *cmd)
 {
-    printer_state_t st;
-    printer_comm_get_state(&st);
-    if (st.opstate == PRINTER_PRINTING || st.opstate == PRINTER_PAUSED)
+    /* lote 11: also while a file is being prepared for printing */
+    if (printer_comm_job_active())
         return ESP_ERR_INVALID_STATE;
 
     /* Echo to ring buffer */

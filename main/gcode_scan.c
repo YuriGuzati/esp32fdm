@@ -3,6 +3,7 @@
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -45,6 +46,11 @@ static void gc_box_add(gc_box_t *b, float x, float y)
 
 void gcode_scan_file(FILE *f, gcode_scan_t *out)
 {
+    gcode_scan_file_ex(f, out, NULL);
+}
+
+bool gcode_scan_file_ex(FILE *f, gcode_scan_t *out, const gcode_scan_opts_t *o)
+{
     memset(out, 0, sizeof(*out));
     out->total_layers = -1;
 
@@ -58,9 +64,23 @@ void gcode_scan_file(FILE *f, gcode_scan_t *out)
     float cur_x = 0, cur_y = 0;
     bool x_known = false, y_known = false, rel_xy = false, after_marker = false, area_bad = false;
 
+    /* lote 11: progress, cancel and yield, checked every 1024 lines */
+    uint32_t done = 0;
+    int64_t last_yield = esp_timer_get_time();
+    bool cancelled = false;
+
     rewind(f);
     while (fgets(buf, sizeof(buf), f)) {
         out->total_lines++;
+        done += strlen(buf);
+        if (o && (out->total_lines & 1023) == 0) {
+            if (o->bytes_done) *o->bytes_done = done;
+            if (o->cancel && *o->cancel) { cancelled = true; break; }
+            if (o->yield && esp_timer_get_time() - last_yield > 100000) {
+                vTaskDelay(1);
+                last_yield = esp_timer_get_time();
+            }
+        }
 
         /* Slicer metadata comments */
         if (buf[0] == ';') {
@@ -161,6 +181,11 @@ void gcode_scan_file(FILE *f, gcode_scan_t *out)
         }
     }
     rewind(f);
+    if (o && o->bytes_done) *o->bytes_done = done;
+    if (cancelled) {
+        ESP_LOGI(TAG, "GCode scan cancelled after %ld lines", (long)out->total_lines);
+        return false;
+    }
 
     /* Derive values if not found in comments */
     out->has_layer_markers = (max_layer >= 0 || layer_change_count > 0);
@@ -201,6 +226,7 @@ void gcode_scan_file(FILE *f, gcode_scan_t *out)
     } else {
         ESP_LOGI(TAG, "Part area unknown (%s)", area_bad ? "extrusion from an unknown position" : "no extrusion moves");
     }
+    return true;
 }
 
 /* ---- GCode scan cache (/cache/gcode/) ---- */
