@@ -63,6 +63,8 @@ static SemaphoreHandle_t s_save_lock;       /* the task and bootdiag_save_now() 
 static bool s_saved_in_job;                 /* the last NVS save was during a job */
 static int64_t s_job_save_us;               /* ... and when */
 #define BD_JOB_EVERY_US (15 * 60 * 1000000LL)
+#define BD_TASK_STACK 8192
+static volatile uint32_t s_task_stack_free = 0;   /* lowest free stack of the task, bytes */
 
 static uint32_t fnv1a(const void *p, size_t n, uint32_t h)
 {
@@ -173,6 +175,7 @@ static void bootdiag_task(void *arg)
             s_saved_in_job = false;
         }
         xSemaphoreGive(s_save_lock);
+        s_task_stack_free = (uint32_t)uxTaskGetStackHighWaterMark(NULL);   /* lote 14b */
         if (job_now) continue;
         /* moved on even when the save failed: no retry every 5 s (review) */
         last_save_s = up;
@@ -244,7 +247,11 @@ void bootdiag_start(void)
         return;
     }
     s_started = true;
-    xTaskCreatePinnedToCore(bootdiag_task, "bootdiag", 3072, NULL, 1, NULL, 0);
+    /* lote 14b: 8 KB. With 3072 B the board panicked twice right after the lote 14 OTA
+     * (2026-11-14 22:25), each time about when this task made its first NVS save: it copies the
+     * printer state (~600 B) and an NVS write that has to move a page goes deep. Not confirmed
+     * (the panic text goes to the UART only); the free stack is now in /api/stats. */
+    xTaskCreatePinnedToCore(bootdiag_task, "bootdiag", BD_TASK_STACK, NULL, 1, NULL, 0);
 }
 
 uint32_t bootdiag_boot_count(void)
@@ -273,14 +280,16 @@ int bootdiag_json(char *buf, size_t buf_size)
 {
     int n;
     if (!s_have_prev)
-        n = snprintf(buf, buf_size, ",\"boot_count\":%lu,\"prev\":null", (unsigned long)s_boot);
+        n = snprintf(buf, buf_size, ",\"boot_count\":%lu,\"bootdiag_stack_free\":%lu,\"prev\":null",
+                     (unsigned long)s_boot, (unsigned long)s_task_stack_free);
     else
         n = snprintf(buf, buf_size,
-                     ",\"boot_count\":%lu,\"prev\":{\"boot\":%lu,\"uptime_s\":%lu,\"src\":\"%s\","
+                     ",\"boot_count\":%lu,\"bootdiag_stack_free\":%lu,"
+                     "\"prev\":{\"boot\":%lu,\"uptime_s\":%lu,\"src\":\"%s\","
                      "\"provisional\":%s,\"epoch\":%lu,\"wifi_first_s\":%lu,\"wifi_now\":%s,"
                      "\"disc_reason\":%u,\"emergency_ap\":%s,\"job\":%s,\"started\":\"%s\"}",
-                     (unsigned long)s_boot, (unsigned long)s_prev.boot,
-                     (unsigned long)s_prev.uptime_s, s_prev_src,
+                     (unsigned long)s_boot, (unsigned long)s_task_stack_free,
+                     (unsigned long)s_prev.boot, (unsigned long)s_prev.uptime_s, s_prev_src,
                      (s_prev.flags & BD_FLAG_PROVISIONAL) ? "true" : "false",
                      (unsigned long)s_prev.epoch, (unsigned long)s_prev.wifi_first_s,
                      s_prev.wifi_now ? "true" : "false", (unsigned)s_prev.disc_reason,
