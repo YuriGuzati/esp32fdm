@@ -54,6 +54,8 @@ static int64_t s_attempt_started_us;
 static volatile uint32_t s_backoff_ms = BACKOFF_MIN_MS;
 static volatile uint32_t s_reconnects;      /* successful re-connections after a drop */
 static volatile bool s_had_connection;      /* connected at least once since boot */
+static volatile uint16_t s_last_disc_reason; /* lote 14: last STA disconnect reason (0: none) */
+static volatile int64_t s_first_conn_us;     /* lote 14: uptime of the first connection (0: never) */
 
 /* Emergency AP (APSTA) while the saved network is unreachable */
 static volatile bool s_ap_active;
@@ -208,6 +210,7 @@ static void event_handler(void *arg, esp_event_base_t event_base,
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         wifi_event_sta_disconnected_t *d = (wifi_event_sta_disconnected_t *)event_data;
         xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+        if (d) s_last_disc_reason = d->reason;   /* lote 14: kept in the boot record */
 
         if (!s_supervise) {
             /* Boot phase: original behaviour, decides STA vs. fallback */
@@ -249,6 +252,8 @@ static void event_handler(void *arg, esp_event_base_t event_base,
         s_backoff_ms = BACKOFF_MIN_MS;
         if (s_had_connection)
             s_reconnects++;
+        else
+            s_first_conn_us = esp_timer_get_time();   /* lote 14 */
         s_had_connection = true;
 
         /* Start SNTP time sync (non-blocking, runs in background) */
@@ -616,6 +621,16 @@ bool wifi_emergency_ap_active(void)
 uint32_t wifi_get_reconnect_count(void)
 {
     return s_reconnects;
+}
+
+uint16_t wifi_last_disconnect_reason(void)
+{
+    return s_last_disc_reason;
+}
+
+int64_t wifi_first_connect_us(void)
+{
+    return s_first_conn_us;
 }
 
 const char *wifi_get_ip_str(void)

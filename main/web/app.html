@@ -1527,13 +1527,36 @@ function Sistema() {
       h('div', { class: 'row wrap', style: 'gap:6px' }, caps.map(k => h('span', { class: 'chip', style: d.caps[k] ? 'color:var(--green);border-color:var(--green)' : '' }, (d.caps[k] ? '✓ ' : '✗ ') + k))));
   }
   loadInfo();
+  /* lote 14: códigos de queda do Wi-Fi do ESP-IDF (wifi_err_reason_t) mais comuns */
+  const WR = { 2: 'autenticação expirou', 4: 'inatividade', 8: 'saiu da rede', 15: 'senha errada ou sinal fraco', 200: 'sinal perdido', 201: 'rede não encontrada', 202: 'autenticação falhou', 203: 'associação falhou', 204: 'handshake expirou', 205: 'conexão falhou' };
+  const wifiReason = c => c + (WR[c] ? ' (' + WR[c] + ')' : '');
   const RR = { poweron: 'ligada da tomada', external: 'botão de reset', software: 'reinício pelo software (atualização ou configuração)', panic: 'travamento (panic)', int_wdt: 'watchdog de interrupção', task_wdt: 'watchdog de tarefa', wdt: 'watchdog', brownout: 'queda de tensão', deepsleep: 'saída de sono', sdio: 'SDIO', other: 'outro' };
   function update() {
     const s = S.stats; box.textContent = '';
     if (!s) { box.append(h('dt', null, 'Carregando…'), h('dd')); return; }
     const kv = (k, v) => box.append(h('dt', null, k), h('dd', null, v));
     kv('Ligada há', fmtDur(s.uptime_s)); kv('Último reinício', RR[s.reset_reason] || s.reset_reason);
+    /* lote 14: o boot anterior, para entender uma queda depois que a placa volta */
+    if (s.boot_count != null) kv('Boot nº', String(s.boot_count));
+    if (s.prev === null) kv('Antes deste boot', 'sem registro');
+    else if (s.prev) {
+      const p = s.prev;
+      let t;
+      if (p.provisional) t = 'só ligou: nenhum registro depois do boot (caiu ou foi desligada logo, não passou da inicialização, ou ficou no modo de configuração)';
+      else {
+        /* rtc: no máximo 5 s velho; nvs: gravado a cada 1–10 min, a placa pode ter ficado ligada mais */
+        t = (p.src === 'rtc' ? 'ligada por ' + fmtDur(p.uptime_s) + ' (até 5 s a mais)' : 'ligada por pelo menos ' + fmtDur(p.uptime_s));
+        t += ' · Wi-Fi ' + (p.wifi_first_s ? (p.wifi_now ? 'conectado' : 'desconectado') : 'nunca conectou');
+        if (p.disc_reason) t += ' · último código de desconexão: ' + wifiReason(p.disc_reason);
+        if (p.emergency_ap) t += ' · rede de emergência aberta';
+        if (p.job) t += ' · com impressão ativa';
+        if (p.epoch) t += ' · último registro em ' + new Date(p.epoch * 1000).toLocaleString('pt-BR');
+      }
+      if (s.boot_count != null && p.boot !== s.boot_count - 1) t += ' (registro do boot ' + p.boot + ')';
+      kv('Antes deste boot', t);
+    }
     kv('Wi-Fi', s.wifi === 'connected' ? 'conectado · ' + s.rssi + ' dBm' : 'desconectado'); kv('Reconexões do Wi-Fi', s.wifi_reconnects);
+    if (s.wifi_disc_reason) kv('Último código de desconexão do Wi-Fi', wifiReason(s.wifi_disc_reason));
     kv('Rede de emergência', s.emergency_ap ? 'aberta' : 'fechada'); kv('Câmera', s.camera ? 'OK' : 'indisponível');
     kv('Memória livre', fmtSize(s.heap)); kv('Memória mínima', fmtSize(s.heap_min)); kv('CPU', s.cpu0 + '% / ' + s.cpu1 + '%');
     kv('Conexões HTTP', s.http_clients); kv('Vídeos abertos', s.stream_clients + ' de 3');

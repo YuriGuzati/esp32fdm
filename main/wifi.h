@@ -35,6 +35,12 @@ bool wifi_emergency_ap_active(void);
 /** Number of successful reconnections since boot (after the first connection). */
 uint32_t wifi_get_reconnect_count(void);
 
+/** Ender Smart (lote 14): reason code of the last STA disconnect (wifi_err_reason_t; 0: none). */
+uint16_t wifi_last_disconnect_reason(void);
+
+/** Ender Smart (lote 14): uptime (us) of the first connection since boot; 0 if never. */
+int64_t wifi_first_connect_us(void);
+
 /**
  * Get the current IP address as a string.
  * Returns pointer to a static buffer — valid until next call.

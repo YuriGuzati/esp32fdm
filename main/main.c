@@ -11,6 +11,7 @@
 #include "logbuf.h"
 #include "mdns_service.h"
 #include "ota.h"
+#include "bootdiag.h"
 #include "esp_littlefs.h"
 
 #include "esp_log.h"
@@ -65,6 +66,7 @@ void app_main(void)
     /* Log buffer — capture boot logs from here on */
     logbuf_init();
     ESP_LOGI(TAG, "Reset reason: %d", (int)esp_reset_reason());
+    bootdiag_init();               /* lote 14: what happened in the previous run */
 
     /* WiFi — with saved credentials it never gives up (F15-02/03) */
     wifi_result_t wifi_result = wifi_init();
@@ -131,6 +133,7 @@ void app_main(void)
     /* Printer comm — always init with USB serial */
     ESP_ERROR_CHECK(usb_serial_init(printer_comm_rx_cb, NULL));
     ESP_ERROR_CHECK(printer_comm_init());
+    bootdiag_start();              /* lote 14: keeps this run's record up to date */
 
     /* Obico client */
     ESP_ERROR_CHECK(obico_client_init());

@@ -20,6 +20,7 @@ set(SRCS
     "mdns_service.c"
     "ota.c"
     "job_history.c"
+    "bootdiag.c"
 )
 
 idf_component_register(

@@ -16,6 +16,7 @@
 
 #include "job_history.h"
 #include "ota.h"
+#include "bootdiag.h"
 #include <time.h>
 
 static const char *TAG = "host_print";
@@ -290,6 +291,7 @@ static void hp_journal_save(void)
         ESP_LOGW(TAG, "Job journal not saved (%s): an ESP32 restart would not be detected",
                  esp_err_to_name(err));
     s_journal_saved_us = esp_timer_get_time();
+    bootdiag_save_now();           /* lote 14: the boot record too, at the same flash write moments */
 }
 
 static void hp_journal_clear(void)
@@ -845,6 +847,23 @@ static bool host_print_unpark(char *failed, size_t failed_len)
     return true;
 }
 
+/** Ender Smart (lote 14): the job's fields in /api/status after a job that did not end normally.
+ *  host_print_interrupt() and the emergency stop used to leave the file name, the elapsed time and
+ *  the layer of the stopped job (found in the lote 12 tests). The opstate is left to the caller:
+ *  hp_set_error() puts the error on screen. */
+static void hp_clear_job_state(void)
+{
+    xSemaphoreTake(g_state_mutex, portMAX_DELAY);
+    g_state.progress_pct = -1;
+    g_state.print_time_s = -1;
+    g_state.print_time_left_s = -1;
+    g_state.host_printing = false;
+    g_state.current_layer = 0;
+    g_state.filename[0] = '\0';
+    g_state.total_layers = -1;     /* lote 8: the screen kept the last job's total */
+    xSemaphoreGive(g_state_mutex);
+}
+
 /** Ender Smart (F15-06/08): stop a job whose printer state is unknown or unsafe.
  *  Unlike a cancel it never moves the head — after a printer reset the position is
  *  unknown — it only turns the heaters off (a safe action) and reports why. */
@@ -870,12 +889,7 @@ static void host_print_interrupt(const char *why)
     s_hp.paused = false;
     s_hp.resend_line = -1;
 
-    xSemaphoreTake(g_state_mutex, portMAX_DELAY);
-    g_state.progress_pct = -1;
-    g_state.print_time_left_s = -1;
-    g_state.host_printing = false;
-    g_state.total_layers = -1;     /* lote 8: the screen kept the last job's total */
-    xSemaphoreGive(g_state_mutex);
+    hp_clear_job_state();          /* lote 14: like host_print_finish() */
     hp_set_notice("");
     hp_journal_clear();            /* lote 8 */
 
@@ -1652,6 +1666,12 @@ void hp_cmd_safety_cancel(const char *why)
         if (u < 0x20 || u > 0x7E || u == '"' || u == '\\') *c = '?';
     }
 
+    /* lote 14: the nozzle temperature when the Ender refused (read before the cancel cools it) */
+    xSemaphoreTake(g_state_mutex, portMAX_DELAY);
+    float he = g_state.hotend_actual;
+    xSemaphoreGive(g_state_mutex);
+    bool cold = strstr(reason, "cold extrusion") != NULL;
+
     if (!s_hp.printing) {
         ESP_LOGW(TAG, "Safety cancel: the job had already stopped; the error stays on screen");
         hp_get_error(cur, sizeof(cur));
@@ -1667,9 +1687,30 @@ void hp_cmd_safety_cancel(const char *why)
     hp_get_error(cur, sizeof(cur));
     if (cur[0] == '\0') {
         /* the cancel confirmed the heaters off (else it left its own error) */
-        strlcpy(msg, "Impressão cancelada: a Ender acusou um erro (", sizeof(msg));
-        strlcat(msg, reason, sizeof(msg));
-        strlcat(msg, "). Aquecedores desligados.", sizeof(msg));
+        if (cold && he > 0.0f) {
+            /* lote 14: say why, in the user's terms. On 2026-11-14 a temperature tower stepped
+             * down to 180 C, the nozzle undershot to 178.98 C, and the Ender (M302: minimum 180 C)
+             * refused to extrude. */
+            int d = (int)(he * 10.0f + 0.5f);          /* tenths, with a decimal comma */
+            if (d < 0) d = 0;
+            if (d > 9999) d = 9999;
+            char t[8];
+            snprintf(t, sizeof(t), "%d,%d", d / 10, d % 10);
+            /* "cerca de": the reading can be up to 2 s old (review). The guess about the file only
+             * near the limit: a cold nozzle (heater off, never heated) has another cause */
+            if (d >= 1650 && d <= 1950)
+                /* <= 190 bytes in UTF-8: fits error_msg[192] */
+                snprintf(msg, sizeof(msg), "Impressão cancelada: a Ender recusou extrudar com o bico a cerca "
+                         "de %s °C, abaixo da mínima (M302); o arquivo deve ter baixado a temperatura "
+                         "perto do limite. Aquecedores desligados.", t);
+            else
+                snprintf(msg, sizeof(msg), "Impressão cancelada: a Ender recusou extrudar com o bico a cerca "
+                         "de %s °C, abaixo da mínima dela (M302). Aquecedores desligados.", t);
+        } else {
+            strlcpy(msg, "Impressão cancelada: a Ender acusou um erro (", sizeof(msg));
+            strlcat(msg, reason, sizeof(msg));
+            strlcat(msg, "). Aquecedores desligados.", sizeof(msg));
+        }
         hp_set_error(msg);
     }
 }
@@ -2006,12 +2047,7 @@ void hp_cmd_estop(int mode)
         s_hp.has_pending = false;
         s_hp.resend_line = -1;
         s_hp.user_wait = false;
-        xSemaphoreTake(g_state_mutex, portMAX_DELAY);
-        g_state.progress_pct = -1;
-        g_state.print_time_left_s = -1;
-        g_state.host_printing = false;
-        g_state.total_layers = -1;
-        xSemaphoreGive(g_state_mutex);
+        hp_clear_job_state();      /* lote 14 */
         hp_set_notice("");
         hp_journal_clear();
     }

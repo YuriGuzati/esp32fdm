@@ -27,6 +27,7 @@
 #include "url_util.h"
 #include "logbuf.h"
 #include "ota.h"
+#include "bootdiag.h"
 #include "version.h"
 #include "esp_app_desc.h"
 #include "esp_ota_ops.h"
@@ -363,12 +364,13 @@ static esp_err_t api_stats_handler(httpd_req_t *req)
     int client_fds[16];
     if (!s_main_server || httpd_get_client_list(s_main_server, &n_clients, client_fds) != ESP_OK)
         n_clients = 0;
-    char json[448];
-    snprintf(json, sizeof(json),
+    char json[800];
+    int jn = snprintf(json, sizeof(json),
         "{\"cpu0\":%d,\"cpu1\":%d,\"heap\":%lu,\"heap_min\":%lu,"
         "\"uptime_s\":%lld,\"reset_reason\":\"%s\",\"rssi\":%d,"
         "\"wifi\":\"%s\",\"emergency_ap\":%s,\"wifi_reconnects\":%lu,\"camera\":%s,"
-        "\"http_clients\":%u,\"stream_clients\":%d,\"rx_dropped\":%lu,\"temp_mode\":\"%s\"}",
+        "\"http_clients\":%u,\"stream_clients\":%d,\"rx_dropped\":%lu,\"temp_mode\":\"%s\","
+        "\"wifi_disc_reason\":%u",
         cpu0_pct, cpu1_pct, (unsigned long)free_heap, (unsigned long)min_heap,
         (long long)(esp_timer_get_time() / 1000000), reset_reason_str(esp_reset_reason()),
         sta ? rssi : 0, sta ? "connected" : "disconnected",
@@ -376,7 +378,14 @@ static esp_err_t api_stats_handler(httpd_req_t *req)
         (unsigned long)wifi_get_reconnect_count(),
         camera_is_available() ? "true" : "false",
         (unsigned)n_clients, __atomic_load_n(&s_stream_clients, __ATOMIC_ACQUIRE),
-        (unsigned long)printer_comm_rx_dropped(), printer_comm_autotemp_active() ? "auto" : "poll");
+        (unsigned long)printer_comm_rx_dropped(), printer_comm_autotemp_active() ? "auto" : "poll",
+        (unsigned)wifi_last_disconnect_reason());
+    /* lote 14: the boot number and what happened in the run before this boot */
+    if (jn > 0 && (size_t)jn < sizeof(json) - 2) {
+        jn += bootdiag_json(json + jn, sizeof(json) - (size_t)jn - 1);
+        json[jn++] = '}';
+        json[jn] = '\0';
+    }
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
