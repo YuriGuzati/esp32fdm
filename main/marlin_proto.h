@@ -1,10 +1,12 @@
 #pragma once
 
 /*
- * Internal interface between printer_comm.c (Marlin protocol layer)
- * and host_print.c (host print state machine).
+ * Internal interface between the Marlin protocol layer and host_print.c (host print state
+ * machine). Ender Smart (F2-01, lote 15): the protocol layer is now printer_comm.c,
+ * marlin_link.c and command_arbiter.c; the state those three share among themselves is in
+ * printer_comm_priv.h.
  *
- * Not part of the public API — only included by these two files.
+ * Not part of the public API — only included by those four files.
  */
 
 #include "printer_comm.h"
@@ -55,7 +57,7 @@ typedef enum {
  * Longer lines are refused instead of being truncated or overflowing a buffer. */
 #define MARLIN_MAX_LINE 95
 
-/* ---- Shared state (owned by printer_comm.c) ---- */
+/* ---- Shared state (g_state/g_state_mutex in printer_comm.c, the rest in marlin_link.c) ---- */
 
 /** Printer state and its mutex */
 extern SemaphoreHandle_t g_state_mutex;
@@ -81,7 +83,7 @@ extern volatile bool s_send_patient;
 extern uint16_t s_unsupported_cmds[UNSUPPORTED_CMD_MAX];
 extern int s_unsupported_count;
 
-/* ---- Functions exported by printer_comm.c for host_print.c ---- */
+/* ---- Functions exported by marlin_link.c (printer_comm_cmd_waiting: command_arbiter.c) ---- */
 
 /** Send a GCode command and block until "ok" or timeout.
  *  Returns true if "ok" was received.  Standard timeout, no stall pings. */
@@ -126,7 +128,7 @@ bool hp_has_pending(void);
 /** Returns true if host print is paused */
 bool hp_is_paused(void);
 
-/** Command handlers (called from printer_comm_task queue dispatch) */
+/** Command handlers (called from the queue dispatch, command_arbiter.c) */
 void hp_cmd_start(const char *filename);
 void hp_cmd_pause(void);
 void hp_cmd_resume(void);
