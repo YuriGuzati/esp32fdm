@@ -1001,6 +1001,26 @@ esp_err_t sdcard_httpd_register(httpd_handle_t server)
         HTTPD_REGISTER(server, &uris[i]);
     }
 
+    /* lote 16 (F3-03): the same handlers under /api/v1; the addresses above stay */
+    const httpd_uri_t v1[] = {
+        { .uri = "/api/v1/files",          .method = HTTP_GET,  .handler = sd_files_handler },
+        { .uri = "/api/v1/files/info",     .method = HTTP_GET,  .handler = sd_info_handler },
+        { .uri = "/api/v1/files/sha256",   .method = HTTP_GET,  .handler = sd_sha256_handler },
+        { .uri = "/api/v1/files/download", .method = HTTP_GET,  .handler = sd_download_handler },
+        { .uri = "/api/v1/files/upload",   .method = HTTP_POST, .handler = sd_upload_handler },
+        { .uri = "/api/v1/files/delete",   .method = HTTP_POST, .handler = sd_delete_handler },
+        { .uri = "/api/v1/job",            .method = HTTP_GET,  .handler = sd_status_handler },
+        { .uri = "/api/v1/job/start",      .method = HTTP_POST, .handler = sd_print_handler },
+        { .uri = "/api/v1/job/pause",      .method = HTTP_POST, .handler = sd_pause_handler },
+        { .uri = "/api/v1/job/resume",     .method = HTTP_POST, .handler = sd_resume_handler },
+        { .uri = "/api/v1/job/cancel",     .method = HTTP_POST, .handler = sd_cancel_handler },
+        { .uri = "/api/v1/job/prepare_cancel", .method = HTTP_POST, .handler = sd_prepare_cancel_handler },
+        { .uri = "/api/v1/job/ack_error",  .method = HTTP_POST, .handler = sd_ack_error_handler },
+    };
+    for (int i = 0; i < sizeof(v1) / sizeof(v1[0]); i++) {
+        HTTPD_REGISTER(server, &v1[i]);
+    }
+
     ESP_LOGI(TAG, "SD card HTTP endpoints registered");
     return ESP_OK;
 }

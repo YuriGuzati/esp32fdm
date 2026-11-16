@@ -155,5 +155,8 @@ esp_err_t job_history_register_httpd(httpd_handle_t server)
     HTTPD_REGISTER(server, &get);
     httpd_uri_t clr = { .uri = "/api/history/clear", .method = HTTP_POST, .handler = history_clear_handler };
     HTTPD_REGISTER(server, &clr);
+    /* lote 16 (F3-03): the same handlers under /api/v1 */
+    HTTPD_REGISTER_V1(server, &get, "/api/v1/history/jobs");
+    HTTPD_REGISTER_V1(server, &clr, "/api/v1/history/clear");
     return ESP_OK;
 }

@@ -2,6 +2,7 @@
 
 #include <string.h>
 #include <stdlib.h>
+#include <math.h>
 
 #include "camera.h"
 #include "wifi.h"
@@ -31,6 +32,7 @@
 #include "version.h"
 #include "esp_app_desc.h"
 #include "esp_ota_ops.h"
+#include "events_ws.h"
 
 static const char *TAG = "httpd";
 
@@ -228,7 +230,16 @@ static esp_err_t stream_handler(httpd_req_t *req)
 
 /* ---- GET /api/status — JSON for status bar + dashboard ---- */
 
-static esp_err_t api_status_handler(httpd_req_t *req)
+static void json_str(char *out, size_t out_size, const char *in);
+
+/* lote 16: NaN/inf would print "nan"/"inf", which is not JSON */
+static float fin(float v) { return isfinite(v) ? v : 0.0f; }
+
+/* lote 16: built here for GET /api/status and for the WebSocket /api/v1/events (both run in the
+ * HTTP server task). The text fields are now escaped (an Ender error line with a quote used to
+ * break the JSON) and carry only valid UTF-8 (a WebSocket text frame with a cut "ã" makes the
+ * browser drop the connection). */
+int httpd_status_json(char *json, size_t json_size)
 {
     printer_state_t st;
     printer_comm_get_state(&st);
@@ -257,29 +268,47 @@ static esp_err_t api_status_handler(httpd_req_t *req)
     int prep_pct = 0;
     printer_comm_preparing(prep, sizeof(prep), &prep_pct);
 
-    char json[1024];
-    snprintf(json, sizeof(json),
+    char fn_e[136], err_e[392], note_e[392], prep_e[136];
+    json_str(fn_e, sizeof(fn_e), st.filename);
+    json_str(err_e, sizeof(err_e), st.opstate == PRINTER_ERROR ? st.error_msg : "");
+    json_str(note_e, sizeof(note_e), st.notice);
+    json_str(prep_e, sizeof(prep_e), prep);
+
+    int n = snprintf(json, json_size,
         "{\"state\":\"%s\",\"backend\":\"%s\",\"hotend\":[%.1f,%.1f],\"bed\":[%.1f,%.1f],"
         "\"progress\":%.1f,\"filename\":\"%s\",\"elapsed\":%ld,\"remaining\":%ld,"
         "\"layer\":\"%ld/%ld\",\"z\":%.1f,\"baby_z\":%.2f,\"usb\":%s,\"error\":\"%s\","
         "\"notice\":\"%s\",\"preparing\":\"%s\",\"prep_pct\":%d,\"halted\":%s}",
         state_str, printer_comm_backend_name(),
-        st.hotend_actual, st.hotend_target,
-        st.bed_actual, st.bed_target,
-        st.progress_pct >= 0 ? st.progress_pct : 0.0f,
-        st.filename,
+        fin(st.hotend_actual), fin(st.hotend_target),
+        fin(st.bed_actual), fin(st.bed_target),
+        st.progress_pct >= 0 ? fin(st.progress_pct) : 0.0f,
+        fn_e,
         (long)(st.print_time_s >= 0 ? st.print_time_s : 0),
         (long)(st.print_time_left_s >= 0 ? st.print_time_left_s : 0),
         (long)(layer >= 0 ? layer : 0),
         (long)(total_layers >= 0 ? total_layers : 0),
-        st.z, s_baby_z,
+        fin(st.z), fin(s_baby_z),
         usb ? "true" : "false",
-        st.opstate == PRINTER_ERROR ? st.error_msg : "",
-        st.notice, prep, prep_pct, printer_comm_halted() ? "true" : "false");
+        err_e,
+        note_e, prep_e, prep_pct, printer_comm_halted() ? "true" : "false");
+    return (n < 0 || (size_t)n >= json_size) ? -1 : n;
+}
 
+static esp_err_t api_status_handler(httpd_req_t *req)
+{
+    char *json = malloc(1600);
+    if (!json) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+        return ESP_FAIL;
+    }
+    int n = httpd_status_json(json, 1600);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-    return httpd_resp_send(req, json, strlen(json));
+    esp_err_t ret = n > 0 ? httpd_resp_send(req, json, n)
+                          : httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "status too long");
+    free(json);
+    return ret;
 }
 
 /* ---- GET /api/stats — per-core CPU usage ---- */
@@ -301,20 +330,22 @@ static const char *reset_reason_str(esp_reset_reason_t r)
     }
 }
 
-/* Accumulated idle ticks from previous call, per core */
-static uint32_t s_prev_idle[2];
-static uint32_t s_prev_total;
-static bool     s_stats_initialized;
+/* Accumulated idle ticks from previous call, per core.
+ * lote 16: one window per caller kind (HTTPD_CPU_REST, HTTPD_CPU_WS), so GET /api/stats keeps
+ * measuring since the previous GET, as before, while the WebSocket pushes every 5 s. */
+static uint32_t s_prev_idle[2][2];
+static uint32_t s_prev_total[2];
+static bool     s_stats_initialized[2];
 
-static esp_err_t api_stats_handler(httpd_req_t *req)
+/* lote 16: built here for GET /api/stats and for the WebSocket /api/v1/events (both run in the
+ * HTTP server task). */
+int httpd_stats_json(char *json, size_t json_size, int window)
 {
+    if (window < 0 || window > 1) window = HTTPD_CPU_REST;
 #if defined(CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS)
     UBaseType_t num_tasks = uxTaskGetNumberOfTasks();
     TaskStatus_t *task_array = malloc(num_tasks * sizeof(TaskStatus_t));
-    if (!task_array) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
-        return ESP_FAIL;
-    }
+    if (!task_array) return -1;
 
     uint32_t total_runtime;
     UBaseType_t count = uxTaskGetSystemState(task_array, num_tasks, &total_runtime);
@@ -330,12 +361,12 @@ static esp_err_t api_stats_handler(httpd_req_t *req)
     }
 
     int cpu0_pct = 0, cpu1_pct = 0;
-    if (s_stats_initialized && total_runtime > s_prev_total) {
-        uint32_t dt = total_runtime - s_prev_total;
+    if (s_stats_initialized[window] && total_runtime > s_prev_total[window]) {
+        uint32_t dt = total_runtime - s_prev_total[window];
         /* total_runtime is wall-clock timer ticks (same for both cores) */
         if (dt > 0) {
-            uint32_t idle0_delta = idle_now[0] - s_prev_idle[0];
-            uint32_t idle1_delta = idle_now[1] - s_prev_idle[1];
+            uint32_t idle0_delta = idle_now[0] - s_prev_idle[window][0];
+            uint32_t idle1_delta = idle_now[1] - s_prev_idle[window][1];
             /* lote 12: 64-bit, idle*100 overflowed 32 bits after ~43 s between two calls
              * (the first call after a long gap showed ~99 %) */
             cpu0_pct = 100 - (int)((uint64_t)idle0_delta * 100 / dt);
@@ -346,10 +377,10 @@ static esp_err_t api_stats_handler(httpd_req_t *req)
             if (cpu1_pct > 100) cpu1_pct = 100;
         }
     }
-    s_prev_idle[0] = idle_now[0];
-    s_prev_idle[1] = idle_now[1];
-    s_prev_total = total_runtime;
-    s_stats_initialized = true;
+    s_prev_idle[window][0] = idle_now[0];
+    s_prev_idle[window][1] = idle_now[1];
+    s_prev_total[window] = total_runtime;
+    s_stats_initialized[window] = true;
 
     free(task_array);
 
@@ -364,12 +395,11 @@ static esp_err_t api_stats_handler(httpd_req_t *req)
     int client_fds[16];
     if (!s_main_server || httpd_get_client_list(s_main_server, &n_clients, client_fds) != ESP_OK)
         n_clients = 0;
-    char json[800];
-    int jn = snprintf(json, sizeof(json),
+    int jn = snprintf(json, json_size,
         "{\"cpu0\":%d,\"cpu1\":%d,\"heap\":%lu,\"heap_min\":%lu,"
         "\"uptime_s\":%lld,\"reset_reason\":\"%s\",\"rssi\":%d,"
         "\"wifi\":\"%s\",\"emergency_ap\":%s,\"wifi_reconnects\":%lu,\"camera\":%s,"
-        "\"http_clients\":%u,\"stream_clients\":%d,\"rx_dropped\":%lu,\"temp_mode\":\"%s\","
+        "\"http_clients\":%u,\"stream_clients\":%d,\"ws_clients\":%d,\"rx_dropped\":%lu,\"temp_mode\":\"%s\","
         "\"wifi_disc_reason\":%u",
         cpu0_pct, cpu1_pct, (unsigned long)free_heap, (unsigned long)min_heap,
         (long long)(esp_timer_get_time() / 1000000), reset_reason_str(esp_reset_reason()),
@@ -378,22 +408,31 @@ static esp_err_t api_stats_handler(httpd_req_t *req)
         (unsigned long)wifi_get_reconnect_count(),
         camera_is_available() ? "true" : "false",
         (unsigned)n_clients, __atomic_load_n(&s_stream_clients, __ATOMIC_ACQUIRE),
+        events_ws_client_count(),
         (unsigned long)printer_comm_rx_dropped(), printer_comm_autotemp_active() ? "auto" : "poll",
         (unsigned)wifi_last_disconnect_reason());
+    if (jn < 0 || (size_t)jn >= json_size - 2) return -1;
     /* lote 14: the boot number and what happened in the run before this boot */
-    if (jn > 0 && (size_t)jn < sizeof(json) - 2) {
-        jn += bootdiag_json(json + jn, sizeof(json) - (size_t)jn - 1);
-        json[jn++] = '}';
-        json[jn] = '\0';
-    }
+    jn += bootdiag_json(json + jn, json_size - (size_t)jn - 1);
+    if ((size_t)jn >= json_size - 1) return -1;
+    json[jn++] = '}';
+    json[jn] = '\0';
+    return jn;
+#else
+    (void)window;
+    int jn = snprintf(json, json_size, "{\"error\":\"stats not enabled\"}");
+    return (jn < 0 || (size_t)jn >= json_size) ? -1 : jn;
+#endif
+}
 
+static esp_err_t api_stats_handler(httpd_req_t *req)
+{
+    char json[900];
+    int n = httpd_stats_json(json, sizeof(json), HTTPD_CPU_REST);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-    return httpd_resp_send(req, json, strlen(json));
-#else
-    httpd_resp_set_type(req, "application/json");
-    return httpd_resp_send(req, "{\"error\":\"stats not enabled\"}", HTTPD_RESP_USE_STRLEN);
-#endif
+    if (n <= 0) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "stats unavailable");
+    return httpd_resp_send(req, json, n);
 }
 
 /* ---- Ender Smart (Fase 4): new interface at /app and its settings JSON ---- */
@@ -446,13 +485,36 @@ static esp_err_t manifest_handler(httpd_req_t *req)
         "{\"src\":\"/apple-touch-icon.png\",\"sizes\":\"180x180\",\"type\":\"image/png\"}]}");
 }
 
+/* lote 16: length of the valid UTF-8 sequence at p (1..4), or 0 if p does not start one
+ * (a byte cut in half by a "%.40s", an overlong form, a surrogate) */
+static int utf8_len(const unsigned char *p)
+{
+    unsigned char c = p[0];
+    if (c < 0x80) return 1;
+    int n;
+    unsigned char lo = 0x80, hi = 0xBF;
+    if (c >= 0xC2 && c <= 0xDF) n = 2;
+    else if (c >= 0xE0 && c <= 0xEF) { n = 3; if (c == 0xE0) lo = 0xA0; else if (c == 0xED) hi = 0x9F; }
+    else if (c >= 0xF0 && c <= 0xF4) { n = 4; if (c == 0xF0) lo = 0x90; else if (c == 0xF4) hi = 0x8F; }
+    else return 0;
+    if (p[1] < lo || p[1] > hi) return 0;      /* also stops at the terminator */
+    for (int i = 2; i < n; i++)
+        if (p[i] < 0x80 || p[i] > 0xBF) return 0;
+    return n;
+}
+
 static void json_str(char *out, size_t out_size, const char *in)
 {
     size_t o = 0;
-    for (const unsigned char *p = (const unsigned char *)(in ? in : ""); *p && o + 7 < out_size; p++) {
-        if (*p == '"' || *p == '\\') { out[o++] = '\\'; out[o++] = (char)*p; }
-        else if (*p < 0x20) o += snprintf(out + o, out_size - o, "\\u%04x", *p);
-        else out[o++] = (char)*p;
+    const unsigned char *p = (const unsigned char *)(in ? in : "");
+    while (*p && o + 7 < out_size) {
+        if (*p == '"' || *p == '\\') { out[o++] = '\\'; out[o++] = (char)*p++; }
+        else if (*p < 0x20) { o += snprintf(out + o, out_size - o, "\\u%04x", *p); p++; }
+        else {
+            int n = utf8_len(p);
+            if (n == 0) { out[o++] = '?'; p++; }          /* lote 16: invalid UTF-8 */
+            else while (n--) out[o++] = (char)*p++;
+        }
     }
     out[o] = '\0';
 }
@@ -507,6 +569,32 @@ static esp_err_t api_settings_handler(httpd_req_t *req)
     esp_err_t ret = httpd_resp_sendstr(req, json);
     free(json);
     return ret;
+}
+
+/* ---- Ender Smart (lote 16, F3-03): GET /api/v1/info — who this is and what the API offers ---- */
+
+static esp_err_t api_v1_info_handler(httpd_req_t *req)
+{
+    const esp_app_desc_t *app = esp_app_get_description();
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    char host[80];
+    json_str(host, sizeof(host), wifi_get_hostname());
+    char json[720];
+    int n = snprintf(json, sizeof(json),
+        "{\"api\":1,\"device\":\"ender-smart\",\"fw\":\"%s\",\"fw_label\":\"%s\",\"partition\":\"%s\","
+        "\"idf\":\"%s\",\"hostname\":\"%s\",\"ip\":\"%s\",\"backend\":\"%s\",\"boot_count\":%lu,"
+        "\"uptime_s\":%lld,\"events\":{\"path\":\"/api/v1/events\",\"clients\":%d,\"max_clients\":%d,"
+        "\"tick_ms\":%d,\"heartbeat_ms\":%d,\"stats_ms\":%d,\"ping_ms\":%d,\"idle_close_ms\":%d,"
+        "\"task_stack_free\":%d}}",
+        app ? app->version : "?", FW_VERSION, running ? running->label : "?", app ? app->idf_ver : "?",
+        host, wifi_get_ip_str(), printer_comm_backend_name(), (unsigned long)bootdiag_boot_count(),
+        (long long)(esp_timer_get_time() / 1000000), events_ws_client_count(), EVENTS_WS_MAX_CLIENTS,
+        EVENTS_WS_TICK_MS, EVENTS_WS_HEARTBEAT_MS, EVENTS_WS_STATS_MS, EVENTS_WS_PING_MS,
+        EVENTS_WS_IDLE_CLOSE_MS, events_ws_pacer_stack_free());
+    httpd_resp_set_type(req, "application/json");
+    if (n < 0 || (size_t)n >= sizeof(json))
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "info too long");
+    return httpd_resp_send(req, json, n);
 }
 
 /* ---- Ender Smart (F2-02): GET /api/printer_info and POST /api/printer_info/refresh ---- */
@@ -919,7 +1007,7 @@ esp_err_t httpd_start_server(void)
     config.server_port = 80;
     config.core_id = 0;
     config.stack_size = 10240;  /* TLS (mbedTLS) in /obico/link handler needs ~8KB */
-    config.max_uri_handlers = 72;   /* Ender Smart: 60 in use after lote 5 */
+    config.max_uri_handlers = 112;  /* Ender Smart: 64 before lote 16, which adds 33 under /api/v1 (97) */
     config.max_open_sockets = 13;
     config.lru_purge_enable = true;
 
@@ -1069,6 +1157,20 @@ esp_err_t httpd_start_server(void)
         .handler  = utils_page_handler,
     };
     HTTPD_REGISTER(server, &utils_uri);
+
+    /* lote 16 (F3-03): the API under /api/v1. Same handlers; the old addresses stay. The modules
+     * below register their own /api/v1 names next to the old ones. */
+    httpd_uri_t v1_info = { .uri = "/api/v1/info", .method = HTTP_GET, .handler = api_v1_info_handler };
+    HTTPD_REGISTER(server, &v1_info);
+    HTTPD_REGISTER_V1(server, &api_status, "/api/v1/status");
+    HTTPD_REGISTER_V1(server, &api_stats, "/api/v1/stats");
+    HTTPD_REGISTER_V1(server, &api_temp_history, "/api/v1/temps/history");
+    HTTPD_REGISTER_V1(server, &settings_api_uri, "/api/v1/settings");
+    HTTPD_REGISTER_V1(server, &printer_info_uri, "/api/v1/printer");
+    HTTPD_REGISTER_V1(server, &printer_info_refresh_uri, "/api/v1/printer/refresh");
+    HTTPD_REGISTER_V1(server, &api_command, "/api/v1/command");
+    HTTPD_REGISTER_V1(server, &api_estop, "/api/v1/emergency_stop");
+    events_ws_register(server);   /* lote 16 (F3-04): WebSocket /api/v1/events */
 
     sdcard_httpd_register(server);
 

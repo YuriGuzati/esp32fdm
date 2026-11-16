@@ -296,6 +296,9 @@ esp_err_t logbuf_register_httpd(httpd_handle_t server)
     };
     HTTPD_REGISTER(server, &uri_clear);
 
+    /* lote 16 (F3-03): the same handler under /api/v1 */
+    HTTPD_REGISTER_V1(server, &uri_get, "/api/v1/logs");
+
     ESP_LOGI(TAG, "Log viewer registered at /logs");
     return ESP_OK;
 }

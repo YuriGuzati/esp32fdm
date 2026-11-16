@@ -688,6 +688,12 @@ esp_err_t bedlevel_register_httpd(httpd_handle_t server)
         { .uri = "/bedlevel/mesh",   .method = HTTP_GET,  .handler = bedlevel_mesh_handler },
         { .uri = "/bedlevel/config", .method = HTTP_GET,  .handler = bedlevel_config_get_handler },
         { .uri = "/bedlevel/config", .method = HTTP_POST, .handler = bedlevel_config_post_handler },
+        /* lote 16 (F3-03): the same handlers under /api/v1; the addresses above stay */
+        { .uri = "/api/v1/mesh",        .method = HTTP_GET,  .handler = bedlevel_mesh_handler },
+        { .uri = "/api/v1/mesh/list",   .method = HTTP_GET,  .handler = bedlevel_meshlist_handler },
+        { .uri = "/api/v1/mesh/status", .method = HTTP_GET,  .handler = bedlevel_status_handler },
+        { .uri = "/api/v1/mesh/read",   .method = HTTP_POST, .handler = bedlevel_read_handler },
+        { .uri = "/api/v1/mesh/probe",  .method = HTTP_POST, .handler = bedlevel_probe_handler },
     };
 
     for (int i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {

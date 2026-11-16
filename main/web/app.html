@@ -262,6 +262,65 @@ async function pollStats() { try { S.stats = await getJSON('/api/stats'); } catc
 async function pollHist() { try { S.hist = (await getJSON('/api/temp_history')).samples || []; } catch (e) { } refreshView(); }
 async function loadSettings() { try { S.settings = await getJSON('/api/settings'); } catch (e) { } refreshView(); }
 function every(fn, ms) { fn(); return setInterval(() => { if (!document.hidden) fn(); }, ms); }
+
+/* lote 16 (F3-04): a ESP32 empurra o estado, as estatísticas e cada leitura de temperatura pelo WebSocket
+   /api/v1/events. Com ele de pé, as consultas a cada 2 e 5 s ficam paradas; se ele cair (ou o firmware não
+   tiver), a tela volta a consultar como antes. O WebSocket não aceita comandos: as ações continuam por POST. */
+const WS = { sock: null, ok: false, tries: 0, timer: 0, last: 0, boot: null, full: false, hideT: 0, why: 'conectando' };
+/* WS.last: hora do último estado recebido (o que a tela mostra); as outras mensagens não contam */
+function wsDrop(why) {
+  const s = WS.sock; WS.sock = null; WS.ok = false; WS.why = why;
+  if (s) { s.onopen = s.onmessage = s.onclose = s.onerror = null; try { s.close(); } catch (e) { } }
+}
+function wsRetry() {
+  clearTimeout(WS.timer);
+  if (document.hidden) return;
+  const d = WS.full ? 60000 : Math.min(30000, 2000 * Math.pow(2, WS.tries));
+  WS.tries++; WS.full = false;
+  WS.timer = setTimeout(wsConnect, d);
+}
+function wsLost() { pollStatus(); pollStats(); }   /* sem esperar o próximo intervalo */
+function wsConnect() {
+  clearTimeout(WS.timer);
+  if (WS.sock || document.hidden) return;
+  if (!('WebSocket' in window)) { WS.why = 'o navegador não tem WebSocket'; return; }
+  let s;
+  try { s = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/api/v1/events'); }
+  catch (e) { WS.why = 'não abriu'; wsRetry(); return; }
+  WS.sock = s; WS.last = Date.now();
+  s.onmessage = ev => {
+    let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
+    if (m.t === 'hello') {
+      if (WS.boot != null && m.boot !== WS.boot) toast('A ESP32 reiniciou (boot nº ' + m.boot + ').');
+      WS.boot = m.boot; WS.ok = true; WS.why = ''; WS.last = Date.now();
+      if (S.hist) pollHist();   /* completa o gráfico com o que faltou enquanto a conexão esteve fora */
+    } else if (m.t === 'status' && m.d) {
+      /* só aqui a espera entre tentativas volta a 2 s: uma conexão que cai logo depois do hello
+         (ex.: um texto que o navegador recusa) não fica tentando a cada 2 s */
+      WS.last = Date.now(); WS.tries = 0;
+      S.status = m.d; S.online = true; S.lastOk = Date.now(); refreshView();
+    }
+    else if (m.t === 'stats' && m.d) { S.stats = m.d; renderChrome(); }
+    else if (m.t === 'temp' && Array.isArray(m.d) && S.hist) {
+      const l = S.hist[S.hist.length - 1];
+      if (!l || m.d[0] > l[0]) { S.hist.push(m.d); if (S.hist.length > 900) S.hist.shift(); }
+    } else if (m.t === 'full') {
+      /* sem vaga: fecha daqui mesmo e tenta de novo em 1 min; até lá, consulta como antes */
+      WS.full = true; wsDrop('a ESP32 já tem ' + m.max + ' telas em tempo real abertas'); wsRetry();
+    }
+  };
+  s.onclose = () => {
+    if (WS.sock !== s) return;
+    const was = WS.ok; WS.sock = null; WS.ok = false;
+    if (!WS.full) WS.why = was ? 'a conexão caiu' : 'não conectou';
+    wsRetry(); if (was) wsLost();
+  };
+  s.onerror = () => { };
+}
+/* A ESP32 manda o estado pelo menos a cada 5 s; 12 s sem ele é conexão morta (celular que dormiu, Wi-Fi) */
+setInterval(() => {
+  if (WS.sock && Date.now() - WS.last > 12000) { const was = WS.ok; wsDrop('sem o estado há 12 s'); wsRetry(); if (was) wsLost(); }
+}, 3000);
 const job = () => { const s = S.status && S.status.state; return s === 'printing' || s === 'paused'; };
 /* lote 11: a ESP32 lê o arquivo inteiro antes de a impressão começar (pode levar segundos num arquivo grande) */
 const prep = () => !!(S.status && S.status.preparing) && !job();
@@ -507,7 +566,8 @@ function Inicio() {
     saveBtn.disabled = active; saveBtn.title = active ? 'Disponível com a impressora parada' : '';
     chartBody.textContent = ''; chartBody.append(chart(S.hist, 30));
   }
-  const t = every(pollHist, 30000);
+  /* lote 16: com o WebSocket, cada leitura nova chega sozinha; o histórico inteiro só é lido sem ele */
+  const t = every(() => { if (!WS.ok || !S.hist) pollHist(); }, 30000);
   return { el, update, unmount() { clearInterval(camTimer); clearInterval(t); img.removeAttribute('src'); } };
 }
 
@@ -1560,6 +1620,9 @@ function Sistema() {
     kv('Rede de emergência', s.emergency_ap ? 'aberta' : 'fechada'); kv('Câmera', s.camera ? 'OK' : 'indisponível');
     kv('Memória livre', fmtSize(s.heap)); kv('Memória mínima', fmtSize(s.heap_min)); kv('CPU', s.cpu0 + '% / ' + s.cpu1 + '%');
     kv('Conexões HTTP', s.http_clients); kv('Vídeos abertos', s.stream_clients + ' de 3');
+    /* lote 16 (F3-04) */
+    kv('Esta tela', WS.ok ? 'atualizada em tempo real (WebSocket)' : 'consulta a cada 2 s' + (WS.why ? ' (WebSocket: ' + WS.why + ')' : ''));
+    if (s.ws_clients != null) kv('Telas em tempo real', s.ws_clients + ' de 4');
     kv('Bytes perdidos da Ender', s.rx_dropped != null ? String(s.rx_dropped) : '—');
     kv('Temperatura', s.temp_mode === 'auto' ? 'enviada pela Ender a cada 2 s (M155)' : 'consultada pela ESP32 (M105)');
     if (S.settings) { kv('Firmware', S.settings.fw + ' (' + S.settings.partition + ')'); }
@@ -1639,10 +1702,23 @@ matchMedia('(prefers-color-scheme: light)').addEventListener('change', applyThem
 buildNav();
 window.addEventListener('hashchange', go);
 go();
-every(pollStatus, 2000);
-every(pollStats, 5000);
+/* lote 16: as consultas só rodam sem o WebSocket (a primeira roda já, para a tela não abrir vazia) */
+every(() => { if (!WS.ok) pollStatus(); }, 2000);
+every(() => { if (!WS.ok) pollStats(); }, 5000);
 loadSettings();
-document.addEventListener('visibilitychange', () => { if (!document.hidden) { pollStatus(); pollStats(); } });
+wsConnect();
+document.addEventListener('visibilitychange', () => {
+  clearTimeout(WS.hideT);
+  if (document.hidden) {
+    /* em segundo plano por 1 min: fecha, para não ocupar uma das vagas da ESP32 */
+    WS.hideT = setTimeout(() => { if (document.hidden) { wsDrop('tela em segundo plano'); clearTimeout(WS.timer); } }, 60000);
+    return;
+  }
+  /* o estado chega pelo menos a cada ~5,5 s; mais de 11 s sem ele é conexão que morreu em segundo plano */
+  if (WS.sock && Date.now() - WS.last > 11000) wsDrop('sem o estado enquanto a tela esteve em segundo plano');
+  if (!WS.ok) { pollStatus(); pollStats(); }
+  if (!WS.sock) { WS.tries = 0; wsConnect(); }
+});
 </script>
 </body>
 </html>

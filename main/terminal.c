@@ -325,6 +325,10 @@ esp_err_t terminal_register_httpd(httpd_handle_t server)
     };
     HTTPD_REGISTER(server, &polling_uri);
 
+    /* lote 16 (F3-03): the same handlers under /api/v1 */
+    HTTPD_REGISTER_V1(server, &send_uri, "/api/v1/terminal/send");
+    HTTPD_REGISTER_V1(server, &poll_uri, "/api/v1/terminal/poll");
+
     ESP_LOGI(TAG, "Terminal endpoints registered");
     return ESP_OK;
 }

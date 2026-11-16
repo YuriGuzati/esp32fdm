@@ -23,6 +23,7 @@ set(SRCS
     "ota.c"
     "job_history.c"
     "bootdiag.c"
+    "events_ws.c"
 )
 
 idf_component_register(

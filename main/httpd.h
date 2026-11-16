@@ -17,6 +17,23 @@
     } \
 } while(0)
 
+/* Ender Smart (lote 16, F3-03): the same handler also under its /api/v1 name.
+ * The old address keeps working; both run the very same function. */
+#define HTTPD_REGISTER_V1(server, uri_ptr, v1_uri) do { \
+    httpd_uri_t _v1 = *(uri_ptr); \
+    _v1.uri = (v1_uri); \
+    HTTPD_REGISTER(server, &_v1); \
+} while(0)
+
+/* Ender Smart (lote 16): the JSON objects of GET /api/status and GET /api/stats, also pushed by
+ * the WebSocket /api/v1/events. They keep state (baby Z seed, CPU counters), so call them only
+ * from the HTTP server task. Return the length written, or -1 if it did not fit.
+ * The CPU % is measured since the previous call with the same window. */
+#define HTTPD_CPU_REST 0
+#define HTTPD_CPU_WS   1
+int httpd_status_json(char *json, size_t json_size);
+int httpd_stats_json(char *json, size_t json_size, int window);
+
 /**
  * Start the HTTP server on port 80.
  * Registers /stream (MJPEG) and /capture (single JPEG) endpoints.
