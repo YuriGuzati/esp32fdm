@@ -8,6 +8,7 @@ set(SRCS
     "sdcard_httpd.c"
     "printer_comm.c"
     "marlin_link.c"
+    "marlin_temp.c"
     "command_arbiter.c"
     "gcode_scan.c"
     "host_print.c"

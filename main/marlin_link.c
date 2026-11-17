@@ -37,6 +37,7 @@
 #include "cache.h"
 #include "gcode_scan.h"
 #include "marlin_proto.h"
+#include "marlin_temp.h"
 #include "printer_comm_priv.h"
 
 static const char *TAG = "printer_comm";
@@ -70,6 +71,7 @@ static int64_t       s_info_time_us;      /* when FIRMWARE_NAME was last seen, 0
 /* F15-23: "Resend: N" seen while sending a user command */
 static volatile int32_t   s_last_resend = -1;
 static uint32_t           s_spam_lines;     /* Creality debug lines dropped */
+static uint32_t           s_temp_refused;   /* F15-25: lines like a report that were refused */
 
 /* Ender Smart (lote 6): bumped by every parsed M114 answer, so a pause can tell a fresh
  * position from a stale one (the 1st pause on 2026-11-12 saved X0.4 Y20 from long before). */
@@ -179,42 +181,19 @@ static bool needs_echo_ping(const char *gcode)
     return false;
 }
 
-/** Find value after a key character, e.g. 'T' in "T:205.3 /210.0" */
-static bool parse_temp_pair(const char *line, char key,
-                            float *actual, float *target)
+/** Store a temperature report ("ok T:205.3 /210.0 B:60.1 /60.0", or the M155 one).
+ *  Ender Smart (F15-25, lote 17): was parse_m105(line). Only lines that
+ *  marlin_parse_temp_report() accepts get here, and a target the line does not carry keeps its
+ *  old value. */
+static void store_temp_report(const marlin_temps_t *t)
 {
-    /* Look for "X:" pattern */
-    char pattern[4];
-    snprintf(pattern, sizeof(pattern), "%c:", key);
-    const char *p = strstr(line, pattern);
-    if (!p) return false;
-
-    p += 2; /* skip "X:" */
-    *actual = strtof(p, (char **)&p);
-
-    /* Look for " /NNN" target temperature */
-    while (*p == ' ') p++;
-    if (*p == '/') {
-        p++;
-        *target = strtof(p, NULL);
-    }
-    return true;
-}
-
-/** Parse M105 response: "ok T:205.3 /210.0 B:60.1 /60.0" */
-static void parse_m105(const char *line)
-{
-    float ha, ht, ba, bt;
-
     xSemaphoreTake(g_state_mutex, portMAX_DELAY);
 
-    if (parse_temp_pair(line, 'T', &ha, &ht)) {
-        g_state.hotend_actual = ha;
-        g_state.hotend_target = ht;
-    }
-    if (parse_temp_pair(line, 'B', &ba, &bt)) {
-        g_state.bed_actual = ba;
-        g_state.bed_target = bt;
+    g_state.hotend_actual = t->hotend;
+    if (t->has_hotend_target) g_state.hotend_target = t->hotend_target;
+    if (t->has_bed) {
+        g_state.bed_actual = t->bed;
+        if (t->has_bed_target) g_state.bed_target = t->bed_target;
     }
 
     g_state.last_update_us = esp_timer_get_time();
@@ -403,8 +382,16 @@ static void process_line(const char *line)
      * (it shows whether the Ender kept its position, i.e. did not restart). */
     bool is_ok = strncmp(line, "ok", 2) == 0 && (line[2] == '\0' || line[2] == ' ');
     bool is_pos = strstr(line, "X:") && strstr(line, "Y:") && strstr(line, "Z:") && strstr(line, "Count");
+    marlin_temps_t temps;                                       /* F15-25 (lote 17) */
+    bool is_temp = marlin_parse_temp_report(line, &temps);
+    /* a line that looks like a report but was refused: a lost byte, or a firmware whose
+     * report does not start with "T:" (the board would then stay "disconnected") */
+    if (!is_temp && strstr(line, "T:") && strstr(line, " B:") && strstr(line, "@:") &&
+        (s_temp_refused++ % 100) == 0)
+        ESP_LOGW(TAG, "Temperature line refused (%lu so far): %s",
+                 (unsigned long)s_temp_refused, line);
     bool quiet = strncmp(line, "busy:", 5) == 0 ||
-                 (strstr(line, "T:") && strstr(line, "B:")) ||
+                 is_temp ||
                  strstr(line, "Not SD printing") || strstr(line, "SD printing byte") ||
                  (is_ok && (s_tx_quiet || hp_is_active() || s_pending_query == QUERY_M105 ||
                             s_pending_query == QUERY_M27 || s_pending_query == QUERY_M114 ||
@@ -450,10 +437,14 @@ static void process_line(const char *line)
         s_mk_echo = false;
     }
 
-    /* Content-based matching — handles unsolicited auto-reports too */
-    if (strstr(line, "T:")) {
-        if (s_pending_query != QUERY_M105) s_last_auto_temp_us = esp_timer_get_time();  /* F2-03 */
-        parse_m105(line);
+    /* Content-based matching — handles unsolicited auto-reports too.
+     * F15-25 (lote 17): a report must start with "T:" (or "ok T:"). An "ok T:" line is the
+     * answer to an M105, never an autoreport, and it is read only here (it used to be read a
+     * second time in the "ok" handling below, adding the same sample twice). */
+    if (is_temp) {
+        if (!is_ok && s_pending_query != QUERY_M105)
+            s_last_auto_temp_us = esp_timer_get_time();  /* F2-03 */
+        store_temp_report(&temps);
     } else if (strstr(line, "SD printing") || strstr(line, "Not SD")) {
         parse_m27(line);
     } else if (strstr(line, "Current file:")) {
@@ -644,9 +635,7 @@ static void process_line(const char *line)
             ESP_LOGI(TAG, "The Ender answered every older command (marker %lu)",
                      (unsigned long)s_mk_id);
         }
-        if (strstr(line, "T:")) {
-            parse_m105(line);
-        }
+        /* "ok T:..." was already read above (F15-25, lote 17) */
         s_pending_query = QUERY_NONE;
         /* Clear cooldown so the wait-loop doesn't mistake this real "ok"
          * for a "busy: processing" clear and re-arm the query. */
