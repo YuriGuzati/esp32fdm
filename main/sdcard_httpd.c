@@ -179,6 +179,7 @@ typedef struct {
     int                  total;
     char                 path[300];
     TaskHandle_t         owner;       /* lote 18: notified once the writer is done with this struct */
+    unsigned             writer_stack_free;   /* lote 18b: high-water mark of sd_wr, for the log */
 } sd_writer_ctx_t;
 
 #define SD_STREAM_SIZE  1048576
@@ -233,6 +234,7 @@ static void sd_writer_task(void *arg)
     fclose(wctx->file);
     wctx->file = NULL;  /* signal main task: we closed it */
     free(wbuf);
+    wctx->writer_stack_free = (unsigned)uxTaskGetStackHighWaterMark(NULL);
     /* lote 18: the upload task waits for this instead of polling eTaskGetState() on a task
      * whose TCB the idle task may already have freed */
     xTaskNotifyGive(wctx->owner);
@@ -390,8 +392,8 @@ static void sd_upload_task(void *arg)
     if (ret != ESP_OK || wctx.write_error) {
         unlink(path);
         upload_release();
-        ESP_LOGW(TAG, "Upload %s failed after %d of %d bytes, discarded (stack_free %u)", ctx->filename,
-                 total - remaining, total, (unsigned)uxTaskGetStackHighWaterMark(NULL));
+        ESP_LOGW(TAG, "Upload %s failed after %d of %d bytes, discarded (stack_free %u, writer %u)", ctx->filename,
+                 total - remaining, total, (unsigned)uxTaskGetStackHighWaterMark(NULL), wctx.writer_stack_free);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Upload failed");
     } else if (ctx->want_sha[0] && strcasecmp(ctx->want_sha, hex) != 0) {
         unlink(path);
@@ -417,8 +419,9 @@ static void sd_upload_task(void *arg)
             httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Rename failed");
         } else {
             upload_release();
-            ESP_LOGI(TAG, "Uploaded %s (%d bytes, sha256 %s%s, stack_free %u)", ctx->filename, total, hex,
-                     ctx->want_sha[0] ? ", verified" : "", (unsigned)uxTaskGetStackHighWaterMark(NULL));
+            ESP_LOGI(TAG, "Uploaded %s (%d bytes, sha256 %s%s, stack_free %u, writer %u)", ctx->filename, total, hex,
+                     ctx->want_sha[0] ? ", verified" : "", (unsigned)uxTaskGetStackHighWaterMark(NULL),
+                     wctx.writer_stack_free);
             char esc[160], json[320];
             json_escape(ctx->filename, esc, sizeof(esc));
             snprintf(json, sizeof(json), "{\"ok\":true,\"name\":\"%s\",\"size\":%d,\"sha256\":\"%s\",\"verified\":%s}",
@@ -525,7 +528,10 @@ static esp_err_t sd_upload_handler(httpd_req_t *req)
     strlcpy(ctx->filename, filename, sizeof(ctx->filename));
     strlcpy(ctx->want_sha, want_sha, sizeof(ctx->want_sha));
 
-    if (xTaskCreatePinnedToCore(sd_upload_task, "sd_upload", 4096, ctx,
+    /* lote 18b: 8 KB. With 4096 B the lote 18 panicked three times (stack overflow): a stalled or
+     * reset upload went through more ESP_LOG calls (each one formats in the caller's stack, and
+     * the log hook adds 512 B), and a normal upload already left only ~600 B free. */
+    if (xTaskCreatePinnedToCore(sd_upload_task, "sd_upload", 8192, ctx,
                                  5, NULL, 0) != pdPASS) {
         upload_release();
         httpd_req_async_handler_complete(async_req);
