@@ -6,9 +6,12 @@
 #include "layout.h"
 #include "url_util.h"
 
+#include "gcode_preview.h"
+
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
+#include "mbedtls/base64.h"
 #include "mbedtls/sha256.h"
 #include "esp_http_server.h"
 #include "freertos/FreeRTOS.h"
@@ -20,6 +23,7 @@
 #include <dirent.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -419,6 +423,7 @@ static void sd_upload_task(void *arg)
             httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Rename failed");
         } else {
             upload_release();
+            gcode_preview_delete(ctx->filename);   /* lote 19: new content, the old preview no longer fits */
             ESP_LOGI(TAG, "Uploaded %s (%d bytes, sha256 %s%s, stack_free %u, writer %u)", ctx->filename, total, hex,
                      ctx->want_sha[0] ? ", verified" : "", (unsigned)uxTaskGetStackHighWaterMark(NULL),
                      wctx.writer_stack_free);
@@ -585,6 +590,7 @@ static esp_err_t sd_delete_handler(httpd_req_t *req)
     }
 
     ESP_LOGI(TAG, "Deleted %s", fn);
+    gcode_preview_delete(fn);   /* lote 19 */
 
     /* Redirect back to /sd */
     httpd_resp_set_status(req, "303 See Other");
@@ -837,10 +843,32 @@ static void sd_info_task(void *arg)
     if (info.thumbnail_base64) {
         httpd_resp_sendstr_chunk(req, ",\"thumbnail\":\"data:image/png;base64,");
         httpd_resp_sendstr_chunk(req, info.thumbnail_base64);
-        httpd_resp_sendstr_chunk(req, "\"");
+        httpd_resp_sendstr_chunk(req, "\",\"thumbnailSource\":\"file\"");
         free(info.thumbnail_base64);
     } else {
-        httpd_resp_sendstr_chunk(req, ",\"thumbnail\":null");
+        /* lote 19: a preview drawn by the page from the G-code, if there is one for this size */
+        size_t n = 0;
+        uint8_t *img = gcode_preview_load(ctx->filename, (long)st.st_size, &n);
+        size_t b64_len = 0;
+        unsigned char *b64 = NULL;
+        if (img) {
+            mbedtls_base64_encode(NULL, 0, &b64_len, img, n);   /* size needed, with the final NUL */
+            b64 = heap_caps_malloc(b64_len, MALLOC_CAP_SPIRAM);
+            if (b64 && mbedtls_base64_encode(b64, b64_len, &b64_len, img, n) != 0) {
+                free(b64);
+                b64 = NULL;
+            }
+        }
+        if (b64) {
+            snprintf(buf, sizeof(buf), ",\"thumbnail\":\"data:%s;base64,", gcode_preview_mime(img, n));
+            httpd_resp_sendstr_chunk(req, buf);
+            httpd_resp_sendstr_chunk(req, (const char *)b64);
+            httpd_resp_sendstr_chunk(req, "\",\"thumbnailSource\":\"preview\"");
+        } else {
+            httpd_resp_sendstr_chunk(req, ",\"thumbnail\":null,\"thumbnailSource\":null");
+        }
+        free(b64);
+        free(img);
     }
 
     httpd_resp_sendstr_chunk(req, "}");
@@ -859,13 +887,15 @@ static esp_err_t sd_info_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    char query[128];
+    /* lote 19: room for the still-encoded name ("%20" takes 3 characters); sd_name_ok() checks the
+     * decoded length (< 64). With 128/64, a long name with spaces gave 400. */
+    char query[256];
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing query");
         return ESP_FAIL;
     }
 
-    char filename[64];
+    char filename[200];
     if (httpd_query_key_value(query, "filename", filename, sizeof(filename)) != ESP_OK) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing filename");
         return ESP_FAIL;
@@ -958,8 +988,11 @@ static void sd_read_task(void *arg)
             httpd_resp_set_hdr(req, "Content-Disposition", cd);
         }
         long total = 0;
-        bool ok = true;
+        bool ok = true, by_job = false;
         while (true) {
+            /* lote 19: the 409 above is only checked at the start; a print (or its preparation) that starts
+             * during a long read stops it here, so the two never compete for the SD card */
+            if (printer_comm_job_active() || printer_comm_preparing(NULL, 0, NULL)) { ok = false; by_job = true; break; }
             int n = read(fd, buf, bsz);
             if (n < 0) { ok = false; break; }
             if (n == 0) break;
@@ -977,7 +1010,11 @@ static void sd_read_task(void *arg)
         if (ctx->download) {
             if (ok) httpd_resp_send_chunk(req, NULL, 0);
             ESP_LOGI(TAG, "Download %s: %ld bytes in %d ms%s, sha256 %s", ctx->filename, total, ms,
-                     ok ? "" : " (interrupted)", hex);
+                     ok ? "" : by_job ? " (stopped: a print started)" : " (interrupted)", hex);
+        } else if (by_job) {
+            httpd_resp_set_status(req, "409 Conflict");
+            httpd_resp_set_type(req, "text/plain");
+            httpd_resp_sendstr(req, "Stopped: a print started");
         } else if (!ok) {
             httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "SD read error");
         } else {
@@ -1049,6 +1086,135 @@ fail:
     return ESP_FAIL;
 }
 
+/* ---- POST /sd/preview?filename=&size= — Ender Smart (lote 19) ----
+ * Body: a PNG (or JPEG) the page drew from the G-code. Kept on LittleFS (gcode_preview.c), never
+ * on the SD card, and returned by /sd/info while the file has this size. */
+
+typedef struct {
+    httpd_req_t *req;
+    char filename[64];
+    long size;
+} sd_preview_ctx_t;
+
+/* One preview POST at a time: each holds 6 KB of internal RAM and up to 160 KB of PSRAM. */
+static atomic_bool s_preview_busy;
+
+static bool preview_job_busy(void)
+{
+    return printer_comm_job_active() || printer_comm_preparing(NULL, 0, NULL);
+}
+
+static void sd_preview_task(void *arg)
+{
+    sd_preview_ctx_t *ctx = (sd_preview_ctx_t *)arg;
+    httpd_req_t *req = ctx->req;
+    int total = (int)req->content_len;
+    int got = 0;
+    const char *status = "200 OK", *msg = NULL;
+    char json[64] = "";
+    uint8_t *img = heap_caps_malloc(total, MALLOC_CAP_SPIRAM);
+
+    if (!img) {
+        status = "500 Internal Server Error"; msg = "Out of memory";
+    } else {
+        int64_t last_data = esp_timer_get_time();
+        while (got < total) {
+            int r = httpd_req_recv(req, (char *)img + got, total - got);
+            if (r == HTTPD_SOCK_ERR_TIMEOUT && esp_timer_get_time() - last_data < 15 * 1000000LL) {
+                vTaskDelay(pdMS_TO_TICKS(20));
+                continue;
+            }
+            if (r <= 0) break;
+            got += r;
+            last_data = esp_timer_get_time();
+        }
+        char path[300];
+        snprintf(path, sizeof(path), MOUNT_POINT "/%s", ctx->filename);
+        struct stat st;
+        if (got < total) {
+            status = "400 Bad Request"; msg = "Incomplete image";
+        } else if (!gcode_preview_mime(img, total)) {
+            status = "400 Bad Request"; msg = "Not a PNG or JPEG, or larger than 1024 px";
+        } else if (preview_job_busy()) {
+            /* checked again: a print may have started while the image arrived; no flash write then */
+            status = "409 Conflict"; msg = "A impressora começou a imprimir ou a preparar um arquivo";
+        } else if (stat(path, &st) != 0) {
+            /* the file may have been deleted or replaced while the page was drawing */
+            status = "404 Not Found"; msg = "File not found";
+        } else if ((long)st.st_size != ctx->size) {
+            status = "409 Conflict"; msg = "The file changed while the preview was drawn";
+        } else if (gcode_preview_save(ctx->filename, ctx->size, img, (size_t)total) != ESP_OK) {
+            status = "500 Internal Server Error"; msg = "Could not save the preview";
+        } else {
+            snprintf(json, sizeof(json), "{\"ok\":true,\"bytes\":%d}", total);
+        }
+    }
+    ESP_LOGI(TAG, "Preview POST %s: %s (%d of %d bytes, stack_free %u)", ctx->filename, status, got, total,
+             (unsigned)uxTaskGetStackHighWaterMark(NULL));
+    free(img);
+
+    atomic_store(&s_preview_busy, false);   /* before answering: the page sends the next one right away */
+    httpd_resp_set_status(req, status);
+    httpd_resp_set_type(req, msg ? "text/plain" : "application/json");
+    httpd_resp_sendstr(req, msg ? msg : json);
+
+    httpd_req_async_handler_complete(req);
+    free(ctx);
+    vTaskDelete(NULL);
+}
+
+static esp_err_t sd_preview_handler(httpd_req_t *req)
+{
+    if (!sdcard_is_mounted())
+        return upload_refuse(req, "500 Internal Server Error", "SD card not mounted");
+
+    /* room for the still-encoded name; sd_name_ok() checks the decoded length (< 64) */
+    char query[320], filename[200], size_s[24];
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK ||
+        httpd_query_key_value(query, "filename", filename, sizeof(filename)) != ESP_OK ||
+        httpd_query_key_value(query, "size", size_s, sizeof(size_s)) != ESP_OK)
+        return upload_refuse(req, "400 Bad Request", "Missing filename or size");
+    url_decode_inplace(filename);
+    if (!sd_name_ok(filename))
+        return upload_refuse(req, "400 Bad Request", "Invalid filename");
+    char *end = NULL;
+    long size = strtol(size_s, &end, 10);
+    if (!end || *end || size <= 0)
+        return upload_refuse(req, "400 Bad Request", "Invalid size");
+    if (req->content_len == 0 || req->content_len > GCODE_PREVIEW_MAX_BYTES)
+        return upload_refuse(req, "413 Payload Too Large", "The preview must be 1 byte to 160 KB");
+    /* the same rule as the other heavy file operations: nothing while a print runs or is prepared */
+    if (preview_job_busy())
+        return upload_refuse(req, "409 Conflict", "A impressora está imprimindo ou preparando um arquivo");
+    bool idle = false;
+    if (!atomic_compare_exchange_strong(&s_preview_busy, &idle, true))
+        return upload_refuse(req, "409 Conflict", "Another preview is being saved");
+
+    httpd_req_t *async_req = NULL;
+    if (httpd_req_async_handler_begin(req, &async_req) != ESP_OK) {
+        atomic_store(&s_preview_busy, false);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Async init failed");
+        return ESP_FAIL;
+    }
+    sd_preview_ctx_t *ctx = malloc(sizeof(sd_preview_ctx_t));
+    if (!ctx) {
+        atomic_store(&s_preview_busy, false);
+        httpd_req_async_handler_complete(async_req);
+        return ESP_FAIL;
+    }
+    ctx->req = async_req;
+    strlcpy(ctx->filename, filename, sizeof(ctx->filename));
+    ctx->size = size;
+    /* 6 KB: LittleFS writes and several ESP_LOG calls (see the lote 18 panics with 4 KB) */
+    if (xTaskCreatePinnedToCore(sd_preview_task, "sd_prev", 6144, ctx, 5, NULL, 0) != pdPASS) {
+        atomic_store(&s_preview_busy, false);
+        httpd_req_async_handler_complete(async_req);
+        free(ctx);
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
 static esp_err_t sd_sha256_handler(httpd_req_t *req) { return sd_read_start(req, false); }
 static esp_err_t sd_download_handler(httpd_req_t *req) { return sd_read_start(req, true); }
 
@@ -1089,6 +1255,7 @@ esp_err_t sdcard_httpd_register(httpd_handle_t server)
         { .uri = "/sd/status", .method = HTTP_GET,  .handler = sd_status_handler },
         { .uri = "/sd/sha256", .method = HTTP_GET,  .handler = sd_sha256_handler },
         { .uri = "/sd/download", .method = HTTP_GET, .handler = sd_download_handler },
+        { .uri = "/sd/preview", .method = HTTP_POST, .handler = sd_preview_handler },   /* lote 19 */
     };
 
     for (int i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
@@ -1101,6 +1268,7 @@ esp_err_t sdcard_httpd_register(httpd_handle_t server)
         { .uri = "/api/v1/files/info",     .method = HTTP_GET,  .handler = sd_info_handler },
         { .uri = "/api/v1/files/sha256",   .method = HTTP_GET,  .handler = sd_sha256_handler },
         { .uri = "/api/v1/files/download", .method = HTTP_GET,  .handler = sd_download_handler },
+        { .uri = "/api/v1/files/preview",  .method = HTTP_POST, .handler = sd_preview_handler },
         { .uri = "/api/v1/files/upload",   .method = HTTP_POST, .handler = sd_upload_handler },
         { .uri = "/api/v1/files/delete",   .method = HTTP_POST, .handler = sd_delete_handler },
         { .uri = "/api/v1/job",            .method = HTTP_GET,  .handler = sd_status_handler },

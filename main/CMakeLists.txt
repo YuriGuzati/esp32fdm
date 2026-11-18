@@ -11,6 +11,7 @@ set(SRCS
     "marlin_temp.c"
     "command_arbiter.c"
     "gcode_scan.c"
+    "gcode_preview.c"
     "host_print.c"
     "printer_comm_klipper.c"
     "obico_client.c"

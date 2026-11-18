@@ -626,19 +626,283 @@ async function sha256File(file, onProgress) {
   return sh.hex();
 }
 
+/* ---------- Prévia dos G-codes (lote 19) ----------
+   Para os arquivos sem miniatura: a tela baixa o G-code, guarda só os movimentos com extrusão e desenha a peça em
+   perspectiva (cor pela altura). A imagem vai para a ESP32 (POST /sd/preview), que a guarda na flash e a devolve no
+   /sd/info enquanto o arquivo tiver o mesmo tamanho. */
+function gcodeParser() {
+  /* Segmentos [x1, y1, x2, y2, z]. Antes da 1ª marca de camada (o código inicial, com a linha de purga) eles vão para
+     "pre", que só é usado se o arquivo não tiver nenhuma marca. Trechos curtos seguidos (curvas) viram cordas de 0,3 mm.
+     O contorno em volta da peça (;TYPE:SKIRT no Cura e no Orca, Skirt/Brim no PrusaSlicer) fica de fora: ele não é a
+     peça e a deixaria pequena na imagem. */
+  const D2 = 0.3 * 0.3;
+  /* Modos como no Marlin 2.0: G90/G91 valem para XYZ e para o E, e M82/M83 só para o E; vale o último comando */
+  const P = { x: 0, y: 0, z: 0, e: 0, g91: false, eRel: false, started: false, skirt: false, lines: 0,
+    seg: new Float32Array(1 << 16), n: 0, pre: new Float32Array(1 << 12), np: 0 };
+  let pend = false, sx = 0, sy = 0, px = 0, py = 0, pz = 0;
+  function push(x1, y1, x2, y2, z) {
+    const k = P.started ? 'seg' : 'pre', nk = P.started ? 'n' : 'np';
+    if (P[nk] + 5 > P[k].length) { const t = new Float32Array(P[k].length * 2); t.set(P[k]); P[k] = t; }
+    const a = P[k], i = P[nk];
+    a[i] = x1; a[i + 1] = y1; a[i + 2] = x2; a[i + 3] = y2; a[i + 4] = z; P[nk] = i + 5;
+  }
+  function flush() { if (pend) { push(sx, sy, px, py, pz); pend = false; } }
+  function extrude(x1, y1, x2, y2, z) {
+    if (pend && (z !== pz || x1 !== px || y1 !== py)) flush();
+    if (!pend) { sx = x1; sy = y1; pz = z; pend = true; }
+    px = x2; py = y2;
+    const dx = px - sx, dy = py - sy;
+    if (dx * dx + dy * dy >= D2) flush();
+  }
+  const WORD = /([XYZE])\s*(-?(?:\d+\.?\d*|\.\d+))/gi;
+  function words(s) { const o = {}; let m; WORD.lastIndex = 0; while ((m = WORD.exec(s))) o[m[1].toUpperCase()] = parseFloat(m[2]); return o; }
+  function line(s) {
+    P.lines++;
+    const c = s.indexOf(';');
+    if (c >= 0) {
+      const cm = s.slice(c + 1);
+      if (!P.started && /^\s*(LAYER:-?\d|LAYER_CHANGE\s*$)/i.test(cm)) { flush(); P.started = true; }
+      const t = /^\s*TYPE:\s*(\S+)/i.exec(cm);
+      if (t) { const sk = /^SKIRT/i.test(t[1]); if (sk !== P.skirt) { flush(); P.skirt = sk; } }
+      s = s.slice(0, c);
+    }
+    s = s.trim();
+    if (!s) return;
+    const L = s[0].toUpperCase();
+    if (L === 'G') {
+      const code = parseInt(s.slice(1), 10);
+      if (code >= 0 && code <= 3) {
+        const w = words(s.slice(1 + String(code).length));
+        const relE = P.eRel;
+        const nx = w.X == null ? P.x : P.g91 ? P.x + w.X : w.X;
+        const ny = w.Y == null ? P.y : P.g91 ? P.y + w.Y : w.Y;
+        const nz = w.Z == null ? P.z : P.g91 ? P.z + w.Z : w.Z;
+        const ne = w.E == null ? P.e : relE ? P.e + w.E : w.E;
+        const moved = nx !== P.x || ny !== P.y;
+        if (nz !== P.z) flush();
+        if (w.E != null && ne > P.e + 1e-5 && moved && !P.skirt) extrude(P.x, P.y, nx, ny, nz);   /* G2/G3: corda até o fim do arco */
+        else if (moved) flush();
+        P.x = nx; P.y = ny; P.z = nz; P.e = ne;
+      } else if (code === 90) { P.g91 = false; P.eRel = false; }
+      else if (code === 91) { P.g91 = true; P.eRel = true; }
+      else if (code === 92) { const w = words(s.slice(3)); if (w.X != null) P.x = w.X; if (w.Y != null) P.y = w.Y; if (w.Z != null) P.z = w.Z; if (w.E != null) P.e = w.E; }
+      else if (code === 28) {
+        /* "G28 X Y" vem sem números; a posição depois da origem não importa para o desenho (é antes da 1ª camada) */
+        flush();
+        const r = s.slice(3).toUpperCase(), all = !/[XYZ]/.test(r);
+        if (all || r.includes('X')) P.x = 0; if (all || r.includes('Y')) P.y = 0; if (all || r.includes('Z')) P.z = 0;
+      }
+    } else if (L === 'M') {
+      const code = parseInt(s.slice(1), 10);
+      if (code === 82) P.eRel = false; else if (code === 83) P.eRel = true;
+    }
+  }
+  function end() {
+    flush();
+    return P.started ? { seg: P.seg, n: P.n, lines: P.lines, marks: true } : { seg: P.pre, n: P.np, lines: P.lines, marks: false };
+  }
+  return { line, end };
+}
+
+function drawGcodePreview(r, size, background) {
+  const a = r.seg, n = r.n;
+  let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity, z0 = Infinity, z1 = -Infinity;
+  for (let i = 0; i < n; i += 5) {
+    const xa = a[i], ya = a[i + 1], xb = a[i + 2], yb = a[i + 3], z = a[i + 4];
+    if (xa < x0) x0 = xa; if (xb < x0) x0 = xb; if (xa > x1) x1 = xa; if (xb > x1) x1 = xb;
+    if (ya < y0) y0 = ya; if (yb < y0) y0 = yb; if (ya > y1) y1 = ya; if (yb > y1) y1 = yb;
+    if (z < z0) z0 = z; if (z > z1) z1 = z;
+  }
+  const cv = document.createElement('canvas'); cv.width = cv.height = size;
+  const g = cv.getContext('2d');
+  if (background) { g.fillStyle = background; g.fillRect(0, 0, size, size); }
+  if (!n) return cv;
+  /* vista em perspectiva da frente-esquerda, de cima (isométrica): x para a direita, y para o fundo, z para cima */
+  const C = Math.cos(Math.PI / 6), Sn = 0.5;
+  const U = (x, y) => (x - y) * C, V = (x, y, z) => -((x + y) * Sn + z);
+  let u0 = Infinity, u1 = -Infinity, v0 = Infinity, v1 = -Infinity;
+  for (const x of [x0, x1]) for (const y of [y0, y1]) for (const z of [z0, z1]) {
+    const u = U(x, y), v = V(x, y, z);
+    if (u < u0) u0 = u; if (u > u1) u1 = u; if (v < v0) v0 = v; if (v > v1) v1 = v;
+  }
+  const pad = size * 0.06, room = size - 2 * pad;
+  const sc = Math.min(room / Math.max(u1 - u0, 1e-3), room / Math.max(v1 - v0, 1e-3));
+  const ox = pad + (room - (u1 - u0) * sc) / 2 - u0 * sc, oy = pad + (room - (v1 - v0) * sc) / 2 - v0 * sc;
+  g.lineCap = 'round'; g.lineJoin = 'round';
+  g.lineWidth = Math.max(1, Math.min(4, 0.45 * sc));
+  const BANDS = 28, zs = z1 - z0 || 1;
+  let band = -1;
+  for (let i = 0; i < n; i += 5) {
+    const b = Math.min(BANDS - 1, Math.floor((a[i + 4] - z0) / zs * BANDS));
+    if (b !== band) {
+      if (band >= 0) g.stroke();
+      band = b;
+      const t = b / (BANDS - 1);
+      g.strokeStyle = 'hsl(' + (22 + 14 * t).toFixed(0) + ',88%,' + (34 + 30 * t).toFixed(0) + '%)';
+      g.beginPath();
+    }
+    const z = a[i + 4];
+    g.moveTo(ox + U(a[i], a[i + 1]) * sc, oy + V(a[i], a[i + 1], z) * sc);
+    g.lineTo(ox + U(a[i + 2], a[i + 3]) * sc, oy + V(a[i + 2], a[i + 3], z) * sc);
+  }
+  if (band >= 0) g.stroke();
+  return cv;
+}
+
+const canvasBlob = (cv, type, q) => new Promise(res => cv.toBlob(res, type, q));
+
+/** Baixa o G-code f ({ name, size }) da ESP32, desenha a prévia e devolve { blob, segs, lines, marks }.
+    onProg(fase, feito, total). Um download que não chega inteiro (a ESP32 o corta quando uma impressão começa) é erro:
+    uma prévia pela metade nunca é guardada. */
+async function makeGcodePreview(f, onProg, signal) {
+  let r;
+  try { r = await fetch('/sd/download?filename=' + encodeURIComponent(f.name), { cache: 'no-store', signal }); }
+  catch (e) { throw signal && signal.aborted ? e : new Error('a conexão com a ESP32 caiu'); }
+  if (!r.ok) throw new Error(r.status === 409 ? 'a impressora está ocupada' : r.status === 503 ? 'outro download ou SHA-256 em andamento' : ((await r.text().catch(() => '')).slice(0, 120) || 'HTTP ' + r.status));
+  const total = f.size || +r.headers.get('Content-Length') || 0;   /* o download vem em pedaços, sem Content-Length */
+  const reader = r.body.getReader(), dec = new TextDecoder();
+  const p = gcodeParser();
+  let rest = '', got = 0, lastProg = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      got += value.length;
+      const txt = rest + dec.decode(value, { stream: true });
+      const parts = txt.split('\n');
+      rest = parts.pop();
+      for (const ln of parts) p.line(ln);
+      const now = performance.now();
+      if (onProg && now - lastProg > 250) { lastProg = now; onProg('baixando', got, total); }
+    }
+  } catch (e) { throw signal && signal.aborted ? e : new Error('o download foi interrompido'); }
+  rest += dec.decode();
+  if (rest) p.line(rest);
+  if (f.size && got !== f.size) throw new Error('o download veio incompleto (' + fmtSize(got) + ' de ' + fmtSize(f.size) + '): uma impressão começou?');
+  const res = p.end();
+  if (!res.n) throw new Error('não achei movimentos com extrusão no arquivo');
+  if (onProg) onProg('desenhando', got, total);
+  await new Promise(ok => setTimeout(ok, 0));
+  /* PNG transparente; se passar de 150 KB, menor; por fim JPEG sobre fundo escuro */
+  let blob = await canvasBlob(drawGcodePreview(res, 360), 'image/png');
+  if (blob && blob.size > 150000) blob = await canvasBlob(drawGcodePreview(res, 280), 'image/png');
+  if (blob && blob.size > 150000) blob = await canvasBlob(drawGcodePreview(res, 360, '#1d1f24'), 'image/jpeg', 0.85);
+  if (!blob) throw new Error('o navegador não gerou a imagem');
+  return { blob, segs: res.n / 5, lines: res.lines, marks: res.marks };
+}
+
+async function savePreview(f, blob) {
+  let r;
+  /* uma recusa sem ler o corpo (409/413) costuma chegar ao navegador só como conexão derrubada */
+  try { r = await fetch('/sd/preview?filename=' + encodeURIComponent(f.name) + '&size=' + f.size, { method: 'POST', body: blob, headers: { 'Content-Type': blob.type || 'image/png' } }); }
+  catch (e) { throw new Error('a ESP32 recusou ou a conexão caiu (a impressora começou a trabalhar?)'); }
+  if (!r.ok) throw new Error((await r.text().catch(() => '')).slice(0, 160) || 'HTTP ' + r.status);
+}
+
+/* /sd/info já lido nesta página, por nome|tamanho|data */
+const fileInfoCache = new Map();
+const infoKey = f => f.name + '|' + f.size + '|' + (f.mtime || 0);
+
+/* Uma prévia por vez na página inteira (o download da ESP32 é um por vez). previewCtl para a geração em andamento:
+   ela é parada quando a impressora começa a trabalhar e quando a tela Arquivos sai de cena. */
+let previewCtl = null;
+
 /* ---------- Arquivos ---------- */
 /* lote 18: a ESP32 aceita um envio por vez. Fica fora de Arquivos() porque a tela é recriada a cada navegação,
    e o envio continua em segundo plano. */
 let sdUploading = false;
+let sdPreviewing = false;   /* lote 19: "Gerar prévias" em andamento (usa a mesma barra de progresso) */
 function Arquivos() {
   let files = [], sort = 'recentes';
   const el = h('div', { class: 'col', style: 'gap:12px' });
   const input = h('input', { type: 'file', accept: '.gcode,.g,.gc', class: 'hide' });
   const prog = h('div', { class: 'bar hide' }, h('div', { style: 'width:0%' }));
   const progTxt = h('span', { class: 'small muted' });
+  const genBtn = h('button', { class: 'btn', onclick: () => genAll(), title: 'Desenha a prévia dos arquivos que não trazem miniatura' }, sdPreviewing ? 'Parar' : 'Gerar prévias');
   const head = h('div', { class: 'row between wrap' },
     h('h1', null, 'Arquivos'),
-    h('button', { class: 'btn primary', onclick: () => input.click() }, icon('up'), 'Enviar G-code'));
+    h('div', { class: 'row wrap', style: 'gap:6px' }, genBtn,
+      h('button', { class: 'btn primary', onclick: () => input.click() }, icon('up'), 'Enviar G-code')));
+  const iconEls = new Map();
+  let thumbRun = 0;
+  function setIcon(f, d) {
+    const ic = iconEls.get(infoKey(f));
+    if (!ic || !d || !d.thumbnail || !/^data:image\//.test(d.thumbnail)) return;
+    ic.textContent = '';
+    ic.style.background = 'transparent';
+    ic.append(h('img', { src: d.thumbnail, alt: '', style: 'width:100%;height:100%;object-fit:contain;border-radius:10px' }));
+  }
+  async function infoOf(f) {
+    const k = infoKey(f);
+    if (fileInfoCache.has(k)) return fileInfoCache.get(k);
+    const d = await getJSON('/sd/info?filename=' + encodeURIComponent(f.name));
+    fileInfoCache.set(k, d);
+    return d;
+  }
+  /* miniaturas na lista, uma consulta por vez; durante um job o /sd/info não é chamado (ele lê o cartão) */
+  async function loadThumbs(arr) {
+    const run = ++thumbRun;
+    for (const f of arr) {
+      if (run !== thumbRun) return;
+      if (!fileInfoCache.has(infoKey(f)) && busyJob()) return;
+      let d;
+      try { d = await infoOf(f); } catch (e) { continue; }
+      if (run !== thumbRun || !el.isConnected) return;
+      setIcon(f, d);
+    }
+  }
+  async function genAll() {
+    if (sdPreviewing) { if (previewCtl) previewCtl.abort(); return; }   /* o botão vira "Parar" */
+    if (busyJob()) { toast('Só com a impressora parada.', true); return; }
+    if (sdUploading) { toast('Espere o envio atual terminar.', true); return; }
+    const ctl = new AbortController();
+    previewCtl = ctl; sdPreviewing = true; genBtn.textContent = 'Parar';
+    const fim = msg => {
+      if (previewCtl === ctl) { previewCtl = null; sdPreviewing = false; }
+      genBtn.textContent = 'Gerar prévias'; genBtn.disabled = busyJob();
+      prog.classList.add('hide'); progTxt.textContent = '';
+      if (msg) toast(msg[0], msg[1]);
+    };
+    const fora = () => { if (!el.isConnected) ctl.abort(); return ctl.signal.aborted; };   /* saiu da tela Arquivos */
+    const fila = [];
+    progTxt.textContent = 'Conferindo quais arquivos não têm prévia…';
+    for (const f of files) {
+      if (fora()) return fim(null);
+      try { const d = await infoOf(f); setIcon(f, d); if (!d.thumbnail) fila.push(f); } catch (e) { }
+    }
+    progTxt.textContent = '';
+    if (!fila.length) return fim(['Todos os arquivos já têm prévia.']);
+    const total = fila.reduce((s, f) => s + (f.size || 0), 0);
+    const sim = await confirmBox('Gerar ' + fila.length + (fila.length > 1 ? ' prévias?' : ' prévia?'),
+      'A ESP32 envia cada arquivo inteiro para esta página (' + fmtSize(total) + ' ao todo, uns ' + Math.max(1, Math.round(total / 300000 / 60)) +
+      ' min pelo Wi-Fi). Nada é enviado à impressora. Para sozinho se ela começar a trabalhar ou se você sair desta tela.', 'Gerar');
+    if (!sim || fora()) return fim(null);
+    if (busyJob() || sdUploading) return fim(['A impressora ou um envio começou: tente depois.', true]);
+    prog.classList.remove('hide');
+    let ok = 0, falhas = 0;
+    for (let i = 0; i < fila.length; i++) {
+      const f = fila[i];
+      if (fora()) break;
+      if (busyJob()) { ctl.abort(); break; }
+      try {
+        const r = await makeGcodePreview(f, (fase, a, t) => {
+          if (fora()) return;
+          prog.firstChild.style.width = (t ? Math.min(100, a / t * 100) : 0) + '%';
+          progTxt.textContent = 'Prévia ' + (i + 1) + ' de ' + fila.length + ' (' + f.name + '): ' + (fase === 'baixando' ? 'baixando ' + fmtSize(a) + (t ? ' de ' + fmtSize(t) : '') : 'desenhando');
+        }, ctl.signal);
+        if (fora()) break;
+        await savePreview(f, r.blob);
+        ok++;
+        fileInfoCache.delete(infoKey(f));
+        infoOf(f).then(d => setIcon(f, d)).catch(() => { });
+      } catch (e) {
+        if (ctl.signal.aborted) break;
+        falhas++; toast(f.name + ': ' + e.message, true);
+      }
+    }
+    const motivo = !ctl.signal.aborted ? '' : busyJob() ? 'A impressora começou a trabalhar: parei. ' : !el.isConnected ? 'Parei as prévias (você saiu da tela Arquivos). ' : 'Parado. ';
+    fim([motivo + ok + (ok === 1 ? ' prévia gerada' : ' prévias geradas') + (falhas ? ', ' + falhas + ' com erro' : '') + '.', falhas > 0 || !!motivo && motivo !== 'Parado. ']);
+  }
   const info = h('div', { class: 'card', style: 'gap:6px' });
   const chips = h('div', { class: 'row wrap', style: 'gap:6px' });
   const list = h('ul', { class: 'list', 'aria-label': 'Arquivos no cartão da ESP32' });
@@ -652,6 +916,7 @@ function Arquivos() {
   input.onchange = () => {
     const f = input.files[0]; input.value = ''; if (!f) return;
     if (sdUploading) { toast('Espere o envio atual terminar.', true); return; }
+    if (sdPreviewing) { toast('Espere as prévias terminarem (ou toque em Parar).', true); return; }
     const name = safeName(f.name);
     if (files.some(x => x.name === name)) { toast('Já existe um arquivo com esse nome no cartão. Renomeie antes de enviar.', true); return; }
     sdUploading = true;
@@ -721,10 +986,47 @@ function Arquivos() {
         m('Filamento', d.filamentMm > 0 ? num(d.filamentMm / 1000, 2) + ' m' + (d.filamentG > 0 ? ' · ' + num(d.filamentG, 1) + ' g' : '') : '—'),
         m('Camadas', d.layers > 0 ? d.layers + (d.layerHeight > 0 ? ' × ' + num(d.layerHeight, 2) + ' mm' : '') : '—'),
         m('Altura', d.objectHeight > 0 ? num(d.objectHeight, 1) + ' mm' : '—'));
-      thumb.textContent = '';
-      if (d.thumbnail && /^data:image\//.test(d.thumbnail)) thumb.append(h('img', { src: d.thumbnail, alt: 'Miniatura', style: 'max-width:100%;max-height:180px;border-radius:8px' }));
-      else thumb.append('Sem miniatura: o fatiador não gravou uma imagem que a ESP32 entenda');
+      fileInfoCache.set(infoKey(f), d);
+      showThumb(d);
     } catch (e) { meta.textContent = ''; meta.append(h('span', { class: 'muted small' }, 'Não consegui ler os dados: ' + e.message)); thumb.textContent = ''; }
+    /* lote 19: a miniatura do fatiador, a prévia já gerada, ou o botão para gerar */
+    function showThumb(d) {
+      thumb.textContent = '';
+      if (d.thumbnail && /^data:image\//.test(d.thumbnail)) {
+        thumb.append(h('div', { class: 'col', style: 'align-items:center;gap:6px' },
+          h('img', { src: d.thumbnail, alt: 'Prévia de ' + f.name, style: 'max-width:100%;max-height:220px;border-radius:8px' }),
+          d.thumbnailSource === 'preview' ? h('span', { class: 'tiny faint' }, 'Prévia desenhada a partir do G-code') : null));
+        return;
+      }
+      const btn = h('button', { class: 'btn sm', disabled: busyJob(), onclick: () => gen() }, 'Gerar prévia a partir do G-code');
+      thumb.append(h('div', { class: 'col', style: 'align-items:center;gap:8px' },
+        h('span', null, 'Sem miniatura: o fatiador não gravou uma imagem.'), btn,
+        busyJob() ? h('span', { class: 'tiny faint' }, 'Só com a impressora parada.') : null));
+      async function gen() {
+        if (sdPreviewing) { toast('Já há uma prévia sendo gerada (ou toque em Parar).', true); return; }
+        if (busyJob()) { toast('Só com a impressora parada.', true); return; }
+        const ctl = new AbortController();
+        previewCtl = ctl; sdPreviewing = true; btn.disabled = true;
+        const st = h('span', { class: 'small muted' }, 'Baixando o arquivo…');
+        thumb.textContent = ''; thumb.append(st);
+        try {
+          const r = await makeGcodePreview(f, (fase, a, t) => {
+            st.textContent = fase === 'baixando' ? 'Baixando ' + fmtSize(a) + (t ? ' de ' + fmtSize(t) : '') + '…' : 'Desenhando…';
+          }, ctl.signal);
+          st.textContent = 'Guardando na ESP32…';
+          await savePreview(f, r.blob);
+          fileInfoCache.delete(infoKey(f));
+          const d2 = await getJSON('/sd/info?filename=' + encodeURIComponent(f.name));
+          fileInfoCache.set(infoKey(f), d2);
+          showThumb(d2); setIcon(f, d2);
+        } catch (e) {
+          thumb.textContent = '';
+          thumb.append(h('span', { class: 'small' }, ctl.signal.aborted ? 'Prévia interrompida: a impressora começou a trabalhar.' : 'Não consegui gerar a prévia: ' + e.message));
+        } finally {
+          if (previewCtl === ctl) { previewCtl = null; sdPreviewing = false; }
+        }
+      }
+    }
   }
   function render() {
     const total = files.reduce((a, f) => a + (f.size || 0), 0);
@@ -736,13 +1038,23 @@ function Arquivos() {
       chips.append(h('button', { class: 'btn sm' + (sort === k ? ' sel' : ''), onclick: () => { sort = k; render(); } }, l)));
     const arr = files.slice().sort(sort === 'nome' ? (a, b) => a.name.localeCompare(b.name) : sort === 'tamanho' ? (a, b) => b.size - a.size : (a, b) => (b.mtime || 0) - (a.mtime || 0));
     list.textContent = '';
+    iconEls.clear();
     if (!arr.length) list.append(h('li', { class: 'muted' }, 'Nenhum arquivo no cartão.'));
-    arr.forEach(f => list.append(h('li', null, h('button', { class: 'item', onclick: () => openFile(f) },
-      h('span', { style: 'width:40px;height:40px;flex:none;border-radius:10px;background:var(--surface3);display:flex;align-items:center;justify-content:center;color:var(--muted)' }, icon('files')),
-      h('span', { class: 'col', style: 'gap:2px;flex:1' }, h('span', { class: 'nm' }, f.name), h('span', { class: 'small muted' }, fmtSize(f.size) + ' · ' + fmtDate(f.mtime)))))));
+    arr.forEach(f => {
+      const ic = h('span', { style: 'width:40px;height:40px;flex:none;border-radius:10px;background:var(--surface3);display:flex;align-items:center;justify-content:center;color:var(--muted)' }, icon('files'));
+      iconEls.set(infoKey(f), ic);
+      list.append(h('li', null, h('button', { class: 'item', onclick: () => openFile(f) }, ic,
+        h('span', { class: 'col', style: 'gap:2px;flex:1' }, h('span', { class: 'nm' }, f.name), h('span', { class: 'small muted' }, fmtSize(f.size) + ' · ' + fmtDate(f.mtime))))));
+      setIcon(f, fileInfoCache.get(infoKey(f)));
+    });
+    loadThumbs(arr);
   }
   load();
-  return { el, update() { } };
+  return { el, update() {
+    /* lote 19: a impressora começou a trabalhar: a prévia em andamento para (a ESP32 também corta o download) */
+    if (busyJob() && previewCtl) previewCtl.abort();
+    genBtn.disabled = !sdPreviewing && busyJob();
+  } };
 }
 
 /* ---------- Controles ---------- */
