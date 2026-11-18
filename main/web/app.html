@@ -627,6 +627,9 @@ async function sha256File(file, onProgress) {
 }
 
 /* ---------- Arquivos ---------- */
+/* lote 18: a ESP32 aceita um envio por vez. Fica fora de Arquivos() porque a tela é recriada a cada navegação,
+   e o envio continua em segundo plano. */
+let sdUploading = false;
 function Arquivos() {
   let files = [], sort = 'recentes';
   const el = h('div', { class: 'col', style: 'gap:12px' });
@@ -648,8 +651,10 @@ function Arquivos() {
   }
   input.onchange = () => {
     const f = input.files[0]; input.value = ''; if (!f) return;
+    if (sdUploading) { toast('Espere o envio atual terminar.', true); return; }
     const name = safeName(f.name);
     if (files.some(x => x.name === name)) { toast('Já existe um arquivo com esse nome no cartão. Renomeie antes de enviar.', true); return; }
+    sdUploading = true;
     prog.classList.remove('hide');
     (async () => {
       /* F15-21: o SHA-256 vai no cabeçalho; a ESP32 confere e descarta o arquivo se não bater */
@@ -658,16 +663,25 @@ function Arquivos() {
       catch (e) { sha = ''; }
       const x = new XMLHttpRequest();
       x.upload.onprogress = e => { if (e.lengthComputable) { prog.firstChild.style.width = (e.loaded / e.total * 100) + '%'; progTxt.textContent = 'Enviando ' + name + ': ' + fmtSize(e.loaded) + ' de ' + fmtSize(e.total); } };
+      x.onloadend = () => { sdUploading = false; };
       x.onload = () => {
         prog.classList.add('hide'); progTxt.textContent = '';
         if (x.status === 200) {
           let r = {}; try { r = JSON.parse(x.responseText); } catch (e) { }
           toast(r.verified ? 'Enviado e conferido: ' + name + ' (SHA-256 igual nos dois lados)' : 'Enviado: ' + name);
           load();
-        } else toast('Falha no envio: ' + x.responseText, true);
+        } else toast('Falha no envio: ' + (x.responseText || 'erro ' + x.status), true);
       };
-      x.onerror = () => { prog.classList.add('hide'); progTxt.textContent = ''; toast('Falha no envio (conexão)', true); };
-      x.open('POST', '/sd/upload'); x.setRequestHeader('X-Filename', name); if (sha) x.setRequestHeader('X-SHA256', sha); x.send(f);
+      x.onerror = () => {
+        prog.classList.add('hide'); progTxt.textContent = '';
+        toast('Falha no envio (conexão). Se outro aparelho estava enviando, ou o cartão está cheio, a ESP32 recusa; espere até 30 s e tente de novo.', true);
+      };
+      try {
+        x.open('POST', '/sd/upload'); x.setRequestHeader('X-Filename', name); if (sha) x.setRequestHeader('X-SHA256', sha); x.send(f);
+      } catch (e) {
+        sdUploading = false; prog.classList.add('hide'); progTxt.textContent = '';
+        toast('Falha no envio: ' + e.message, true);
+      }
     })();
   };
   async function load() {

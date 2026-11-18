@@ -14,8 +14,11 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/stream_buffer.h"
+#include <sys/socket.h>
+#include <netinet/tcp.h>
 
 #include <dirent.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
 #include <fcntl.h>
@@ -30,6 +33,40 @@ static const char *TAG = "sdcard_httpd";
 /* Ender Smart (F3-02): uploads go to a hidden temporary name and are renamed only
  * when complete, so an interrupted upload never leaves a truncated file behind. */
 #define UPLOAD_TMP_PREFIX ".up_"
+
+/* Ender Smart (lote 18): an upload whose data stops (a phone that loses Wi-Fi for a few
+ * seconds) is waited for up to UPLOAD_STALL_MAX_US instead of failing at the first recv
+ * timeout (recv_wait_timeout, 5 s). A closed connection still fails at once.
+ *
+ * One upload at a time: while a stalled upload waits, a second upload of the same file would
+ * unlink and recreate the temporary file the first one still has open, and with
+ * CONFIG_FATFS_FS_LOCK=0 FatFs allows that (the first f_close would then write back a directory
+ * entry pointing at freed clusters). The flag is taken in the handler and released by the
+ * upload task before it answers, so the client can start the next upload right away. */
+#define UPLOAD_STALL_MAX_US (30 * 1000000LL)
+static atomic_bool s_upload_busy;
+
+static void upload_release(void)
+{
+    atomic_store(&s_upload_busy, false);
+}
+
+/* lote 18: refuse an upload before reading its body, then close the connection (ESP_FAIL).
+ * Returning ESP_OK would make httpd_req_delete() read and discard the whole body in the server
+ * task, 32 bytes at a time, freezing every other page (Pause, Cancel, emergency stop) for the
+ * whole transfer. TCP_NODELAY sends the answer before the close; since the body is not read,
+ * the client may still see only a connection reset. */
+static esp_err_t upload_refuse(httpd_req_t *req, const char *status, const char *msg)
+{
+    int fd = httpd_req_to_sockfd(req);
+    int one = 1;
+    if (fd >= 0) setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    httpd_resp_set_status(req, status);
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_set_hdr(req, "Connection", "close");
+    httpd_resp_sendstr(req, msg);
+    return ESP_FAIL;
+}
 
 /* Ender Smart (F15-14 / A5): one rule for every file name coming from the network.
  * Rejects path traversal ("..", "/", "\"), hidden/leading-dot names, control
@@ -141,6 +178,7 @@ typedef struct {
     FILE                *file;
     int                  total;
     char                 path[300];
+    TaskHandle_t         owner;       /* lote 18: notified once the writer is done with this struct */
 } sd_writer_ctx_t;
 
 #define SD_STREAM_SIZE  1048576
@@ -160,6 +198,7 @@ static void sd_writer_task(void *arg)
     if (!wbuf) {
         ESP_LOGE(TAG, "SD writer: no internal DMA memory");
         wctx->write_error = true;
+        xTaskNotifyGive(wctx->owner);   /* lote 18: last access to wctx */
         vTaskDelete(NULL);
         return;
     }
@@ -170,6 +209,7 @@ static void sd_writer_task(void *arg)
         ESP_LOGE(TAG, "Failed to open file for writing");
         wctx->write_error = true;
         free(wbuf);
+        xTaskNotifyGive(wctx->owner);
         vTaskDelete(NULL);
         return;
     }
@@ -193,6 +233,9 @@ static void sd_writer_task(void *arg)
     fclose(wctx->file);
     wctx->file = NULL;  /* signal main task: we closed it */
     free(wbuf);
+    /* lote 18: the upload task waits for this instead of polling eTaskGetState() on a task
+     * whose TCB the idle task may already have freed */
+    xTaskNotifyGive(wctx->owner);
     vTaskDelete(NULL);
 }
 
@@ -214,6 +257,7 @@ static void sd_upload_task(void *arg)
 
     FILE *f = fopen(path, "w");
     if (!f) {
+        upload_release();
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to create file");
         goto done;
     }
@@ -230,6 +274,7 @@ static void sd_upload_task(void *arg)
         free(stream_static);
         fclose(f);
         unlink(path);
+        upload_release();
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
         goto done;
     }
@@ -241,6 +286,7 @@ static void sd_upload_task(void *arg)
         .write_error = false,
         .file        = f,
         .total       = req->content_len,
+        .owner       = xTaskGetCurrentTaskHandle(),
     };
     strlcpy(wctx.path, path, sizeof(wctx.path));
 
@@ -253,6 +299,7 @@ static void sd_upload_task(void *arg)
         free(stream_static);
         fclose(f);
         unlink(path);
+        upload_release();
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Task create failed");
         goto done;
     }
@@ -262,6 +309,8 @@ static void sd_upload_task(void *arg)
     int remaining = req->content_len;
     int total = remaining;
     esp_err_t ret = ESP_OK;
+    int64_t last_data = esp_timer_get_time();   /* lote 18 */
+    bool stalled = false;
 
     if (!rbuf) {
         wctx.recv_error = true;
@@ -277,11 +326,33 @@ static void sd_upload_task(void *arg)
 
         int to_read = remaining < UPLOAD_BUF_SIZE ? remaining : UPLOAD_BUF_SIZE;
         int received = httpd_req_recv(req, rbuf, to_read);
+        if (received == HTTPD_SOCK_ERR_TIMEOUT) {
+            /* lote 18: no data for recv_wait_timeout, but the connection is still open */
+            int64_t idle = esp_timer_get_time() - last_data;
+            if (!stalled) {
+                stalled = true;
+                ESP_LOGW(TAG, "Upload %s: no data for %lld s (%d of %d bytes received), waiting up to %lld s",
+                         ctx->filename, idle / 1000000, total - remaining, total, UPLOAD_STALL_MAX_US / 1000000);
+            }
+            if (idle < UPLOAD_STALL_MAX_US) {
+                vTaskDelay(pdMS_TO_TICKS(20));   /* never a busy loop, even if recv returned at once */
+                continue;
+            }
+            ESP_LOGE(TAG, "Upload %s: no data for %lld s, giving up", ctx->filename, idle / 1000000);
+            ret = ESP_FAIL;
+            break;
+        }
         if (received <= 0) {
             ESP_LOGE(TAG, "Upload recv error: %d", received);
             ret = ESP_FAIL;
             break;
         }
+        if (stalled) {
+            ESP_LOGI(TAG, "Upload %s: data again after %lld ms without data", ctx->filename,
+                     (esp_timer_get_time() - last_data) / 1000);
+            stalled = false;
+        }
+        last_data = esp_timer_get_time();
 
         mbedtls_sha256_update(&sha, (const unsigned char *)rbuf, received);
 
@@ -293,6 +364,7 @@ static void sd_upload_task(void *arg)
                                           pdMS_TO_TICKS(100));
             sent += n;
         }
+        last_data = esp_timer_get_time();   /* lote 18: a slow SD card is not a silent client */
 
         remaining -= received;
     }
@@ -300,10 +372,8 @@ static void sd_upload_task(void *arg)
     if (ret != ESP_OK) wctx.recv_error = true;
     wctx.recv_done = true;
 
-    /* Wait for writer to finish draining */
-    while (eTaskGetState(writer) != eDeleted) {
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
+    /* Wait for writer to finish draining (lote 18: its notification, see sd_writer_task) */
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
     free(rbuf);
     vStreamBufferDelete(stream);
@@ -316,11 +386,16 @@ static void sd_upload_task(void *arg)
     mbedtls_sha256_finish(&sha, dig);
     hex32(dig, hex);
 
+    /* lote 18: each branch finishes with the files first, then releases the upload slot, then answers */
     if (ret != ESP_OK || wctx.write_error) {
         unlink(path);
+        upload_release();
+        ESP_LOGW(TAG, "Upload %s failed after %d of %d bytes, discarded (stack_free %u)", ctx->filename,
+                 total - remaining, total, (unsigned)uxTaskGetStackHighWaterMark(NULL));
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Upload failed");
     } else if (ctx->want_sha[0] && strcasecmp(ctx->want_sha, hex) != 0) {
         unlink(path);
+        upload_release();
         ESP_LOGW(TAG, "Upload %s: SHA-256 mismatch (got %s, expected %s), discarded", ctx->filename, hex, ctx->want_sha);
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "SHA-256 mismatch: file discarded");
     } else {
@@ -328,6 +403,7 @@ static void sd_upload_task(void *arg)
          * unlink() of an open file frees clusters the print is still reading */
         if (sd_name_in_use(ctx->filename)) {
             unlink(path);
+            upload_release();
             ESP_LOGW(TAG, "Upload %s discarded: the file is being printed or prepared", ctx->filename);
             httpd_resp_set_status(req, "409 Conflict");
             httpd_resp_sendstr(req, "This file is being printed");
@@ -337,10 +413,12 @@ static void sd_upload_task(void *arg)
         unlink(final_path);
         if (rename(path, final_path) != 0) {
             unlink(path);
+            upload_release();
             httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Rename failed");
         } else {
-            ESP_LOGI(TAG, "Uploaded %s (%d bytes, sha256 %s%s)", ctx->filename, total, hex,
-                     ctx->want_sha[0] ? ", verified" : "");
+            upload_release();
+            ESP_LOGI(TAG, "Uploaded %s (%d bytes, sha256 %s%s, stack_free %u)", ctx->filename, total, hex,
+                     ctx->want_sha[0] ? ", verified" : "", (unsigned)uxTaskGetStackHighWaterMark(NULL));
             char esc[160], json[320];
             json_escape(ctx->filename, esc, sizeof(esc));
             snprintf(json, sizeof(json), "{\"ok\":true,\"name\":\"%s\",\"size\":%d,\"sha256\":\"%s\",\"verified\":%s}",
@@ -351,6 +429,8 @@ static void sd_upload_task(void *arg)
     }
 
 done:
+    /* lote 18: no upload_release() here: every path above already did it before answering,
+     * and by now a new upload may hold the slot */
     mbedtls_sha256_free(&sha);
     httpd_req_async_handler_complete(req);
     free(ctx);
@@ -400,14 +480,10 @@ static esp_err_t sd_upload_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
     int32_t free_kb = sdcard_get_free_kb();
-    if (free_kb >= 0 && (int64_t)req->content_len + 1048576 > (int64_t)free_kb * 1024) {
-        httpd_resp_set_status(req, "507 Insufficient Storage");
-        return httpd_resp_sendstr(req, "Not enough free space on the SD card");
-    }
-    if (sd_name_in_use(filename)) {
-        httpd_resp_set_status(req, "409 Conflict");
-        return httpd_resp_sendstr(req, "This file is being printed");
-    }
+    if (free_kb >= 0 && (int64_t)req->content_len + 1048576 > (int64_t)free_kb * 1024)
+        return upload_refuse(req, "507 Insufficient Storage", "Not enough free space on the SD card");
+    if (sd_name_in_use(filename))
+        return upload_refuse(req, "409 Conflict", "This file is being printed");
     char want_sha[80] = "";
     if (httpd_req_get_hdr_value_str(req, "X-SHA256", want_sha, sizeof(want_sha)) == ESP_OK) {
         bool hex_ok = strlen(want_sha) == 64;
@@ -423,14 +499,25 @@ static esp_err_t sd_upload_handler(httpd_req_t *req)
         want_sha[0] = '\0';
     }
 
+    /* lote 18: one upload at a time (see UPLOAD_STALL_MAX_US) */
+    bool idle = false;
+    if (!atomic_compare_exchange_strong(&s_upload_busy, &idle, true)) {
+        ESP_LOGW(TAG, "Upload %s refused: another upload is in progress", filename);
+        return upload_refuse(req, "409 Conflict",
+                             "Outro envio em andamento. Se ele parou, a ESP32 desiste dele depois de 30 s sem dados; "
+                             "tente de novo em seguida.");
+    }
+
     httpd_req_t *async_req = NULL;
     if (httpd_req_async_handler_begin(req, &async_req) != ESP_OK) {
+        upload_release();
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Async init failed");
         return ESP_FAIL;
     }
 
     sd_upload_ctx_t *ctx = malloc(sizeof(sd_upload_ctx_t));
     if (!ctx) {
+        upload_release();
         httpd_req_async_handler_complete(async_req);
         return ESP_FAIL;
     }
@@ -440,6 +527,7 @@ static esp_err_t sd_upload_handler(httpd_req_t *req)
 
     if (xTaskCreatePinnedToCore(sd_upload_task, "sd_upload", 4096, ctx,
                                  5, NULL, 0) != pdPASS) {
+        upload_release();
         httpd_req_async_handler_complete(async_req);
         free(ctx);
         return ESP_FAIL;
