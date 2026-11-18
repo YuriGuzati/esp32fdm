@@ -1009,6 +1009,10 @@ static void sd_read_task(void *arg)
 
         if (ctx->download) {
             if (ok) httpd_resp_send_chunk(req, NULL, 0);
+            /* lote 19: an interrupted download has no final chunk; without this the client would wait for
+             * the rest until its own timeout. shutdown() (not close) ends the connection now and leaves
+             * the socket to the server, which closes it on the EOF. */
+            else shutdown(httpd_req_to_sockfd(req), SHUT_RDWR);
             ESP_LOGI(TAG, "Download %s: %ld bytes in %d ms%s, sha256 %s", ctx->filename, total, ms,
                      ok ? "" : by_job ? " (stopped: a print started)" : " (interrupted)", hex);
         } else if (by_job) {
